@@ -1,0 +1,49 @@
+qu-e:
+  model: "qwen3.6:35b-a3b-q4_K_M"
+  ollama_url: "http://localhost:11434"
+  prompts_dir: "/opt/taka-ma/qu-e/sentinel/prompts"   # プロンプトテンプレート格納先（役割パッケージ直下）
+
+health_check:
+  interval_sec: 30
+  thresholds:
+    memory_warning: 80    # %
+    memory_critical: 95
+    cpu_warning: 90
+    disk_warning: 90
+
+# ファイル監査（A1 確定事項 §1 検知 / §4 保存）
+file_audit:
+  # 検知（A1 §1）— watchdog（FSEvents、event-driven）
+  watch_paths:
+    - "/opt/taka-ma"
+  ignore_patterns:                 # 静的フィルタ（.gitignore と合成）
+    - "*.log"
+    - "*.jsonl"
+    - "*.pyc"
+    - "__pycache__"
+    - ".git"
+  # .gitignore は判定実行時に mtime チェックで再読み込み（A1 §1、mtime のみキャッシュ）
+  debounce_sec: 1                  # ノイズ抑制: 同パス連続変更を集約する時間（A1 §1）
+
+  # 監査ログ（A1 §4）
+  log_dir: "/opt/taka-ma/logs/file-audit"           # 出力ディレクトリ
+  log_filename: "file-audit-{YYYY-MM-DD}.jsonl"     # 日付別ファイル名
+  retention_days: 90                                 # 保持日数（qu-e.yaml で切替可）
+  # ローテーション: 起動時 + 日次に削除（retention_days 超過ファイル、main.py が実行）
+  # 各レコードは id フィールド（uuid4 hex、Slack ボタン callback で特定）
+
+  # 通知（A1 §2 / §8.12）— deny/escalate を sa-ru に SSH push
+  o_moi_alert_dir: "/opt/taka-ma/data/file-audit-alerts"  # sa-ru 側の alert 受信先（Mac mini）
+  mac_mini_host: "mac-mini"                          # SSH 先 Host 名（~/.ssh/config）
+
+# §8.13 タスクコンテキスト受信 — TaskContextHandler が watchdog で即時取り込み
+task_context:
+  dir: "/opt/taka-ma/data/task-context"             # sa-ru が SSH push する受信先（MBP）
+
+# リソース最適化（§4.2 / §8.14）— 推奨 heavy 並行数を sa-ru へ SSH push
+resource_optimization:
+  max_heavy_instances: 7           # heavy worker 並行数の上限（権威値。Phase 6 実機検証で確定）
+  scale_down_memory_threshold: 85  # % 以上 → heavy 並行数を減らす（OOM 回避）
+  scale_up_memory_threshold: 60    # % 未満 → 上限まで許可（throughput 最大化）
+  notify_interval_sec: 30          # 推奨並行数の再算出間隔（変化時のみ push）
+  o_moi_notify_dir: "/opt/taka-ma/data/resource-notify"  # sa-ru 側の通知受信先（Mac mini）

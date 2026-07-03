@@ -1,0 +1,152 @@
+# ya-ta 設定
+ya-ta:
+  model: "deepseek-r1:32b"    # タスク分解・分類・リスク判定に使うモデル（ollama CLI 経由）
+  num_ctx: 32768              # コンテキスト長。Mac mini 64GB の OOM 回避のため 128K→32K に縮小
+                              # （実測: 128K=常駐47GB → 32K=常駐26GB）。
+                              # ※ コードは `ollama run` 経由で num_ctx を渡さないため、実効値は
+                              #   モデル側 Modelfile の PARAMETER num_ctx 32768 に焼き込んで担保する
+                              #   （構築手順書 04 §1-2 参照。初期投入時に PyInfra が自動焼込）。
+
+# カテゴリ別デフォルトモデル — category 判定後、model 指定がない場合に使用
+# 配列は優先度順（[0] がデフォルト、[1] 以降は障害時のフォールバック先）
+routing:
+  category_defaults:
+    light:
+      - gemma         # 優先度 1（デフォルト）
+    heavy:
+      - opus          # 優先度 1（デフォルト）
+      - gemini        # 優先度 2（フォールバック先）
+
+# モデル登録 — ルーティング先の定義
+# キー名 = ユーザーが :モデル名 で指定する名前（完全一致）
+#
+# methods: 対応する呼び出し経路の配列
+#   - pty:        SSH + PTY ラッパー（pexpect + tmux）。対話型タスク、y/n プロンプト介入が必要なもの
+#   - subprocess: SSH + subprocess 単発実行。マルチモーダル単発・cross-review・フォールバックなど対話不要なもの
+# 複数指定可（例: gemini は pty と subprocess の両方に対応）。
+# 経路選択は orchestrator がタスクの性質（対話 / 単発、cross-review、マルチモーダル）から動的に決める。
+#
+# command: worker CLI の起動コマンド名（PTY ラッパー / subprocess 共通で使用）
+#   - 通常は vendor から自動推測される（anthropic → claude、google → gemini 等）
+#   - 自動推測を上書きしたい場合のみ明示記述する（複数 CLI 提供ベンダー・自前 CLI 等）
+models:
+  opus:
+    full_name: "claude-opus-4.8"
+    type: api
+    vendor: anthropic
+    methods: [pty]
+    command: claude
+    model_flag: ""            # heavy デフォルト（claude CLI 既定 = Opus 4.8）
+    capabilities: [code, design, reasoning, implementation]
+    description: "重量タスクの既定。探索・試行錯誤・ツール使用を伴う作業"
+
+  fable:
+    full_name: "claude-fable-5"
+    type: api
+    vendor: anthropic
+    methods: [pty]
+    command: claude
+    model_flag: "--model fable-5"   # ★CLI が受理する正確な値は実機要確認
+    capabilities: [code, design, reasoning, implementation]
+    description: "最難関タスク用。:fable で明示指定（難易度自動振り分けは Phase2）"
+
+  opus4.6:
+    full_name: "claude-opus-4.6"
+    type: api
+    vendor: anthropic
+    methods: [pty]
+    command: claude
+    model_flag: ""
+    capabilities: [code, design, reasoning, implementation]
+    description: "重量タスク。探索・試行錯誤・ツール使用を伴う作業"
+
+  sonnet:
+    full_name: "claude-sonnet-4.6"
+    type: api
+    vendor: anthropic
+    methods: [pty]
+    command: claude
+    model_flag: "--model sonnet-4.6"
+    capabilities: [code, reasoning]
+    description: "中量タスク。Opus より高速・低コスト"
+
+  haiku:
+    full_name: "claude-haiku-4.5"
+    type: api
+    vendor: anthropic
+    methods: [pty]
+    command: claude
+    model_flag: "--model haiku-4.5"
+    capabilities: [light-task, qa]
+    description: "軽量タスク。高速応答"
+
+  gemini:
+    full_name: "gemini-3.5-flash"
+    type: api
+    vendor: google
+    methods: [pty, subprocess]   # heavy 対話 = pty、高度なマルチモーダル解析単発 / cross-review / フォールバック = subprocess
+    command: agy                 # Antigravity CLI（Gemini CLI の後継）。認証は macOS keychain 依存（設計書 §8.5/§8.6）
+    keychain_auth: true          # 認証が macOS keychain 依存 → SSH 直実行不可。GUI 起源 tmux 内で実行（§8.6）
+    model_flag: "-p --model gemini-3.5-flash"   # agy: -p=非対話単発 + --model=版明示（agy 既定も 3.5 Flash）
+    capabilities: [multimodal-analysis, code, reasoning]
+    capability_description: |
+      - 動画・音声・画像の高度な解析（理解）を含むタスク → model: "gemini"
+        （基本的な解析はローカル gemma4 が担当。生成は Phase 2 — 設計書 §2.4 参照）
+      - heavy 対話タスクのセカンドオピニオン → cross-review
+      - Opus 障害時のフォールバック（テキスト・コード）
+    description: "Gemini 既定（3.5 Flash）。高速・低コストで高度なマルチモーダル解析 + heavy 対話"
+
+  gemini-pro:
+    full_name: "gemini-3.1-pro"
+    type: api
+    vendor: google
+    methods: [pty, subprocess]
+    command: agy
+    keychain_auth: true
+    model_flag: "-p --model gemini-3.1-pro"   # agy: 最上位を明示選択
+    capabilities: [multimodal-analysis, code, reasoning]
+    capability_description: |
+      - 複雑・創造的タスクで Gemini の最上位が要るとき → model: "gemini-pro"
+      - 1M トークン級の長文脈が要るタスク
+    description: "Gemini 最難関用（3.1 Pro）。:gemini-pro で明示指定（自動振り分けは Phase2）"
+
+  gemma:
+    full_name: "gemma-4-31b"
+    type: local
+    methods: [subprocess]
+    command: ollama              # ollama run gemma4:31b の形で呼び出す
+    model_id: "gemma4:31b"
+    capabilities: [light-task, format, qa]
+    description: "ローカル軽量。外部通信不要"
+
+  # 外部サービスの追加例:
+  # suno:
+  #   full_name: "suno-v4"
+  #   type: api
+  #   vendor: suno
+  #   methods: [subprocess]
+  #   command: suno
+  #   capabilities: [music-generation]
+  #   capability_description: |
+  #     - 音楽の作曲・編曲・生成を含むタスク → model: "suno"
+  #   description: "音楽生成"
+
+# 並行実行制御
+concurrency:
+  # 重量モデル（methods に pty を含むモデル）の同時実行数上限。
+  # 起動時のブートストラップ値（実行時は qu-e のリソース最適化通知 §8.14 で動的増減する）。
+  # Phase 6 の実機検証で MBP のリソース消費を計測して確定する（qu-e.yaml の上限値と揃える）。
+  max_heavy_instances: 3
+
+# フォールバック設定
+# `category_defaults[category]` 配列を先頭から試行
+# 値の意味: fallback の試行回数（先頭は含まない）
+#   0 = fallback なし（先頭のみ）、1 = 先頭 + 1 fallback、N = 先頭 + N fallback
+# 未指定（コメントアウト）の場合: 配列内のすべてのモデルを試行（無制限）
+# ユーザーが `:モデル名` を明示指定した場合はフォールバックしない（指定モデル尊重）
+fallback:
+  # max_fallback_attempts: 1     # 値を指定して制限する場合のみ有効化
+
+# 判定ログ
+logging:
+  decision_log_dir: "/opt/taka-ma/logs"

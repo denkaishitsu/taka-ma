@@ -1,0 +1,7 @@
+# 自動承認ホワイトリスト
+# Claude Code の y/n プロンプトで自動承認する操作パターン
+auto_approve:
+  - pattern: "Read file"
+    action: approve
+  - pattern: "List directory"
+    action: approve

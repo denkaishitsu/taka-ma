@@ -1,0 +1,71 @@
+# sa-ru 本体 — TaskClassifier / RiskClassifier / ConversationManager が参照
+sa-ru:
+  model: "gemma4:12b"                  # 脳モデル（stdout文脈抽出 + 人間とのマルチモーダル会話フロントエンド）
+  ollama_host: "http://localhost:11434" # ollama API エンドポイント（Mac mini localhost）
+  converse_timeout_sec: 120            # 会話 LLM（ollama run）1 ターンのタイムアウト
+
+# 会話フロントエンド — ConversationManager / _conversation_loop が参照
+conversation:
+  dir: "/opt/taka-ma/data/conversations"  # u-zu が発話を書き込む会話キュー（sa-ru が走査）
+  poll_interval_sec: 2                    # 未処理発話がないときのポーリング間隔
+  session_ttl_sec: 3600                   # 会話セッションを保持する上限秒。超過した未使用会話は破棄（メモリ増加防止）
+
+# 着手確認ゲート（§8.3 (B)）— _exec_confirmation_loop が参照
+exec_confirm:
+  dir: "/opt/taka-ma/data/exec-confirmations"  # 着手確認レコードの読み書き先（u-zu がボタンで status 更新）
+  poll_interval_sec: 2                          # 確認決着のポーリング間隔
+  timeout_sec: 300                              # pending のまま放置された確認の自動 timeout（§8.10 と同方針）
+
+# 制御コマンド受信（§8.10c）— _control_loop が参照
+control:
+  dir: "/opt/taka-ma/data/controls"  # u-zu が制御命令（手動 ollama 停止等）を書き込む先（sa-ru が走査）
+  poll_interval_sec: 2               # 未処理命令がないときのポーリング間隔
+
+# SSH — RemoteProcessManager が参照
+ssh:
+  mbp_host: "mbp"  # ~/.ssh/config のHost名
+  timeout_sec: 30  # ollama ps/stop・Blender 検知など軽い SSH 操作の応答待ち上限（秒）。モデル実行など重い操作は run_ssh_command 既定 120
+
+# タスクキュー — dispatcher が参照
+task_queue:
+  dir: "/opt/taka-ma/data/tasks"  # Slack Bot がタスクファイルを作成するディレクトリ
+  poll_interval_sec: 5            # 未処理タスクがないときのポーリング間隔
+
+# 承認パイプライン — Tier 3 ハンドラが参照
+approval:
+  dir: "/opt/taka-ma/data/approvals"  # 承認ファイルの読み書き先
+  tier3_timeout_sec: 300              # Slack 承認リクエストのタイムアウト（秒）
+  poll_interval_sec: 1                # 承認待ち中のポーリング間隔
+
+# モデル関連設定（routing / fallback / concurrency / models）は ya-ta.yaml に集約。
+# Orchestrator 起動時に ya-ta.yaml と当ファイルをマージして単一 config を構築する。
+
+# Blender モード — ResourceMonitor が参照
+resource_management:
+  blender_detection: true   # Blender プロセス検知の有効/無効
+  blender_action: "stop_llm" # 検知時のアクション
+  check_interval_sec: 10    # Blender 検知のポーリング間隔
+
+# アーカイブローテート — _daily_cleanup() が参照
+cleanup:
+  retention_days: 90  # タスクアーカイブ（done/）の保持日数。判定ログは永続保持
+
+# qu-e ヘルス監視 — dispatcher が参照（SSH 経由で MBP のファイルを取得）
+qu-e:
+  # model: qwen3.6:35b-a3b-q4_K_M — qu-e 自身の設定ファイル（/opt/taka-ma/qu-e/config/qu-e.yaml）で管理
+  health_poll_interval_sec: 60                          # ヘルスチェック取得間隔
+  health_file: "/opt/taka-ma/logs/qu-e-health.json" # MBP 上のヘルスチェック結果ファイル
+
+# file_audit アラート受信 — FileAuditHandler（watchdog）が参照（§8.12）
+file_audit:
+  alert_dir: "/opt/taka-ma/data/file-audit-alerts"  # qu-e からの SSH push 受信先（watchdog で監視）
+
+# §8.13 タスクコンテキスト送信 — Orchestrator._push_task_context() が参照
+task_context:
+  remote_dir: "/opt/taka-ma/data/task-context"  # MBP 上の qu-e 受信先
+  workspace_base: "/opt/taka-ma/work"           # タスク専用作業ディレクトリの基底（実体は {base}/{task_id}）
+
+# §8.14 リソース最適化通知 受信 — ResourceNotifyHandler（watchdog）が参照
+# qu-e から SSH push される推奨 heavy 並行数で max_heavy_instances を動的更新する
+resource_optimization:
+  notify_dir: "/opt/taka-ma/data/resource-notify"  # qu-e からの SSH push 受信先（Mac mini、watchdog で監視）

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- GUI ログインセッション起源の tmux サーバを常駐させる。
+         目的: agy (Antigravity CLI) の認証は macOS keychain 管理であり、
+         SSH セッション（別セキュリティセッション）からは keychain を読めない。
+         GUI 起源の tmux サーバ内で worker CLI を実行することで keychain 参照を可能にする
+         （設計書 §8.6 / 構築手順書 06 Step 2 参照。実測 2026-07-03: 素の SSH=認証失敗、
+          GUI tmux 経由=成功）。 -->
+    <key>Label</key>
+    <string>com.taka-ma.worker-tmux</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/tmux</string>
+        <string>new-session</string>
+        <string>-d</string>
+        <string>-s</string>
+        <string>taka-ma-worker</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- tmux new-session -d はサーバをデーモン化して即終了する（正常）。
+         KeepAlive を付けると launchd が無限再起動を試みるため false 固定。 -->
+    <key>KeepAlive</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/opt/taka-ma/logs/worker-tmux.log</string>
+    <key>StandardErrorPath</key>
+    <string>/opt/taka-ma/logs/worker-tmux-error.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{{ home }}/.local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

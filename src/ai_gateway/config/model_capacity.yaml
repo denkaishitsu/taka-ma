@@ -1,0 +1,62 @@
+# モデル容量管理（設計書 §7.4 モデル自動監視・半自動入替）
+#
+# 位置づけ（重要）:
+#   本ファイルは「設定」ではなく **容量適合判定の入力データ（現行構成の実測スナップショット）**。
+#   ここの size_gb をもとに「入れ替えても各稼働機の RAM 予算に収まるか」を判定する。
+#   - モデル選択の権威は各コンポーネント config（ya-ta.yaml / qu-e.yaml / sa-ru.yaml）。本ファイルは何の設定にも反映されない。
+#   - 値は実機 `ollama ps` の実測で維持する **派生記録**。更新は **ランブック**（docs/sa-runbooks/model-capacity-and-swap.md）に従い
+#     エージェントが Do→Check→Record で行う（コード固定は容量不等式 evaluate_swap のみ）。
+#
+# 何のためのデータか:
+#   各役割が「どの稼働機で」「どれだけのメモリを使う」モデルを動かしているかを 1 か所にまとめ、
+#   新候補モデルに入れ替えても稼働機の RAM 予算に収まるか（容量適合）を機械的に判定するための入力。
+#
+# サイズ値の扱い（重要・2026-06-06 改訂: KV キャッシュを加味）:
+#   size_gb は **実常駐サイズ（＝量子化重み + KV キャッシュ）** を入れる。容量判定はこの値の合計で行う。
+#   - weights_gb は一次ソース / 設計書で検証済みの量子化重み（参考値）。
+#   - kv_gb は KV キャッシュ実測（= 実常駐 − 重み）。context 長で大きく変わる。
+#   - size_gb / kv_gb は実機 `ollama ps` の SIZE 列で実測する（AI 推測値は入れない）。
+#   context（num_ctx）を変えたら size_gb / kv_gb を再実測すること。重みだけでは OOM を見逃す。
+#   新候補のサイズもスワップ提案時に「同じ context での実常駐」を claims で実測して与える。
+
+# 稼働機ごとの RAM 予算。ram_gb は実装メモリ、reserve_gb は OS・その他常駐に残す分（実機で調整）。
+hosts:
+  mac-mini:
+    ram_gb: 64
+    reserve_gb: 8
+  mbp:
+    ram_gb: 128
+    reserve_gb: 12
+
+# 役割ごとの現行モデルと稼働機・サイズ。host が同じ役割同士は同一機で同居＝size_gb 合計が予算に収まる必要がある。
+# heavy（opus / gemini）は API 実行のためローカル RAM を消費せず、容量管理の対象外（ここに載せない）。
+# size_gb / kv_gb は 2026-06-06 に各稼働機の `ollama ps`（SIZE 列）で実測。
+roles:
+  ya-ta:                       # タスク分解・分類・リスク判定（ya-ta 分解脳）
+    host: mac-mini
+    model: deepseek-r1:32b
+    context: 32768             # num_ctx を 32K に縮小（Modelfile PARAMETER で焼込・OOM 回避）
+    weights_gb: 19             # Q4_K_M 重み（ollama 実測）
+    kv_gb: 7                   # KV 実測（常駐 26 − 重み 19）
+    size_gb: 26                # 実常駐（重み+KV、容量判定に使用）
+  sa-ru:                       # オーケストレーション（stdout 文脈抽出）+ 人間とのマルチモーダル会話
+    host: mac-mini
+    model: gemma4:12b
+    context: 40960             # 既定 num_ctx
+    weights_gb: 7.6            # Q4_K_M 重み（mac-mini ollama 0.30.10 pull blob 実測 2026-06-20）
+    kv_gb: 1.1                 # KV 実測（常駐 8.7 − 重み 7.6。num_ctx=40960・q8_0・flash-attn）
+    size_gb: 8.7              # 実常駐 実測（重み+KV、容量判定に使用。mac-mini `ollama ps` 2026-06-20）
+  light:                       # 軽量タスク処理
+    host: mbp
+    model: gemma4:31b
+    context: 262144            # 既定 num_ctx（256K）
+    weights_gb: 20             # 設計書 §2.5 / §7.3（Q4_K_M ~20GB）
+    kv_gb: 16                  # KV 実測（常駐 36 − 重み 20）
+    size_gb: 36                # 実常駐（重み+KV、容量判定に使用）
+  que:                         # qu-e Tier2 審査・file_audit
+    host: mbp
+    model: qwen3.6:35b-a3b-q4_K_M
+    context: 262144            # 既定 num_ctx（256K）。qu-e は num_ctx 無指定→ollama がモデル既定 262144 でロード（2026-06-25 実測検証）
+    weights_gb: 23             # ollama list SIZE（Q4_K_M ~23GB、MoE 35B総 / active 3B）
+    kv_gb: 4                   # KV 実測（常駐 27 − 重み 23、num_ctx 262144）
+    size_gb: 27                # 実常駐（重み+KV、容量判定に使用。ollama ps 2026-06-25）

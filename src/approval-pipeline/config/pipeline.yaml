@@ -1,0 +1,24 @@
+# 承認パイプライン設定
+# 構築手順書: docs/procedures/09-approval-pipeline.md Step 7
+
+pipeline:
+  tier3_timeout_sec: 300
+  # コンポーネント間の通信方式
+  #   Tier 分類 → ya-ta は in-process 呼出（ya-ta はライブラリ方式）
+  #   Tier 2 → qu-e は SSH（review_cli.py を MBP で 1 ショット実行、§8.8 / NF-01）
+
+audit:
+  log_path: "/opt/taka-ma/logs/approval-audit.jsonl"
+  log_rotation: "daily"
+
+safety:
+  # --dangerously-skip-permissions は使用しない
+  always_deny:
+    - "rm -rf /"
+    - "mkfs"
+    - "dd if=/dev/zero"
+    - ":(){:|:&};:"
+  always_escalate_to_human:
+    - "sudo"
+    - "deploy"
+    - "production"

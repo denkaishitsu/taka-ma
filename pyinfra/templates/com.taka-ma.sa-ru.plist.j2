@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.taka-ma.sa-ru</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/taka-ma-env/bin/python</string>
+        <string>-m</string>
+        <string>orchestrator</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/opt/taka-ma/sa-ru</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/opt/taka-ma/logs/sa-ru.log</string>
+    <key>StandardErrorPath</key>
+    <string>/opt/taka-ma/logs/sa-ru-error.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin</string>
+        <key>PYTHONPATH</key>
+        <string>/opt/taka-ma/sa-ru:/opt/taka-ma/ya-ta</string>
+    </dict>
+</dict>
+</plist>

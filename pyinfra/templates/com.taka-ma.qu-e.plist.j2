@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.taka-ma.qu-e</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/taka-ma-env/bin/python</string>
+        <string>/opt/taka-ma/qu-e/sentinel/main.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/opt/taka-ma/qu-e</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/opt/taka-ma/logs/qu-e.log</string>
+    <key>StandardErrorPath</key>
+    <string>/opt/taka-ma/logs/qu-e-error.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin</string>
+        <key>PYTHONPATH</key>
+        <string>/opt/taka-ma/qu-e</string>
+    </dict>
+</dict>
+</plist>

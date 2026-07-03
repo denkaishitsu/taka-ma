@@ -1,0 +1,10 @@
+# users.yaml — Slack Bot のロールベース認可設定（テンプレート）
+# 配置先: /opt/taka-ma/config/users.yaml
+# 手順書: docs/procedures/03-slack-bot.md（アクセス制御）
+users:
+  U0123ABCD:          # Slack user ID
+    name: "owner-name"
+    role: owner
+  U0456EFGH:
+    name: "member1"
+    role: user
