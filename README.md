@@ -1,5 +1,36 @@
 # taka-ma
 
+**English** (summary) ｜ [日本語](#日本語) (full)
+
+## English (Summary)
+
+**An autonomous, parallel development platform where a human and multiple AIs collaborate to write software.**
+
+A human gives instructions and approvals from a chat interface (Slack initially), while a fleet of local and cloud AIs divides up task decomposition, execution, cross-review, and safety auditing. Instead of outsourcing everything to a SaaS, judgment and control stay on your own Macs.
+
+> [!IMPORTANT]
+> **This is a personal, experimental project.** It assumes a specific hardware setup (two Macs) and is published AS-IS, with no warranty and no support. It is not intended for production use — use at your own risk (see [LICENSE](LICENSE)).
+
+**What it is / isn't**
+
+- ✅ An **orchestration platform** that binds local LLMs and coding agents over SSH and runs tasks with a human approval gate.
+- ✅ A **reference implementation** publishing the design philosophy, role separation, safety auditing, and build procedures.
+- ❌ *Not* a general-purpose tool that runs anywhere (specific hardware assumed).
+- ❌ *Not* a commercially supported product.
+
+**Highlights**
+
+- **Human at the approval gate** — AIs summarize and propose; execution starts only after a person approves. Three tiers by risk (auto / AI review / human approval).
+- **Model selection by role** — routing across two classes (light / heavy); the model behind each role is swappable.
+- **SSH-only transport** — machines talk over SSH with no open ports or REST APIs; external comms are limited to a private Slack channel.
+- **AI cross-review** — a separate guardian AI audits execution results and code changes.
+
+The full documentation below is written in Japanese. For details, use your browser's translation, or read the [design docs](docs/design/design-development-system.md).
+
+---
+
+## 日本語
+
 **人間と複数の AI が協調(AI Gateway)して開発を進める、自律型並行開発基盤。**
 
 人がチャットなどから（初期は、Slackを使用）で指示・承認を行い、ローカル/外部の AI 群がタスクの分解・実行・相互レビュー・安全審査を分担します。外部 SaaS に丸投げせず、判断と制御を手元の Mac で完結させることを狙った構成です。
