@@ -182,9 +182,14 @@ async def main():
     # task_context 受信用のメモリ dict（task_id → context）
     task_context_store: dict[str, dict] = {}
 
-    # 起動時 retention rotation（A1 §4）
+    # 起動時 retention rotation（A1 §4）。log_dir は本来 start_audit() の
+    # FileAuditHandler.__init__ が作成するが、呼び出し順が rotate_jsonl → start_audit
+    # のため初回起動時（ディレクトリ未作成）は os.listdir が FileNotFoundError になる
+    # （実機検証で再現）。rotation はディレクトリ存在が前提の処理なので、ここで先に
+    # 作成してから呼ぶ。
     log_dir = config["file_audit"]["log_dir"]
     retention_days = config["file_audit"].get("retention_days", 90)
+    os.makedirs(log_dir, exist_ok=True)
     try:
         rotate_jsonl(log_dir, retention_days)
     except Exception:

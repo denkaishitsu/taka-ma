@@ -74,9 +74,16 @@ files.template(
     dest=f"{HOME}/Library/LaunchAgents/com.taka-ma.sa-ru.plist",
 )
 server.shell(commands=[
-    # macOS 10.10+ 推奨構文。再ロードに備えて bootout を先に実行（未登録時はエラー無視）
+    # macOS 10.10+ 推奨構文。再ロードに備えて bootout を先に実行（未登録時はエラー無視）。
+    # bootout は XPC 経由で非同期に片付くため、直後に bootstrap すると解体未完了の
+    # ジョブと衝突し "Bootstrap failed: 5: Input/output error" になることを qu-e の
+    # 同一パターンで実機再現（#68 E2E T07）。固定 sleep 1 でも足りない場合が実機で
+    # あったため、bootstrap 成功まで最大 5 回・1 秒間隔でリトライする（リトライ上限
+    # 到達時は exit 1 して pyinfra へ失敗を伝播する。until をそのまま抜けると exit 0
+    # になり偽成功を報告してしまうため）。
     "launchctl bootout gui/$(id -u)/com.taka-ma.sa-ru 2>/dev/null; "
-    "launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.taka-ma.sa-ru.plist",
+    "i=0; until launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.taka-ma.sa-ru.plist; do "
+    "i=$((i+1)); if [ $i -ge 5 ]; then exit 1; fi; sleep 1; done",
 ])
 record("sa-ru", "launchd com.taka-ma.sa-ru", "com.taka-ma.sa-ru",
        {"op": "launchctl.bootout", "label": "com.taka-ma.sa-ru"})

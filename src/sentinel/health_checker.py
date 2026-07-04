@@ -96,24 +96,28 @@ class HealthChecker:
         }
 
     def _check_network(self) -> dict:
-        """Mac mini への到達性を ping で確認（10GbE 直結 / Tailscale VPN いずれか経由）。
+        """Mac mini への SSH 到達性を確認（10GbE 直結 / Tailscale VPN いずれか経由）。
 
-        ping は通るが応答が無い（returncode != 0）程度なら warning に留め、subprocess 自体が
-        タイムアウト/失敗するなど到達経路が完全に断たれた場合は critical とする。
-        sa-ru へ到達できないと監査アラートの SSH push が成立しないため監視する。
+        ping ではなく ssh で確認する。mac_mini_host は file_auditor.py の SSH push と
+        共有する ~/.ssh/config の Host エイリアス（例: "mac-mini"）であり、ping は
+        ~/.ssh/config を解釈しないため名前解決できない（実機で "cannot resolve" を確認・
+        是正）。監視したいのは「監査アラートの SSH push が成立するか」そのものなので、
+        実際に使う経路と同じ ssh コマンドで到達性を測るのが正確。
         """
         try:
-            # -c 1: 1 回だけ送信、-t 2: 2 秒で諦める。subprocess 全体にも 3 秒の保険を掛ける
+            # BatchMode=yes: パスフレーズ入力を待たず鍵認証失敗なら即座に失敗させる。
+            # ConnectTimeout=2: 2 秒で諦める。subprocess 全体にも 5 秒の保険を掛ける
             result = subprocess.run(
-                ["ping", "-c", "1", "-t", "2", self.mac_mini_host],
-                capture_output=True, timeout=3,
+                ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=2",
+                 self.mac_mini_host, "true"],
+                capture_output=True, timeout=5,
             )
-            # 応答あり=healthy、ping 失敗=warning（経路はあるが届かない程度に留める）
+            # 接続・認証・コマンド実行まで成功=healthy、失敗（鍵/権限等）は warning
             status = "healthy" if result.returncode == 0 else "warning"
             return {"host": self.mac_mini_host, "status": status}
         except subprocess.TimeoutExpired:
-            # ping コマンド自体が返ってこない＝経路断とみなし critical
-            return {"host": self.mac_mini_host, "status": "critical", "error": "ping timeout"}
+            # ssh コマンド自体が返ってこない＝経路断とみなし critical
+            return {"host": self.mac_mini_host, "status": "critical", "error": "ssh timeout"}
         except Exception as e:
-            # ping 不在等の予期しない失敗も到達不能扱いで critical
+            # ssh 不在等の予期しない失敗も到達不能扱いで critical
             return {"host": self.mac_mini_host, "status": "critical", "error": str(e)}

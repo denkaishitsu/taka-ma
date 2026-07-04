@@ -6,8 +6,24 @@
 
 import json
 import os
+import re
 
 import httpx
+
+# qu-e のローカル LLM（Qwen3.6-35B-A3B、thinking モデル）は応答本文を ```json フェンスで
+# 包むことがある（実機検証で "rm -rf /" 審査時に再現・是正、非決定的＝プロンプトにより
+# フェンス無しで返る場合もある）。ya-ta 側 ai_gateway.llm.extract_json と同一パターンだが、
+# qu-e は MBP 単体で常駐し ya-ta（Mac mini 専用コンポーネント）を import できないため
+# 同ロジックをここに複製する。
+_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
+
+
+def _extract_json(text: str) -> str:
+    """LLM 応答からフェンス除去した JSON 本体を取り出す（フェンス無しならそのまま返す）。"""
+    m = _FENCE_RE.search(text)
+    if m:
+        return m.group(1).strip()
+    return text.strip()
 
 
 class QueReviewer:
@@ -52,7 +68,7 @@ Respond in JSON:
 """
         try:
             response = await self._generate(prompt)
-            return json.loads(response)
+            return json.loads(_extract_json(response))
         except (json.JSONDecodeError, httpx.HTTPError) as e:
             return {"decision": "escalate",
                     "reason": f"qu-e 判定不能（{type(e).__name__}: {e}）",
@@ -78,7 +94,7 @@ Respond in JSON:
 """
         try:
             response = await self._generate(prompt)
-            return json.loads(response)
+            return json.loads(_extract_json(response))
         except (json.JSONDecodeError, httpx.HTTPError) as e:
             return {"decision": "escalate",
                     "reason": f"qu-e 判定不能（{type(e).__name__}: {e}）",
@@ -100,7 +116,7 @@ Respond in JSON:
                   .replace("{status}", status or "none"))
         try:
             response = await self._generate(prompt)
-            return json.loads(response)
+            return json.loads(_extract_json(response))
         except (json.JSONDecodeError, httpx.HTTPError) as e:
             # 判定不能（LLM 不達・壊れた JSON）は approve せず escalate に倒す
             return {
