@@ -15,6 +15,9 @@ venv/
 # Logs
 *.log
 
+# E2E test results
+docs/exam/E2E-test-spec_results
+
 # Editor / IDE
 .vscode/
 .idea/

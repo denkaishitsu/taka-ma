@@ -5,9 +5,9 @@
 """
 
 import json
-import subprocess
 from pathlib import Path
 
+from ai_gateway.llm import extract_json, run_ollama
 from ai_gateway.logger import YaTaLogger
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
@@ -41,14 +41,14 @@ class TaskDecomposer:
             system_prompt = f.read().replace("{categories}", categories)
 
         # プロンプト＋ユーザー指示をローカル ollama（ya-ta モデル）に渡しサブタスク JSON を得る
-        result = subprocess.run(
-            ["ollama", "run", self.model],
-            input=f"{system_prompt}\n\nユーザー指示: {command}",
-            capture_output=True, text=True, timeout=60,
+        stdout = run_ollama(
+            self.model,
+            f"{system_prompt}\n\nユーザー指示: {command}",
+            timeout=60,
         )
         try:
             # サブタスクごとに生判定をログし、信頼度の低い light を heavy へ格上げする
-            subtasks = json.loads(result.stdout)
+            subtasks = json.loads(extract_json(stdout))
             for s in subtasks:
                 # 判定ログ: モデルの生判定（light→heavy 強制の前）をサブタスク単位で記録する。
                 # 強制後ではなく生判定を残すのは、Phase 2 が「モデルがどう誤ったか」を学習対象に

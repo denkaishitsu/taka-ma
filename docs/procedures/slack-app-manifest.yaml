@@ -1,0 +1,60 @@
+# taka-ma Slack App マニフェスト
+# 用途: api.slack.com の「Features → App Manifest」に貼り付けると、
+#       Scopes / Events / Slash Commands / Socket Mode を一括設定できる。
+# 手順: appendix-A-slack-setup.md の Step 3〜5 をこの貼り付け 1 回で代替する。
+# 注意: トークン(xapp-/xoxb-)発行・Install・チャンネル作成は本マニフェストでは行えない（別途手動）。
+display_information:
+  name: taka-ma
+  description: taka-ma 人とAIの協調開発システム
+features:
+  app_home:
+    home_tab_enabled: false
+    messages_tab_enabled: true            # Bot への DM（message.im）受信に必須
+    messages_tab_read_only_enabled: false # ユーザーが DM を送信できるようにする
+  bot_user:
+    display_name: taka-ma
+    always_online: true
+  slash_commands:
+    - command: /taka-ma-task
+      description: 相談を開始
+    - command: /taka-ma-go
+      description: 会話を締めて着手
+    - command: /taka-ma-status
+      description: システム状態を確認
+    - command: /taka-ma-approve
+      description: 承認リクエストに応答
+    - command: /taka-ma-stop
+      description: 緊急停止
+    - command: /taka-ma-start
+      description: サービス復旧
+    - command: /taka-ma-ollama-stop
+      description: ollama 手動停止
+    - command: /taka-ma-logs
+      description: ログを取得
+    - command: /taka-ma-blender
+      description: Blender モード切替
+    - command: /taka-ma-user
+      description: ユーザー管理
+    - command: /taka-ma-model
+      description: モデル管理
+oauth_config:
+  scopes:
+    bot:
+      - chat:write
+      - chat:write.customize
+      - groups:history
+      - groups:read
+      - app_mentions:read
+      - im:history
+      - commands
+      - files:write
+      - reactions:write
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention
+      - message.groups
+      - message.im
+  socket_mode_enabled: true
+  org_deploy_enabled: false
+  token_rotation_enabled: false

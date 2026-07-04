@@ -24,7 +24,7 @@ import time
 import uuid
 from pathlib import Path
 
-from ai_gateway.llm import run_ollama
+from ai_gateway.llm import extract_json, run_ollama
 
 logger = logging.getLogger("sa-ru.conversation")
 
@@ -126,7 +126,10 @@ class ConversationManager:
         stdout = None
         try:
             stdout = run_ollama(self.model, prompt, timeout=self.timeout)
-            parsed = json.loads(stdout)
+            # gemma4:12b は json.loads が失敗する ```json フェンス付きで出力することがある
+            # （実機検証で再現・2026-07-04）。ai_gateway 側 classifier/decomposer と同じ
+            # extract_json でフェンス除去してからパースする（同根の欠陥・§9.2 と同一パターン）。
+            parsed = json.loads(extract_json(stdout))
             return {
                 "reply": parsed.get("reply", ""),
                 "ready": bool(parsed.get("ready", False)),

@@ -5,8 +5,9 @@
 """
 
 import json
-import subprocess
 from pathlib import Path
+
+from ai_gateway.llm import extract_json, run_ollama
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
@@ -31,14 +32,14 @@ class RiskClassifier:
             system_prompt = f.read()
 
         # プロンプト＋対象操作を ya-ta モデルに渡し、JSON 形式の判定を得る
-        result = subprocess.run(
-            ["ollama", "run", self.model],
-            input=f"{system_prompt}\n\n操作: {operation}",
-            capture_output=True, text=True, timeout=60,
+        stdout = run_ollama(
+            self.model,
+            f"{system_prompt}\n\n操作: {operation}",
+            timeout=60,
         )
         try:
             # tier 欠落は判定不成立とみなし、フォールバックへ落とす
-            parsed = json.loads(result.stdout)
+            parsed = json.loads(extract_json(stdout))
             if "tier" not in parsed:
                 raise KeyError("tier missing")
             return parsed

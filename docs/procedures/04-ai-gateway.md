@@ -75,9 +75,13 @@ ssh mac-mini "ollama run deepseek-r1:32b hi >/dev/null; ollama ps; ollama stop d
 
 ### Step 2: PyInfra実行 (ya-ta を配備)
 
+Mac mini 上で**ローカル実行**する（`@local`）。
+
 ```bash
-pyinfra mac-mini pyinfra/deploys/ai_gateway.py
+pyinfra -y @local pyinfra/deploys/ai_gateway.py
 ```
+
+> **NOTE（実行モデル）**: 旧版は `pyinfra mac-mini ...` と記載していたが、これはホストを定義した**インベントリ**が前提（本リポジトリに未整備）で、実行すると `mac-mini is neither an inventory file, ...` で失敗する（01 の NOTE と同一の欠陥）。本手順は Mac mini ローカルの `@local` 実行に統一する。
 
 [`pyinfra/deploys/ai_gateway.py`](../../pyinfra/deploys/ai_gateway.py) が下記を冪等に実行する:
 

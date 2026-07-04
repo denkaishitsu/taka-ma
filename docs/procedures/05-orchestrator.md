@@ -67,9 +67,13 @@ ssh mac-mini "chmod 600 /opt/taka-ma/config/.env"
 
 ### Step 2: PyInfra実行 (sa-ru を配備)
 
+Mac mini 上で**ローカル実行**する（`@local`）。
+
 ```bash
-pyinfra mac-mini pyinfra/deploys/orchestrator.py
+pyinfra -y @local pyinfra/deploys/orchestrator.py
 ```
+
+> **NOTE（実行モデル）**: 旧版は `pyinfra mac-mini ...` と記載していたが、これはホストを定義した**インベントリ**が前提（本リポジトリに未整備）で、実行すると `mac-mini is neither an inventory file, ...` で失敗する（01 の NOTE と同一の欠陥）。本手順は Mac mini ローカルの `@local` 実行に統一する。
 
 [`pyinfra/deploys/orchestrator.py`](../../pyinfra/deploys/orchestrator.py) が下記を冪等に実行する（番号は論理フロー順、pyinfra スクリプトの実行順とは別。冪等性は担保済）:
 

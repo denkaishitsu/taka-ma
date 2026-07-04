@@ -42,7 +42,7 @@ Mac mini M4 Pro (司令塔)
 
 ### Step 1: 手動準備（PyInfra 実行前）
 
-Slack ワークスペース・App の新規作成は Web 上で実施する（PyInfra ではカバーできない作業）。
+Slack ワークスペース・App の新規作成は Web 上で実施する（PyInfra ではカバーできない作業）。管理画面のクリック単位の操作詳細は [Appendix A: Slack 設定 完全手順](appendix-A-slack-setup.md) を参照。
 
 #### 1-1. Slack ワークスペースの作成
 
@@ -55,14 +55,14 @@ Slack ワークスペース・App の新規作成は Web 上で実施する（Py
 
 1. https://api.slack.com/apps にアクセス
 2. 「Create New App」→「From scratch」
-3. App Name: `taka-ma-sa-ru`
+3. App Name: `taka-ma`
 4. Workspace: 1-1 で作成したワークスペースを選択
 
 #### 1-3. Socket Mode を有効化
 
 1. 左メニュー「Socket Mode」→ Enable Socket Mode を ON
 2. App-Level Token を生成:
-   - Token Name: `taka-ma-sa-ru-socket`
+   - Token Name: `taka-ma-socket`
    - Scope: `connections:write`
    - 生成された `xapp-...` トークンを控える
 
@@ -90,7 +90,7 @@ Subscribe to bot events:
 
 | Event | 用途 |
 |-------|------|
-| `app_mention` | @taka-ma-sa-ru で Bot 呼び出し |
+| `app_mention` | @taka-ma で Bot 呼び出し |
 | `message.groups` | Private Channel メッセージの監視 |
 | `message.im` | DM メッセージの受信（Bot への直接指示） |
 
@@ -120,9 +120,13 @@ Subscribe to bot events:
 
 ### Step 2: PyInfra実行 (u-zu を配備)
 
+Mac mini 上で**ローカル実行**する（`@local`）。
+
 ```bash
-pyinfra mac-mini pyinfra/deploys/slack_bot.py
+pyinfra -y @local pyinfra/deploys/slack_bot.py
 ```
+
+> **NOTE（実行モデル）**: 旧版は `pyinfra mac-mini ...` と記載していたが、これはホストを定義した**インベントリ**が前提（本リポジトリに未整備）で、実行すると `mac-mini is neither an inventory file, ...` で失敗する（01 の NOTE と同一の欠陥）。本手順は Mac mini ローカルの `@local` 実行に統一する。
 
 [`pyinfra/deploys/slack_bot.py`](../../pyinfra/deploys/slack_bot.py) が下記を冪等に実行する:
 
@@ -160,12 +164,12 @@ EOF
 ssh mac-mini "chmod 600 /opt/taka-ma/config/.env"
 ```
 
-> **NOTE**: `.env` ファイルは `/opt/taka-ma/config/.env` で一元管理する。各コンポーネント（03-slack-bot, 06-task-models 等）が自分のキーを追記する。テンプレート (`.env.example`) は 01-common-base で配置済み。
+> **NOTE**: `.env` ファイルは `/opt/taka-ma/config/.env` で一元管理する。各コンポーネント（03-slack-bot, 06-task-models 等）が自分のキーを追記する。雛形 `.env.example` は本 deploy（Step 2）が [`pyinfra/templates/env.example.j2`](../../pyinfra/templates/env.example.j2) から `/opt/taka-ma/config/.env.example` に配置する。
 
 #### 3-2. Private Channel の作成と Bot 招待
 
 1. Slack で Private Channel `#taka-ma` を作成
-2. Bot を招待: `/invite @taka-ma-sa-ru`
+2. Bot を招待: `/invite @taka-ma`
 
 #### 3-3. 初期 Owner の登録
 
@@ -175,7 +179,7 @@ ssh mac-mini "chmod 600 /opt/taka-ma/config/.env"
 
 複数の Slack ワークスペースで運用する場合、各ワークスペースを `team_id` で識別し、ワークスペースごとの bot トークンを登録する。Socket Mode は app-level トークン 1 本で全ワークスペースのイベントを受信するため、追加ワークスペースでもポート開放は不要（OAuth installer は採らない）。ワークスペースを追加するごとに以下を繰り返す。
 
-1. 1-2 で作成した同一 Slack App（`taka-ma-sa-ru`）を追加ワークスペースにもインストールする（1-7 と同じ操作を対象ワークスペースで実施）。発行される Bot User OAuth Token (`xoxb-...`) を控える。
+1. 1-2 で作成した同一 Slack App（`taka-ma`）を追加ワークスペースにもインストールする（1-7 と同じ操作を対象ワークスペースで実施）。発行される Bot User OAuth Token (`xoxb-...`) を控える。
 2. 追加ワークスペースの `team_id`（`T...`）を控える。
 3. 3-2 と同様に Private Channel を作成し、Bot を招待してチャンネル ID を控える。
 4. `/opt/taka-ma/config/.env` に `team_id` をキーとして bot トークンとチャンネル ID を追記する。app-level トークン（`SLACK_APP_TOKEN`）は 3-1 の 1 本を全ワークスペース共通で使う。

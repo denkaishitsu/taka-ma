@@ -27,6 +27,8 @@ JSON オブジェクトを 1 つだけ出力します。前後に説明文・コ
 - `ready` が false のとき: `reply` に会話の返信を入れ、`summary` は null。
 - `ready` が true のとき: `summary` に構造化した実行指示（worker への完全な指示文）を入れ、
   `reply` には「この内容で着手します」等の短い確認文を入れる。
+- `reply` と `summary` は両方とも、直近の発話で人間が使っている言語で書く（`reply` だけでなく
+  `summary` も対象。実機検証で summary のみ英語になる混在を確認・是正）。
 
 ## 入力
 

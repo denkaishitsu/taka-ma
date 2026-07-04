@@ -1,0 +1,11 @@
+# Managed by pyinfra (taka-ma ssh_tunnel.py). Do not edit by hand.
+# クラスタ相手機への SSH エイリアス（Tailscale 経由）。
+# 既存 ~/.ssh/config を壊さないよう、本ファイルは ~/.ssh/config.d/ 配下に置き
+# ~/.ssh/config から Include で取り込む。
+# IdentityFile は自機専用鍵（マシン別鍵）。
+Host {{ peer_alias }}
+    HostName {{ peer_host }}
+    User {{ peer_user }}
+    IdentityFile {{ identity_file }}
+    IdentitiesOnly yes
+    StrictHostKeyChecking accept-new

@@ -36,7 +36,8 @@ models:
     vendor: anthropic
     methods: [pty]
     command: claude
-    model_flag: ""            # heavy デフォルト（claude CLI 既定 = Opus 4.8）
+    model_flag: "--model opus" # heavy デフォルト（明示指定必須。claude CLI 既定は端末の ~/.claude/settings.json
+                                # の model 設定に従うため無指定だと Opus 4.8 が保証されない。実機検証で確認済）
     capabilities: [code, design, reasoning, implementation]
     description: "重量タスクの既定。探索・試行錯誤・ツール使用を伴う作業"
 
@@ -46,7 +47,8 @@ models:
     vendor: anthropic
     methods: [pty]
     command: claude
-    model_flag: "--model fable-5"   # ★CLI が受理する正確な値は実機要確認
+    model_flag: "--model fable"   # claude CLI の --model はエイリアス（fable/opus/sonnet/haiku）を取る。
+                                   # full_name の "claude-fable-5" は不可（実機検証で拒否を確認）
     capabilities: [code, design, reasoning, implementation]
     description: "最難関タスク用。:fable で明示指定（難易度自動振り分けは Phase2）"
 
@@ -66,7 +68,7 @@ models:
     vendor: anthropic
     methods: [pty]
     command: claude
-    model_flag: "--model sonnet-4.6"
+    model_flag: "--model sonnet"   # エイリアス指定（"sonnet-4.6"は無効値・実機検証で拒否を確認）
     capabilities: [code, reasoning]
     description: "中量タスク。Opus より高速・低コスト"
 
@@ -76,7 +78,7 @@ models:
     vendor: anthropic
     methods: [pty]
     command: claude
-    model_flag: "--model haiku-4.5"
+    model_flag: "--model haiku"   # エイリアス指定（"haiku-4.5"は無効値・実機検証で拒否を確認）
     capabilities: [light-task, qa]
     description: "軽量タスク。高速応答"
 
@@ -87,7 +89,11 @@ models:
     methods: [pty, subprocess]   # heavy 対話 = pty、高度なマルチモーダル解析単発 / cross-review / フォールバック = subprocess
     command: agy                 # Antigravity CLI（Gemini CLI の後継）。認証は macOS keychain 依存（設計書 §8.5/§8.6）
     keychain_auth: true          # 認証が macOS keychain 依存 → SSH 直実行不可。GUI 起源 tmux 内で実行（§8.6）
-    model_flag: "-p --model gemini-3.5-flash"   # agy: -p=非対話単発 + --model=版明示（agy 既定も 3.5 Flash）
+    model_flag: "-p"   # agy: -p=非対話単発。--model は付加しない — subprocess 経路は run_model_subprocess が
+                        # プロンプトを model_flag の末尾に追記するため "-p --model X <prompt>" の語順になり、
+                        # agy の -p は次トークンをプロンプト値として消費する実装のため --model の文字列自体を
+                        # プロンプトとして誤消費し本来のプロンプトが黙って破棄される（実機検証で再現・2026-07-03）。
+                        # agy 既定モデルが 3.5 Flash のため --model 省略でも要件（Flash 応答）を満たす
     capabilities: [multimodal-analysis, code, reasoning]
     capability_description: |
       - 動画・音声・画像の高度な解析（理解）を含むタスク → model: "gemini"
@@ -103,7 +109,12 @@ models:
     methods: [pty, subprocess]
     command: agy
     keychain_auth: true
-    model_flag: "-p --model gemini-3.1-pro"   # agy: 最上位を明示選択
+    model_flag: "-p --model gemini-3.1-pro"   # agy: 最上位を明示選択（Phase2 未着手・現状無効。理由2件:
+                                                # (a) subprocess 経路は語順が "-p --model X <prompt>" になり
+                                                #     プロンプトが破棄される（gemini 側コメント参照）。
+                                                # (b) 語順を正しても（"-p <prompt> --model X"）agy 1.0.16 は
+                                                #     --model で実際に 3.1 Pro へ切替わらない（自己申告が常に
+                                                #     3.5 Flash のまま。実機検証で再現・2026-07-03）
     capabilities: [multimodal-analysis, code, reasoning]
     capability_description: |
       - 複雑・創造的タスクで Gemini の最上位が要るとき → model: "gemini-pro"

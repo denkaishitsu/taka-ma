@@ -7,10 +7,14 @@
 記録発行（制御側・共有）は _manifest.record。
 """
 
+import getpass
 import os
 import sys
 
 from pyinfra.operations import brew, server, files, pip
+
+# @local 実行では各マシンの実行ユーザーが所有者となる。
+_USER = getpass.getuser()
 
 # 共有の記録ヘルパー（同ディレクトリの _manifest.py）を import
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -19,8 +23,8 @@ from _manifest import record  # noqa: E402
 # --- マニフェスト記録の前提（chicken-and-egg 解決のため最初に置く） ---
 # data ディレクトリと lib ディレクトリを先に作り、記録ヘルパーと
 # アンインストール・ランナーを配置する。
-files.directory(path="/opt/taka-ma/data", user="youruser", group="staff", present=True)
-files.directory(path="/opt/taka-ma/lib", user="youruser", group="staff", present=True)
+files.directory(path="/opt/taka-ma/data", user=_USER, group="staff", present=True)
+files.directory(path="/opt/taka-ma/lib", user=_USER, group="staff", present=True)
 files.put(
     src="pyinfra/lib/install_manifest.py",
     dest="/opt/taka-ma/lib/install_manifest.py",
@@ -52,8 +56,15 @@ brew.packages(packages=_PACKAGES, present=True)
 record("common", "brew.packages", ",".join(_PACKAGES),
        {"op": "skip", "reason": "shared homebrew packages"})
 
-# Tailscale（外部資産のため撤去対象外）
-brew.casks(casks=["tailscale"], present=True)
+# Tailscale（外部資産・撤去対象外）。既に導入済み（cask 管理下 or /Applications に
+# アプリが存在）なら何もしない。未導入時のみ cask 導入する。
+# 旧版は brew.casks(present=True) を無条件実行していたが、brew 管理外の既存
+# Tailscale.app に対し再導入を試み管理者権限（sudo）を要求して非対話 deploy が停止した。
+server.shell(name="Tailscale 導入（未導入時のみ）", commands=[
+    "brew list --cask tailscale >/dev/null 2>&1 "
+    "|| test -d /Applications/Tailscale.app "
+    "|| brew install --cask tailscale",
+])
 record("common", "brew.casks", "tailscale",
        {"op": "skip", "reason": "external (tailscale)"})
 
@@ -69,7 +80,7 @@ record("common", "brew.service ollama", "ollama",
 for d in ["config", "logs", "models"]:
     files.directory(
         path=f"/opt/taka-ma/{d}",
-        user="youruser",
+        user=_USER,
         group="staff",
         present=True,
     )

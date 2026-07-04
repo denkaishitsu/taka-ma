@@ -8,7 +8,7 @@ import json
 import re
 from pathlib import Path
 
-from ai_gateway.llm import run_ollama
+from ai_gateway.llm import extract_json, run_ollama
 from ai_gateway.logger import YaTaLogger
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
@@ -100,7 +100,7 @@ class TaskClassifier:
         )
         try:
             # category 欠落は判定不成立とみなしフォールバックへ落とす
-            parsed = json.loads(stdout)
+            parsed = json.loads(extract_json(stdout))
             if "category" not in parsed:
                 raise KeyError("category missing")
             # 判定ログ: モデルの生判定（light→heavy 強制の前）を記録。

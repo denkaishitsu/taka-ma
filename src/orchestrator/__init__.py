@@ -179,9 +179,13 @@ class Orchestrator:
         self.process_mgr = RemoteProcessManager(ssh_host=mbp_host, ssh_timeout=ssh_timeout)
         self.slack = SlackNotifier()
 
-        # 承認パイプライン（worker の y/n 介入。ya-ta=in-process / qu-e=SSH、§8.8〜§8.9）
-        from main import ApprovalPipeline
-        self.approval_pipeline = ApprovalPipeline(config, slack_notifier=self.slack, ssh_host=mbp_host)
+        # 承認パイプライン（worker の y/n 介入。ya-ta=in-process / qu-e=SSH、§8.8〜§8.9）。
+        # 実体は approval-pipeline パッケージ（08 で /opt/taka-ma/sa-ru/approval-pipeline へ配備、
+        # 設計上「sa-ru の一部」）に存在する。設計 §08「パイプラインは y/n 検出時に起動」に従い、
+        # 初回 y/n 検出時に遅延生成する（approval_pipeline プロパティ）。__init__ で eager import
+        # すると「08 は 05 sa-ru 稼働を前提／05 は 08 配備を前提」の循環になり sa-ru が単体起動できない。
+        self._mbp_host = mbp_host
+        self._approval_pipeline = None
 
         # カテゴリ別キュー（FIFO、上限付き）
         self.queue_light = asyncio.Queue(maxsize=100)
@@ -471,6 +475,20 @@ class Orchestrator:
                     self._finalize_confirm(path, record, status)
             await asyncio.sleep(self.exec_confirm_poll)
 
+    @property
+    def approval_pipeline(self):
+        """承認パイプラインを初回 y/n 検出時に遅延生成する（設計 §08）。
+
+        approval-pipeline は sa-ru 配下（/opt/taka-ma/sa-ru/approval-pipeline、08 で配備）に
+        あり PYTHONPATH 経由で import する。未配備の段階では sa-ru は y/n を検出しない限り本経路に
+        入らないため、遅延生成にすることで approval-pipeline 不在でも sa-ru 単体で起動できる。
+        """
+        if self._approval_pipeline is None:
+            from main import ApprovalPipeline
+            self._approval_pipeline = ApprovalPipeline(
+                self.config, slack_notifier=self.slack, ssh_host=self._mbp_host)
+        return self._approval_pipeline
+
     def _is_confirm_expired(self, record: dict) -> bool:
         """pending の着手確認が timeout_sec を超過したか判定する。"""
         try:
@@ -695,7 +713,11 @@ class Orchestrator:
             candidates = [user_specified]
         else:
             defaults = self.config["routing"]["category_defaults"].get(category, [])
-            max_fallback_attempts = self.config.get("fallback", {}).get("max_fallback_attempts")
+            # ya-ta.yaml の fallback: はコメントのみの場合 YAML 上 None になり、.get("fallback", {})
+            # は「キー自体は存在する」ため既定 {} が使われず None を返す（dict.get の既定は「キー不在」
+            # 時のみ有効・値が None でも代替されない）。.get("fallback") or {} で None も {} に潰す
+            # （実機検証で AttributeError: 'NoneType' object has no attribute 'get' を確認・2026-07-04）。
+            max_fallback_attempts = (self.config.get("fallback") or {}).get("max_fallback_attempts")
             # max_fallback_attempts は fallback の試行回数（先頭は含まない）。
             # 未指定なら配列全要素。N 指定なら先頭 + fallback N 件（合計 N+1 件）
             candidates = defaults if max_fallback_attempts is None else defaults[:max_fallback_attempts + 1]
@@ -888,7 +910,10 @@ class Orchestrator:
             else:
                 # category_defaults 配列から解決（[0] がデフォルト）
                 defaults = self.config["routing"]["category_defaults"].get(s["category"], [])
-                max_fallback_attempts = self.config.get("fallback", {}).get("max_fallback_attempts")
+                # fallback: がコメントのみだと YAML 上 None になり .get(...,{}) の既定が効かない
+                # （キー自体は存在するため）。.get("fallback") or {} で None を吸収する（同根の欠陥、
+                # _execute_worker_task 側コメント参照）
+                max_fallback_attempts = (self.config.get("fallback") or {}).get("max_fallback_attempts")
                 candidates = defaults if max_fallback_attempts is None else defaults[:max_fallback_attempts + 1]
                 if candidates:
                     primary = candidates[0]

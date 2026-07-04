@@ -9,8 +9,10 @@
 - [コンポーネントと役割](#コンポーネントと役割)
 - [初期 LLM の配置と用途](#初期-llm-の配置と用途)
 - [構築手順書の歩き方](#構築手順書の歩き方)
+- [ゼロから構築の前提](#ゼロから構築の前提)
 - [構築後の運用](#構築後の運用)
 - [アンインストール方法と仕組み](#アンインストール方法と仕組み)
+- [E2E 検証の前提](#e2e-検証の前提)
 - [リリースノート（予定）](#リリースノート予定)
 
 ## 大まかな構想
@@ -50,10 +52,14 @@
 | **DeepSeek-R1 32B** | ローカル（差し替え可） | Mac mini | ya-ta | タスク難易度判定・最適モデル選択 |
 | **Gemma 4 31B** | ローカル | MBP | light worker | 軽量タスク（質問応答・フォーマット変換等） |
 | **Claude Opus 4.8** | API (ProMax) | MBP (Claude Code ×N) | heavy worker | 要件定義・設計・実装・テスト（最難関は Fable 5） |
-| **Gemini 3.5 Flash** | API | MBP | heavy worker | マルチモーダル・フォールバック・cross-review（最上位は 3.1 Pro） |
+| **Gemini 3.5 Flash**（agy 既定） | API (Pro) | MBP | heavy worker | マルチモーダル・フォールバック・cross-review。**初期リリースは Flash 固定**（最上位 3.1 Pro は Phase2） |
 | **Qwen3.6-35B-A3B** | ローカル | MBP | qu-e | コード検証・Tier 2 審査 |
 
 > 上記は**初期構成**。各役割のモデルは将来差し替え可能（モデル交換は [claims](../claims/) で管理）。
+
+### マイルストーン: Phase2 での Gemini 上位モデル切替
+
+初期リリースの Gemini は既定（agy / Gemini 3.5 Flash）に固定する。Gemini の上位モデルへの切替は **Phase2** で対応する。前提として、agy の `-p`（非対話単発）モードで `--model` フラグが機能せず常に既定へフォールバックする不具合（[E2E 検証の前提](#e2e-検証の前提)参照）の解消が必要。切替先モデル名は一次ソースで確定してから着手する。
 
 ## 構築手順書の歩き方
 
@@ -67,6 +73,10 @@
 | 06 | [タスク実行モデル](06-task-models.md) | worker LLM 群 |
 | 07 | [qu-e（Sentinel）](07-sentinel.md) | 守護プロセス |
 | 08 | [承認パイプライン](08-approval-pipeline.md) | y/n 三段階審査 |
+
+## ゼロから構築の前提
+
+本手順書群は「**ゼロから構築**」を前提とする。構築途中で必要なファイル（インベントリ・テンプレート・鍵・設定）が**存在しないのは欠陥ではなく構築対象**である。不在を理由に停止・報告して終わらせず、**作成・構築して前進する**。手順そのものが無い／誤っている場合は、正本である**構築手順書を更新**してから進める。
 
 ## 構築後の運用
 
@@ -91,7 +101,7 @@
 | アプリ本体 | `/opt/taka-ma/`（sa-ru / ya-ta / u-zu / qu-e / config / logs / data / models） | `data/` にタスク・承認履歴 |
 | Python 仮想環境 | `/opt/taka-ma-env/` | uv で作成 |
 | ローカル LLM (ollama) | [初期 LLM の配置と用途](#初期-llm-の配置と用途) の各 ollama モデル | 容量大。共有 ollama に注意 |
-| SSH 設定 | `~/.ssh/{taka-ma-cluster,taka-ma-cluster.pub,config}`、`/etc/ssh/sshd_config.d/taka-ma-cluster.conf`、`sshd_config` の Include 行 | 双方向 |
+| SSH 設定 | マシン別鍵 `~/.ssh/taka-ma-<role>{,.pub}`、`~/.ssh/config.d/taka-ma-cluster`・`~/.ssh/config` の Include 行、`~/.ssh/authorized_keys` の相手機公開鍵、`/etc/ssh/sshd_config.d/taka-ma-cluster.conf`、`sshd_config` の Include 行 | 双方向 |
 | 静的 IP | `networksetup` で設定した 10GbE 直結 IP | 直結を使う構成のみ |
 | Homebrew / 外部資産 | ollama・node・gh 等の汎用ツール、Slack App、Claude / Gemini API キー、Tailscale | 共有・外部のため自動削除しない |
 
@@ -112,6 +122,21 @@
 - **Slack App** は Slack 管理画面でアンインストール（トークン失効）。
 - **Claude / Gemini の API キー** は各プロバイダ側で失効させる。
 - **Tailscale** は他用途がなければアプリ側でログアウト・削除。
+
+## E2E 検証の前提
+
+ゼロから全工程を一気通貫で検証する E2E テスト仕様は [`docs/exam/E2E-test-spec.md`](../exam/E2E-test-spec.md)。フェーズ（T01〜T08）単位で進め、合否判定は**コマンド出力を根拠**とする。
+
+### フェーズで FAIL した場合の進め方（更新 → 当該フェーズ初期化 → 再開）
+
+あるフェーズの必須（M）ケースが1つでも PASS しなかった場合:
+
+1. **原因特定**: FAIL ケースの出力から、src・deploy・テンプレート・インベントリ・手順書のどこが欠落／誤りかを特定する。
+2. **更新（作成を含む・恒久修正）**: 不足物は新規作成し、手順が無い／誤っていれば構築手順書を更新する（[ゼロから構築の前提](#ゼロから構築の前提)に従う）。暫定回避は禁止。
+3. **当該フェーズの初期化**: そのフェーズが変更した実機状態のみを撤去し、**フェーズ開始直前の状態に戻す**（前段フェーズの成果は保持）。例: `T01(PASS) → T02(FAIL)` なら T02 のみ初期化し、T01 の共通基盤は残す。撤去は[逆順撤去の順序](#逆順撤去の順序)に準じる。
+4. **再開**: 当該フェーズを先頭から再実行し、全 M ケース PASS までこのループを繰り返す。
+
+> 「初期化」= 対象フェーズの開始直前の状態に戻すこと。フェーズをまたいで前段を壊さない。
 
 ## リリースノート（予定）
 

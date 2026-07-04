@@ -13,6 +13,10 @@ from pyinfra.operations import files, server, pip
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _manifest import record  # noqa: E402
 
+# pyinfra files.* は "~" を展開しない（@local ではリテラル ./~ を生成し偽成功になる）。
+# LaunchAgents の配置先は絶対パスで指定する。
+HOME = os.path.expanduser("~")
+
 # Step 1: ollama モデルのダウンロード（モデル名は sa-ru.yaml を単一ソースとして参照 — Task #26）
 # モデルは component="models" で記録（ollama rm は host グローバルで
 # コンポーネント属性は撤去に無関係。複数 deploy が同一モデルを宣言しても
@@ -45,13 +49,13 @@ server.shell(commands=[
 
 # Step 7: Slack 通知 — 依存パッケージ
 pip.packages(
-    packages=["slack-sdk", "python-dotenv", "pexpect", "pyyaml"],
+    packages=["slack-sdk", "python-dotenv", "pexpect", "pyyaml", "watchdog"],
     virtualenv="/opt/taka-ma-env",
 )
 record("sa-ru", "pip.packages (sa-ru)",
-       "slack-sdk,python-dotenv,pexpect,pyyaml",
+       "slack-sdk,python-dotenv,pexpect,pyyaml,watchdog",
        {"op": "pip.uninstall",
-        "packages": ["slack-sdk", "python-dotenv", "pexpect", "pyyaml"],
+        "packages": ["slack-sdk", "python-dotenv", "pexpect", "pyyaml", "watchdog"],
         "virtualenv": "/opt/taka-ma-env"})
 
 # Step 9: 設定ファイルの配置（ホスト共通の静的 YAML。変数置換不要のため files.put で配置）
@@ -66,8 +70,8 @@ record("sa-ru", "files.template sa-ru.yaml",
 
 # Step 10: launchd サービス登録（冪等: unload してから load）
 files.template(
-    src="templates/com.taka-ma.sa-ru.plist.j2",
-    dest="~/Library/LaunchAgents/com.taka-ma.sa-ru.plist",
+    src="pyinfra/templates/com.taka-ma.sa-ru.plist.j2",
+    dest=f"{HOME}/Library/LaunchAgents/com.taka-ma.sa-ru.plist",
 )
 server.shell(commands=[
     # macOS 10.10+ 推奨構文。再ロードに備えて bootout を先に実行（未登録時はエラー無視）

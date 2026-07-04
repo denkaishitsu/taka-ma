@@ -144,6 +144,8 @@ graph TD
 | 07 | [qu-e](docs/procedures/07-sentinel.md) | 守護プロセス |
 | 08 | [承認パイプライン](docs/procedures/08-approval-pipeline.md) | y/n 三段階審査 |
 
+> **依存関係について**: Python パッケージや Homebrew パッケージは、各手順書の pyinfra デプロイ（`pip.packages` / `brew.packages`）が自動で導入します。手動の `pip install` や `requirements.txt` は不要です（依存の正本は `pyinfra/deploys/` の各デプロイスクリプト）。
+
 ## ドキュメント
 
 - [設計書](docs/design/design-development-system.md) — 詳細仕様・設計判断

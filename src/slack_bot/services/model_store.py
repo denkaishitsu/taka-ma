@@ -69,9 +69,17 @@ def _write_atomic(text: str) -> None:
 
 
 def load_models() -> dict:
-    """models 辞書（key -> conf）を返す。models セクションが無ければ空 dict。"""
-    with open(_yata_path()) as f:
-        data = yaml.safe_load(f) or {}
+    """models 辞書（key -> conf）を返す。
+
+    ya-ta.yaml がまだ存在しない（ya-ta 未構築）場合・models セクションが
+    無い場合はいずれも空 dict を返す。読取系は設定不在をエラーにせず
+    「登録モデル無し」として扱う（書込系 add/install は別途ファイルを要求）。
+    """
+    try:
+        with open(_yata_path()) as f:
+            data = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        return {}
     return data.get("models") or {}
 
 

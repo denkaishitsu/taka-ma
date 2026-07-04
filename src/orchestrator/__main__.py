@@ -10,11 +10,22 @@ ProgramArguments はこのエントリを指す。
 """
 
 import asyncio
+import logging
+import sys
 from pathlib import Path
 
 import yaml
 
 from orchestrator import Orchestrator
+
+# launchd 配下では stdout がそのままサービスログ（plist の StandardOutPath=sa-ru.log）になるため、
+# 全ロガーの出力を標準出力へ集約する。u-zu（slack_bot/main.py）と同一方針。これが無いと
+# logging.getLogger("sa-ru.orchestrator") にハンドラが付かず INFO ログが sa-ru.log に出ない。
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
 
 # ya-ta.yaml と sa-ru.yaml をマージして単一 config を構築する。
 # モデル関連設定（models / routing / fallback / concurrency）は ya-ta.yaml に集約し、

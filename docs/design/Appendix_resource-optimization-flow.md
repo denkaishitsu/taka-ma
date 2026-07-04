@@ -61,4 +61,4 @@ flowchart TD
 | E / F / H / K | `src/orchestrator/__init__.py` | `Orchestrator.run()` / `ResourceNotifyHandler.on_created()` / `_worker_heavy()` / `_execute_heavy_with_release()` |
 | G / I | `src/orchestrator/concurrency.py` | `DynamicConcurrencyLimiter.set_limit()` / `acquire()`（`release()` も） |
 
-配色は CLAUDE.md 作図ルール準拠（永久ループ=薄緑、分岐=薄オレンジ、独立データ=薄青、上限反映=成功緑、いずれも文字色 #000）。
+配色は本リポジトリの作図ルール準拠（永久ループ=薄緑、分岐=薄オレンジ、独立データ=薄青、上限反映=成功緑、いずれも文字色 #000）。

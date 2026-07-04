@@ -26,8 +26,12 @@ record("models", f"ollama pull {_model}", _model,
 #      KV キャッシュで常駐 47GB に達し予算 56GB を食い尽くす（2026-06-06 実測）。32K なら常駐 ~26GB。
 #      ya-ta コードは `ollama run` 経由で num_ctx を渡さないため、モデル既定値として焼き込む。
 #      同タグ上書き・重み共有（再 DL なし）。値は src/ai_gateway/config/ya-ta.yaml の num_ctx と一致させる。
+# NOTE: ollama 0.30 系は `create -f -`（stdin）で Modelfile を読めず
+#       「no Modelfile found」になるため、一時ファイルに書いてパス渡しする。
 server.shell(commands=[
-    f"printf 'FROM {_model}\\nPARAMETER num_ctx 32768\\n' | ollama create {_model} -f -",
+    f"M=$(mktemp -d)/Modelfile; "
+    f"printf 'FROM {_model}\\nPARAMETER num_ctx 32768\\n' > \"$M\"; "
+    f"ollama create {_model} -f \"$M\"; rm -f \"$M\"",
 ])
 
 # Step 2: アプリケーション配置（decomposer.py, classifier.py, risk_classifier.py 含む）

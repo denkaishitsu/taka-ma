@@ -1,0 +1,9 @@
+# Managed by pyinfra (taka-ma ssh_tunnel.py). Do not edit by hand.
+# taka-ma クラスタ用 sshd ドロップイン（/etc/ssh/sshd_config.d/ に Include 方式で配置）。
+# 公開鍵認証のみ許可・パスワード認証無効・root ログイン禁止。
+# 既存 /etc/ssh/sshd_config 本体は変更せず Include 行のみ追加する（破壊しない）。
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+PermitRootLogin no

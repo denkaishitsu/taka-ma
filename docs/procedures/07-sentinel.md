@@ -56,9 +56,13 @@ MBP M4 Max (128GB)
 
 ### Step 2: PyInfra実行 (qu-e を配備)
 
+MBP 上で**ローカル実行**する（`@local`）。
+
 ```bash
-pyinfra mbp pyinfra/deploys/sentinel.py
+pyinfra -y @local pyinfra/deploys/sentinel.py
 ```
+
+> **NOTE（実行モデル）**: 旧版は `pyinfra mbp ...` と記載していたが、これはホストを定義した**インベントリ**が前提（本リポジトリに未整備）で、実行すると `mbp is neither an inventory file, ...` で失敗する（01 の NOTE と同一の欠陥）。本手順は MBP ローカルの `@local` 実行に統一する。
 
 [`pyinfra/deploys/sentinel.py`](../../pyinfra/deploys/sentinel.py) が下記を冪等に実行する:
 
