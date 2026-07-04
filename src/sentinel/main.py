@@ -74,6 +74,9 @@ class TaskContextHandler(FileSystemEventHandler):
             else:
                 # 実行中タスクは最新の文脈で上書き（status 遷移や workspace 確定を反映）
                 self.store[task_id] = ctx
+            # 受信を可視化する（構築手順書 07-sentinel.md 動作確認6の検証観点。
+            # 従来は成功パスに一切ログが無く、受信の有無をログから確認できなかった）
+            logger.info("task_context received: task_id=%s status=%s", task_id, status)
         except Exception:
             # 壊れた json 等を踏んでも受信ループは止めない
             logger.exception("task_context 読み込み失敗: %s", event.src_path)

@@ -54,6 +54,7 @@ files.template(
     home=_home,
 )
 server.shell(commands=[
+    # macOS 10.10+ 推奨構文。再ロードに備えて bootout を先に実行（未登録時はエラー無視）。
     # bootout は XPC 経由で非同期に片付くため、直後に bootstrap すると解体未完了の
     # ジョブと衝突し "Bootstrap failed: 5: Input/output error" になることを qu-e の
     # 同一パターンで実機再現（#68 E2E T07）。固定 sleep 1 でも足りない場合が実機で

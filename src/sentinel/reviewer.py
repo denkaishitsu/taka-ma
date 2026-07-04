@@ -19,10 +19,22 @@ _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 
 
 def _extract_json(text: str) -> str:
-    """LLM 応答からフェンス除去した JSON 本体を取り出す（フェンス無しならそのまま返す）。"""
+    """LLM 応答から JSON 本体を取り出す（ai_gateway.llm.extract_json と同じ2段構え）。
+
+    (1) フェンス内 → (2) 最初の `{`/`[` から最後の `}`/`]` までの順に取り出す。
+    開始フェンスのみで閉じフェンスを欠く等の不完全な出力でもフェンス正規表現だけでは
+    救出できないため、括弧スキャンへのフォールバックを持たせる。どちらも取れなければ
+    元テキストを返す（呼び出し側で json.loads が失敗し escalate フォールバックに落ちる）。
+    """
     m = _FENCE_RE.search(text)
     if m:
         return m.group(1).strip()
+    starts = [i for i in (text.find("{"), text.find("[")) if i != -1]
+    ends = [i for i in (text.rfind("}"), text.rfind("]")) if i != -1]
+    if starts and ends:
+        s, e = min(starts), max(ends)
+        if e > s:
+            return text[s:e + 1]
     return text.strip()
 
 

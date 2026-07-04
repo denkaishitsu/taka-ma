@@ -69,14 +69,21 @@ pyinfra -y @local pyinfra/deploys/sentinel.py
 | # | 内容 | 実装 |
 |---|------|------|
 | 1 | `ollama pull qwen3.6:35b-a3b-q4_K_M`（qu-e 推論モデル、重み 約 23GB Q4_K_M） | `server.shell` |
-| 2 | [`src/sentinel/`](../../src/sentinel/) を `/opt/taka-ma/qu-e/sentinel/` に sync | `files.sync` |
-| 3 | 設定ファイル `qu-e.yaml` を `/opt/taka-ma/qu-e/config/qu-e.yaml` に配置 | `files.template` |
-| 4 | データディレクトリ作成（`/opt/taka-ma/data/{task-context,file-audit-alerts,logs}`） | `files.directory` |
-| 5 | launchd Agent 登録（`com.taka-ma.qu-e.plist`、`bootout` → `bootstrap`） | `files.template` + `server.shell` |
+| 2 | 依存パッケージ（`watchdog` / `psutil` / `httpx` / `pyyaml`）を `/opt/taka-ma-env` に導入 | `pip.packages` |
+| 3 | [`src/sentinel/`](../../src/sentinel/) を `/opt/taka-ma/qu-e/sentinel/` に sync | `files.sync` |
+| 4 | 設定ファイル `qu-e.yaml` を `/opt/taka-ma/qu-e/config/qu-e.yaml` に配置 | `files.put` |
+| 5 | launchd Agent 登録（`com.taka-ma.qu-e.plist`、`bootout` → `bootstrap`。bootout は非同期に片付くため bootstrap は最大 5 回・1 秒間隔でリトライ） | `files.template` + `server.shell` |
+
+> **NOTE（データディレクトリ）**: `task-context` と file_audit の `log_dir`（`/opt/taka-ma/logs/file-audit`）は pyinfra の明示ステップではなく、qu-e 本体（`main.py` の起動処理 / `FileAuditHandler.__init__`）が起動時に `os.makedirs(..., exist_ok=True)` で作成する（MBP ローカル）。`file-audit-alerts` は sa-ru 側（Mac mini）のディレクトリで、qu-e から見るとリモートの alert 送信先であり MBP には作られない。deny/escalate 発生時に qu-e が `ssh mac-mini "mkdir -p ... && cat > ..."` で初めて作成する（§8.12）。
 
 > **NOTE**: qu-e.yaml の設定項目は [`src/sentinel/config/qu-e.yaml`](../../src/sentinel/config/qu-e.yaml) 本体を参照（設計意図は設計書 §2.6 / §4 / §8.8 / §8.12 / §8.13）。
 
 ## 動作確認
+
+> **NOTE（実行元）**: 以下の `ssh mbp "..."` は操作端末が Mac mini（または別端末）である前提。
+> **MBP 自身で実行する場合は `ssh mbp` の自己宛て名前解決ができない**（`Could not resolve hostname mbp`）
+> ため、`ssh mbp "cmd"` はそのまま `cmd`（ラッパー無しのローカル実行）に読み替える。動作確認2〜4の
+> `ssh mac-mini "ssh mbp '...'"`（sa-ru→qu-e の実経路を模した二重 SSH）はこの対象外でそのまま実行する。
 
 ### 1. launchd サービス稼働確認
 
@@ -121,7 +128,7 @@ ssh mac-mini "ssh mbp 'cd /opt/taka-ma/qu-e && PYTHONPATH=/opt/taka-ma/qu-e /opt
 
 | 観点 | 成功 | エラー |
 |------|------|--------|
-| 標準出力 | JSON 1 行で `decision` / `reason` を含む | パースエラー、空応答 |
+| 標準出力 | JSON 1 行で `decision` / `issues` / `severity` を含む（`reviewer.py` の `review_diff()` 出力スキーマ） | パースエラー、空応答 |
 
 ### 5. file_audit（watchdog → jsonl 追記 → sa-ru へ SSH push）
 
@@ -130,13 +137,13 @@ ssh mac-mini "ssh mbp 'cd /opt/taka-ma/qu-e && PYTHONPATH=/opt/taka-ma/qu-e /opt
 ```bash
 ssh mbp "echo test > /opt/taka-ma/data/file-audit-target/test.txt"
 sleep 5
-ssh mbp "tail -3 /opt/taka-ma/logs/audit-*.jsonl"
+ssh mbp "tail -3 /opt/taka-ma/logs/file-audit/file-audit-*.jsonl"
 ssh mac-mini "ls /opt/taka-ma/data/file-audit-alerts/"
 ```
 
 | 観点 | 成功 | エラー |
 |------|------|--------|
-| jsonl 追記 | `/opt/taka-ma/logs/audit-{YYYY-MM-DD}.jsonl` にレコードが追記される | 追記がない、ファイル未生成 |
+| jsonl 追記 | `/opt/taka-ma/logs/file-audit/file-audit-{YYYY-MM-DD}.jsonl` にレコードが追記される | 追記がない、ファイル未生成 |
 | sa-ru への SSH push（deny / escalate のみ） | Mac mini の `/opt/taka-ma/data/file-audit-alerts/` にアラートファイルが届く | approve でも push されてしまう / deny でも push されない |
 
 ### 6. task_context 受信（sa-ru → qu-e SSH push）
@@ -158,12 +165,12 @@ ssh mbp "tail -20 /opt/taka-ma/logs/qu-e.log | grep task_context"
 ### 7. ヘルスチェック
 
 ```bash
-ssh mbp "tail -50 /opt/taka-ma/logs/qu-e.log | grep health_check"
+ssh mbp "tail -50 /opt/taka-ma/logs/qu-e.log | grep ヘルスチェック"
 ```
 
 | 観点 | 成功 | エラー |
 |------|------|--------|
-| 定期実行ログ | `interval_sec` ごとに `health_check` 実行ログが記録される | ログなし |
+| 定期実行ログ | `interval_sec` ごとに `ヘルスチェック` 実行ログが記録される（`main.py` の `health_check_loop()` が出力するログ文言は日本語「ヘルスチェック」であり英語 `health_check` は出力されない） | ログなし |
 | 各項目 | CPU / Memory / Disk / Network の 4 項目とも数値あり、`healthy` / `warning` / `critical` のいずれかが判定される | 項目欠落、判定なし |
 
 ## 検証項目
@@ -174,7 +181,7 @@ ssh mbp "tail -50 /opt/taka-ma/logs/qu-e.log | grep health_check"
 |---|---------|------|
 | 1 | ollama に Qwen3.6-35B-A3B が pull 済 | Step 1 |
 | 2 | `/opt/taka-ma/qu-e/sentinel/` 配下に src/sentinel/ がデプロイ済 | Step 2 |
-| 3 | `/opt/taka-ma/data/{task-context,file-audit-alerts}` が存在 | Step 2 |
+| 3 | `/opt/taka-ma/data/task-context`（MBP ローカル、qu-e 起動時に自動作成）が存在 | Step 2 / 動作確認 6 |
 | 4 | launchd サービスとして安定稼働（exit 0、KeepAlive で自動再起動） | 動作確認 1 |
 | 5 | Tier 2 コードレビュー: 安全なコマンドが `approve` される | 動作確認 2 |
 | 6 | Tier 2 コードレビュー: 危険なコマンド（`rm -rf /` 等）が `deny` される | 動作確認 3 |

@@ -39,9 +39,8 @@
 | **ya-ta** | ai_gateway | Mac mini | sa-ru が import するライブラリ。タスクの分解・分類・リスク判定・モデルルーティング |
 | **qu-e** | sentinel | MBP | 守護プロセス。Tier 2 コード審査・ヘルスチェック・ファイル監査 |
 | **u-zu** | slack_bot | Mac mini | 唯一の外部通信。人間からの指示受付・承認通知（Socket Mode） |
-| **approval-pipeline** | sa-ru 配下 | Mac mini → MBP | y/n 三段階リスク承認。sa-ru から呼び出される |
 
-> 命名規約: デプロイ先（pyinfra）は**コンポーネント名**（古事記由来）、ソース（src）は**役割名**。
+> 表の「コンポーネント」はデプロイ先（pyinfra）で用いる名前、「役割名 (src)」はソースコード上の名前。命名の考え方は [設計思想と命名](../design/design-philosophy-and-naming.md) を参照。
 
 ## 初期 LLM の配置と用途
 
