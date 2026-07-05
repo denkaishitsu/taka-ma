@@ -82,6 +82,11 @@ class FileAuditHandler(FileSystemEventHandler):
         self.loop = loop
         # file_audit 設定の取り出し（無視ルール・集約待ち時間・出力先・通知先）
         self.ignore_patterns: list[str] = config["file_audit"].get("ignore_patterns", [])
+        # sa-ru が SSH push する qu-e 自身の制御プレーンディレクトリ（§8.13）。固定の絶対パスが
+        # 既知なので、ignore_patterns のベアネーム fnmatch（"task-context" という名前の
+        # ユーザー成果物まで誤って除外し得る）ではなく、このパス配下かどうかで厳密に判定する
+        # （Layer3 review で指摘・是正）。
+        self.task_context_dir: str | None = config.get("task_context", {}).get("dir")
         self.debounce_sec: float = config["file_audit"].get("debounce_sec", 1)
         self.log_dir: str = config["file_audit"]["log_dir"]
         self.alert_dir: str = config["file_audit"]["o_moi_alert_dir"]
@@ -99,6 +104,13 @@ class FileAuditHandler(FileSystemEventHandler):
         リポジトリの `.gitignore` を合わせて適用する。パスの各構成要素（ディレクトリ名・
         ファイル名）のいずれかがいずれかのパターンに合致したら除外する。
         """
+        # qu-e/sa-ru 間の内部通信ディレクトリは既知の絶対パスなので、パス prefix で厳密に
+        # 除外する（ベアネーム fnmatch だと同名のユーザー成果物まで巻き込むため対象外）。
+        if self.task_context_dir and (
+            path == self.task_context_dir
+            or path.startswith(self.task_context_dir.rstrip(os.sep) + os.sep)
+        ):
+            return True
         # パスを構成要素に分解し、各要素単位でパターン照合する（中間ディレクトリの除外も拾うため）
         parts = path.split(os.sep)
         # 固定の無視パターン ∪ そのリポジトリの .gitignore
@@ -163,8 +175,7 @@ class FileAuditHandler(FileSystemEventHandler):
         """
         timer = self.loop.call_later(
             self.debounce_sec,
-            lambda: asyncio.create_task(self._audit(path, event_type)),
-        )
+            lambda: asyncio.create_task(self._audit(path, event_type)))
         self._pending[path] = timer
 
     async def _audit(self, path: str, event_type: str):
@@ -257,8 +268,7 @@ class FileAuditHandler(FileSystemEventHandler):
             result = subprocess.run(
                 ["git", "diff", "--stat", "--", path],
                 capture_output=True, text=True, timeout=5,
-                cwd=os.path.dirname(path) or ".",
-            )
+                cwd=os.path.dirname(path) or ".")
             # diff が空（未追跡・ステージ外等）でも最低限の要約は返す
             return (result.stdout or f"{event_type}: {path}").strip()
         except Exception:
@@ -307,8 +317,7 @@ class FileAuditHandler(FileSystemEventHandler):
             subprocess.run(
                 ["ssh", self.ssh_host, f"mkdir -p {self.alert_dir} && cat > {remote}"],
                 input=json.dumps(payload, ensure_ascii=False),
-                capture_output=True, text=True, timeout=10, check=True,
-            )
+                capture_output=True, text=True, timeout=10, check=True)
         except Exception:
             # 通知が落ちても監査記録（jsonl）は残っている。原因追跡のためログのみ残す
             logger.exception("file_audit alert push 失敗: audit_id=%s", audit_id)
@@ -319,7 +328,7 @@ def start_audit(config: dict, reviewer, task_context_store: dict,
     """ファイル監査を開始し、稼働中の watchdog Observer を返す。
 
     設定の watch_paths を再帰監視し、各変更を FileAuditHandler へ流す。返した
-    Observer は呼び出し側が保持し、停止時に stop()/join() する想定。
+    Observer は呼び出し側が保持し、停止時に stop/join する想定。
     """
     handler = FileAuditHandler(config, reviewer, task_context_store, loop)
     observer = Observer()
