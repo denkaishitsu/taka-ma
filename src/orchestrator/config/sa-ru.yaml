@@ -26,6 +26,21 @@ ssh:
   mbp_host: "mbp"  # ~/.ssh/config のHost名
   timeout_sec: 30  # ollama ps/stop・Blender 検知など軽い SSH 操作の応答待ち上限（秒）。モデル実行など重い操作は run_ssh_command 既定 120
 
+# headless アダプタ（Claude Code の claude -p 実行）— Orchestrator._run_worker_headless が参照
+headless:
+  mini_host: "mac-mini"                                # MBP 上のフックから見た Mac mini の SSH ホスト名（~/.ssh/config。実機の
+                                                        # ~/.ssh/config には "mini" エイリアスが存在せず "mac-mini" が正。
+                                                        # 実機検証で解決不能を確認・是正）
+  decide_client: "/opt/taka-ma/sa-ru/approval-pipeline/decide_client.py"  # Mac mini 上のフック薄クライアント
+                                                        # （標準ライブラリのみ＝PYTHONPATH 不要。判定本体は
+                                                        # 常駐 decide デーモン。設計 Appendix §2.1）
+  decide_socket: "/opt/taka-ma/data/decide.sock"       # decide デーモン（com.taka-ma.decide-daemon）の UDS
+  python_bin: "/opt/taka-ma-env/bin/python3"           # decide_client.py 実行バイナリ（標準ライブラリのみの
+                                                        # ため素の python3 でも可だが、存在が deploy で保証
+                                                        # される venv を既定にする）
+  hook_timeout_sec: 310                                # PreToolUse フックの上限（Tier3 人間待ち 300 秒を切らない値）
+  run_timeout_sec: 1800                                # claude -p 1 回の全体上限（秒）
+
 # タスクキュー — dispatcher が参照
 task_queue:
   dir: "/opt/taka-ma/data/tasks"  # Slack Bot がタスクファイルを作成するディレクトリ

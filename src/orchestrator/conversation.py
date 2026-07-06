@@ -24,7 +24,9 @@ import time
 import uuid
 from pathlib import Path
 
+from ai_gateway.classifier import InvalidModelError
 from ai_gateway.llm import extract_json, run_ollama
+from orchestrator.file_queue import atomic_write_json
 
 logger = logging.getLogger("sa-ru.conversation")
 
@@ -41,19 +43,25 @@ class ConversationManager:
     確定済みタスク・確認レコードはファイルとして残るため実行の取りこぼしは起きない。
     """
 
-    def __init__(self, config, slack_notifier, task_dir: str):
+    def __init__(self, config, slack_notifier, task_dir: str, classifier=None):
         """会話マネージャを構築する。
 
         Args:
             config: sa-ru の脳モデル・会話タイムアウト・確定タスク/着手確認の出力先を含む設定。
             slack_notifier: 要約や着手確認ボタンを人間へ提示する通知手段。
             task_dir: 会話から確定したタスクを書き出す先（dispatcher が走査して実行に回す）。
+            classifier: `:モデル名` 明示指定の抽出に使う TaskClassifier（設計書「ユーザーモデル
+                指定」）。脳 LLM の要約はユーザーの生文を言い換えるため `:opus` 等の記法が消える。
+                要約対象の生文（`msg["text"]`）から先に抽出し、要約とは別経路でタスクへ伝える
+                （parse_model 自体は既存だったが呼び出し元が無く未配線だった。実機検証で
+                `:opus` 指定が効かないことを確認・是正）。
         """
         self.config = config
         self.model = config["sa-ru"]["model"]              # 脳（現 qwen3:8b、将来 Gemma 4 12B）
         self.timeout = config["sa-ru"].get("converse_timeout_sec", 120)
         self.slack = slack_notifier
         self.task_dir = task_dir                            # 確定タスクの書き出し先（dispatcher が走査）
+        self.classifier = classifier
         self.confirm_dir = config["exec_confirm"]["dir"]    # 着手確認レコードの dir
         os.makedirs(self.confirm_dir, exist_ok=True)
         # 会話プロンプトは静的なので起動時に 1 度だけ読む（毎ターンの disk I/O を避ける）
@@ -77,6 +85,9 @@ class ConversationManager:
     def handle_message(self, msg: dict):
         """1 件の発話を処理する。会話継続なら返信、意図が固まれば着手確認を提示する。"""
         cid = msg["conversation_id"]
+        # 脳 LLM 呼び出し開始のタイミングを可視化する（投稿受信〜着手確認提示の所要時間を
+        # 計測できるようにする。実運用フィードバックを受けて追加）。
+        logger.info("会話メッセージ処理開始: conversation_id=%s", cid)
         now = time.monotonic()
         self._evict_idle_sessions(now)
         self._last_seen[cid] = now
@@ -96,14 +107,24 @@ class ConversationManager:
         if result.get("ready") and result.get("summary"):
             summary = result["summary"]
             history.append({"role": "assistant", "text": summary})
-            self._present_summary(msg, summary)
+            # `:opus` 等の明示モデル指定は要約（脳 LLM の言い換え）には残らないため、
+            # 要約対象の生文から直接抽出する（設計書「ユーザーモデル指定」）。
+            models: list[str] = []
+            if self.classifier is not None:
+                try:
+                    _, models = self.classifier.parse_model(msg["text"])
+                except InvalidModelError as e:
+                    self.slack.notify(
+                        str(e), msg.get("channel_id"),
+                        team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
+                    return
+            self._present_summary(msg, summary, models)
         else:
             reply = result.get("reply") or "（応答を生成できませんでした。もう一度お願いします）"
             history.append({"role": "assistant", "text": reply})
             self.slack.notify(
                 reply, msg.get("channel_id"),
-                team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"),
-            )
+                team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
 
     def _invoke_llm(self, history: list[dict], force: bool) -> dict:
         """脳 LLM（sa-ru.model）を呼び、{reply, ready, summary} を返す。
@@ -142,8 +163,12 @@ class ConversationManager:
             logger.exception("会話 LLM 呼び出し失敗")
             return {"reply": "（内部エラーが発生しました）", "ready": False, "summary": None}
 
-    def _present_summary(self, msg: dict, summary: str):
-        """着手確認レコード（status=pending）を作り、要約 + ボタンを Slack に提示する。"""
+    def _present_summary(self, msg: dict, summary: str, models: list[str] | None = None):
+        """着手確認レコード（status=pending）を作り、要約 + ボタンを Slack に提示する。
+
+        models: `:opus` 等で明示指定されたモデル名（handle_message が生文から抽出済み）。
+        確定タスク生成（create_exec_task）まで運ぶため record に保持する。
+        """
         exec_request_id = str(uuid.uuid4())
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         record = {
@@ -155,19 +180,22 @@ class ConversationManager:
             "team_id": msg.get("team_id", ""),
             "channel_id": msg.get("channel_id", ""),
             "thread_ts": msg.get("thread_ts"),
+            "model_override": models or [],
             "created_at": now,
             "decided_at": None,
             "decided_by": None,
         }
         path = os.path.join(self.confirm_dir, f"{exec_request_id}.json")
-        with open(path, "w") as f:
-            json.dump(record, f, ensure_ascii=False, indent=2)
+        # 原子書込。u-zu / sa-ru 双方が確認レコードを読むため torn-read を防ぐ（§8.3 書込の原子性）。
+        atomic_write_json(path, record)
 
+        # 着手確認提示のタイミングを可視化する（従来はログが無く、発話受信〜要約提示の
+        # 所要時間が計測不能だった。実運用フィードバックを受けて追加）。
+        logger.info("着手確認提示: id=%s conversation_id=%s", exec_request_id, msg["conversation_id"])
         self.slack.send_exec_confirm_request(
             exec_request_id, summary,
             channel=msg.get("channel_id"), team_id=msg.get("team_id"),
-            thread_ts=msg.get("thread_ts"),
-        )
+            thread_ts=msg.get("thread_ts"))
 
     # ── 着手確認の決着（確認ループから呼ばれる） ──
 
@@ -179,6 +207,9 @@ class ConversationManager:
         """
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         task_id = str(uuid.uuid4())
+        # "_model" は _execute_worker_task が読む明示モデル指定キー（設計書「ユーザーモデル指定」）。
+        # queue_item = {**task, ...} でサブタスクへそのまま伝播する（新規配線不要でこのキー名に揃える）。
+        model_override = record.get("model_override") or []
         task = {
             "task_id": task_id,
             "status": "init",
@@ -188,19 +219,19 @@ class ConversationManager:
             "team_id": record.get("team_id", ""),
             "channel_id": record.get("channel_id", ""),
             "thread_ts": record.get("thread_ts"),
+            "_model": model_override or None,
             "created_at": now,
             "updated_at": now,
         }
         os.makedirs(self.task_dir, exist_ok=True)
         ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S%f")
         path = os.path.join(self.task_dir, f"{ts}_{task_id}.json")
-        with open(path, "w") as f:
-            json.dump(task, f, ensure_ascii=False, indent=2)
+        # 原子書込。dispatcher が部分書込の init タスクを拾う torn-read を防ぐ（§8.3 書込の原子性）。
+        atomic_write_json(path, task)
         self.slack.notify(
             "着手します。実行を開始しました。",
             record.get("channel_id"), team_id=record.get("team_id"),
-            thread_ts=record.get("thread_ts"),
-        )
+            thread_ts=record.get("thread_ts"))
         return task_id
 
     def notify_rejected(self, record: dict):
@@ -208,13 +239,11 @@ class ConversationManager:
         self.slack.notify(
             "やり直します。続けて指示してください。",
             record.get("channel_id"), team_id=record.get("team_id"),
-            thread_ts=record.get("thread_ts"),
-        )
+            thread_ts=record.get("thread_ts"))
 
     def notify_timeout(self, record: dict):
         """着手確認が期限切れ。実行はせず、必要なら締め直しを促す。"""
         self.slack.notify(
             "着手確認がタイムアウトしました。続ける場合はもう一度指示してください。",
             record.get("channel_id"), team_id=record.get("team_id"),
-            thread_ts=record.get("thread_ts"),
-        )
+            thread_ts=record.get("thread_ts"))

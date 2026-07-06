@@ -13,19 +13,20 @@ ROLE_ORDER = {"owner": 3, "admin": 2, "user": 1}
 
 
 def get_role(user_id: str) -> str | None:
-    """登録ロールを返す。未登録なら None。"""
+    """登録ロールを返す。未登録・role 欠落レコードなら None。"""
     user = load_users().get(user_id)
-    return user["role"] if user else None
+    return user.get("role") if user else None
 
 
 def check_role(user_id: str, required_role: str) -> bool:
     """ロールチェック。required_role 以上の権限があれば True。
-    未登録の Slack user ID は全て拒否（False）。
+    未登録の Slack user ID は全て拒否（False）。role 欠落の壊れたレコードも
+    未認可（レベル 0）として拒否する（user["role"] の KeyError で無応答にしない、M11）。
     """
     user = load_users().get(user_id)
     if not user:
         return False
-    return ROLE_ORDER.get(user["role"], 0) >= ROLE_ORDER.get(required_role, 0)
+    return ROLE_ORDER.get(user.get("role"), 0) >= ROLE_ORDER.get(required_role, 0)
 
 
 def can_manage_user(actor_role: str | None, target_current_role: str | None,

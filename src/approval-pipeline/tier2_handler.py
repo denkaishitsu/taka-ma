@@ -11,6 +11,8 @@ import json
 import shlex
 import subprocess
 
+from approval_types import Decision, operation_str
+
 
 class Tier2Handler:
     """Medium Risk: qu-e 審査。
@@ -29,34 +31,35 @@ class Tier2Handler:
         self.ssh_host = ssh_host
         self.qu_e_dir = qu_e_dir
 
-    async def handle(self, prompt, pty_wrapper, ctx=None):
-        """qu-e に審査させ、approve なら承認・それ以外は Tier 3 へエスカレートする。
+    async def handle(self, pending, ctx=None) -> Decision:
+        """qu-e に審査させ、approve なら allow・それ以外は Tier 3 へエスカレートする Decision を返す。
 
         ctx は使わない（エスカレート時の risk_reason 引き継ぎは呼び出し側＝
         ApprovalPipeline が行う）。qu-e の deny も「自動拒否」せず人間に上げるのは、
-        中リスクの最終判断を人に委ねる設計のため。
+        中リスクの最終判断を人に委ねる設計のため。CLI への伝達には関与しない（中核は CLI 非依存）。
         """
         # qu-e にレビューを依頼（SSH 経由）
-        result = await self._call_sentinel(prompt)
+        result = await self._call_sentinel(pending)
 
         if result.get("decision") == "approve":
-            pty_wrapper.approve()
-            return {"action": "approved", "handler": "tier2_sentinel"}
-        else:
-            # qu-e が deny / escalate → Tier 3 にエスカレート（判定理由を引き継ぐ）
-            return {"action": "escalate", "reason": result.get("reason", ""), "handler": "tier2_sentinel"}
+            return Decision(allow=True, handler="tier2_sentinel")
+        # qu-e が deny / escalate → Tier 3 にエスカレート（判定理由を引き継ぐ内部シグナル）
+        return Decision(allow=False, escalate=True, handler="tier2_sentinel",
+                        reason=result.get("reason", ""))
 
-    async def _call_sentinel(self, prompt) -> dict:
+    async def _call_sentinel(self, pending) -> dict:
         """qu-e review_cli.py を SSH + subprocess で 1 ショット実行し、JSON を返す（§8.8）。
 
         review_cli の出力: {"decision": approve|deny|escalate, "reason": ..., "risk_score": ...}
         通信・パース失敗時は安全側で escalate を返す。
         """
-        context = json.dumps({"context": getattr(prompt, "context", "")}, ensure_ascii=False)
+        context = json.dumps({"context": getattr(pending, "context", "")}, ensure_ascii=False)
+        # SSH 非ログインシェルの PATH には素の python が無い（macOS 標準・実機 rc=127 で確認）。
+        # 他コンポーネントと同じ venv の絶対パスで固定する。
         remote = (
             f"cd {self.qu_e_dir} && PYTHONPATH={self.qu_e_dir} "
-            f"python sentinel/review_cli.py --mode command "
-            f"--input {shlex.quote(prompt.command)} --context {shlex.quote(context)}"
+            f"/opt/taka-ma-env/bin/python sentinel/review_cli.py --mode command "
+            f"--input {shlex.quote(operation_str(pending))} --context {shlex.quote(context)}"
         )
         try:
             result = await asyncio.to_thread(

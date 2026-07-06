@@ -31,18 +31,20 @@ class RiskClassifier:
         with open(PROMPTS_DIR / "classify_risk.md") as f:
             system_prompt = f.read()
 
-        # プロンプト＋対象操作を ya-ta モデルに渡し、JSON 形式の判定を得る
-        stdout = run_ollama(
-            self.model,
-            f"{system_prompt}\n\n操作: {operation}",
-            timeout=60,
-        )
         try:
+            # プロンプト＋対象操作を ya-ta モデルに渡し、JSON 形式の判定を得る。
+            # ollama 非ゼロ終了は run_ollama が RuntimeError を送出し、下の except で
+            # 安全側フォールバック（Tier 3）へ落ちる（設計書 §8.4「ollama 実行失敗の検知」）。
+            stdout = run_ollama(
+                self.model,
+                f"{system_prompt}\n\n操作: {operation}",
+                timeout=60,
+            )
             # tier 欠落は判定不成立とみなし、フォールバックへ落とす
             parsed = json.loads(extract_json(stdout))
             if "tier" not in parsed:
                 raise KeyError("tier missing")
             return parsed
-        except (json.JSONDecodeError, KeyError):
-            # 判定不能なら安全側に倒し、Tier 3（人間承認）へ回す（設計書 §8.4）
+        except (json.JSONDecodeError, KeyError, RuntimeError):
+            # 判定不能・ollama 実行失敗なら安全側に倒し、Tier 3（人間承認）へ回す（設計書 §8.4）
             return {"tier": 3, "reason": "parse error — default to human approval", "action": "route_to_human"}

@@ -10,6 +10,8 @@ import datetime
 import json
 import os
 
+from services.atomic_io import atomic_write_json
+
 # sa-ru と共有する確認レコードのディレクトリ（sa-ru.yaml の exec_confirm.dir と一致）。
 EXEC_CONFIRM_DIR = "/opt/taka-ma/data/exec-confirmations"
 
@@ -31,6 +33,7 @@ def resolve_exec_confirm(exec_request_id: str, decision: str, *, decided_by: str
     record["status"] = decision
     record["decided_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
     record["decided_by"] = decided_by
-    with open(path, "w") as f:
-        json.dump(record, f, ensure_ascii=False, indent=2)
+    # 既存レコードの status 書換。原子書込で sa-ru が truncate 途中の壊れ JSON を読むのを防ぐ
+    # （§8.3 書込の原子性）。
+    atomic_write_json(path, record)
     return True

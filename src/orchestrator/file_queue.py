@@ -27,6 +27,28 @@ import uuid
 logger = logging.getLogger("sa-ru.orchestrator")
 
 
+def atomic_write_json(path: str, obj) -> None:
+    """obj を JSON として path へ原子的に書き込む（tmp へ全量書込 → os.replace で差し替え）。
+
+    共有 FS では書込中の中途半端な JSON を別プロセスや次ポーリングが読み torn-read する。また
+    書込中クラッシュで壊れたファイルが本パスに残ると、次回起動の予約回収スキャンを誤らせる。
+    truncate-in-place（open(w)）はこれらの窓を生むため、sa-ru の全キュー/タスク書込をこの
+    原子書込に統一する（u-zu 側 slack_bot.services.atomic_io と同規律・設計書 §8.3）。失敗時は
+    孤児 .tmp を後始末して例外を伝播する。
+    """
+    tmp = f"{path}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(tmp, "w") as fp:
+            json.dump(obj, fp, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 class FileQueue:
     """1 ディレクトリ分のファイルキュー。done/ と failed/ を内部管理する。
 
@@ -87,6 +109,24 @@ class FileQueue:
                 return path, record
         return None
 
+    def reclaim(self, reserved_statuses: set, reset_status: str) -> int:
+        """予約済みレコードの status を reset_status へ戻し、戻した件数を返す（起動時に 1 回呼ぶ）。
+
+        claim は init 予約→処理という二段階を取るため、予約済み（accepted/in_progress 等）の
+        まま消費者がクラッシュすると、claim(ready=init) はそれらを拾えず恒久滞留する。プロセス
+        起動時にこのスキャンで予約を reset_status（=init）へ戻し「再起動後に処理再開」を成立させる
+        （設計書 §8.3 予約の再起動回収）。実行中タスクを誤って戻さないよう、常駐ループの再起動点では
+        なく真のプロセス起動点（run）から 1 回だけ呼ぶこと。書込は原子的（_write）。
+        """
+        count = 0
+        for path, record in self.iter_records():
+            if record.get("status") in reserved_statuses:
+                record["status"] = reset_status
+                record["updated_at"] = datetime.datetime.now().isoformat()
+                self._write(path, record)
+                count += 1
+        return count
+
     # ── 退避 ──
 
     def mark_done(self, path: str):
@@ -142,20 +182,9 @@ class FileQueue:
             return None
 
     def _write(self, path: str, record: dict):
-        """record を原子的に path へ書く（tmp へ全量書込 → os.replace で差し替え）。
+        """record を原子的に path へ書く（共有ヘルパー atomic_write_json に委譲）。
 
-        共有 FS では書込中の中途半端な JSON を別プロセスや次ポーリングが読み torn-read する。
-        truncate-in-place（open(w)）はその窓を生むため、既存 tier3_handler / approval_store と
-        同じ tmp→os.replace 方式に揃える。失敗時は tmp を後始末して例外を伝播する。
+        予約書換（claim）等でリーダーに torn-read を見せないための原子書込。実体は
+        モジュール関数 atomic_write_json（既存 tier3_handler / approval_store と同規律）。
         """
-        tmp = f"{path}.{uuid.uuid4().hex}.tmp"
-        try:
-            with open(tmp, "w") as fp:
-                json.dump(record, fp, ensure_ascii=False, indent=2)
-            os.replace(tmp, path)
-        except OSError:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-            raise
+        atomic_write_json(path, record)

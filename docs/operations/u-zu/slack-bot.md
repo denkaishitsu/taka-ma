@@ -158,7 +158,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.taka-ma.sa-ru.plist
 ```
 
 - `add` / `update` / `remove`: ya-ta.yaml の models セクションを編集
-- `install`: ya-ta.yaml に反映し、必要に応じてモデルのダウンロード（ollama pull 等）+ sa-ru 再起動
+- `install`: ya-ta.yaml に反映し、必要に応じてモデルのダウンロード（ollama pull 等）+ sa-ru 再起動。ローカルモデル（`type: local`）の `install` は `model_id` が必須で、未設定のまま実行すると（実体を何もダウンロードせずに成功と誤報しないよう）エラーになる
 - `uninstall`: ya-ta.yaml から削除 + sa-ru 再起動
 
 > **NOTE**: 起動 CLI 名(ya-ta.yaml の `command:`)は **`--vendor` から自動推測**される(例: `anthropic` → `claude`、`google` → `agy`)。推測を上書きしたい場合のみ `--command <CLI 名>` を明示する。
@@ -179,6 +179,8 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.taka-ma.sa-ru.plist
 | `/taka-ma-model` | o | o | x |
 
 ※ Admin は User の追加・削除が可能。Owner の変更は Owner のみ。
+
+> **最後の Owner は削除・降格できない**: システムを Owner 権限からロックアウトさせないため、Owner が 1 人だけのときにその Owner を `remove` / 降格 `update` しようとすると拒否される。先に別のユーザーを Owner に昇格させてから操作する。
 
 ### ロールチェックの実装
 

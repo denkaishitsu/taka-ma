@@ -3,9 +3,10 @@
 sa-ru が SSH + subprocess で本スクリプトを起動し、JSON 1 行で結果を受け取る。
 プロセス常駐ではなく、呼び出しごとに 1 ショット実行する。
 
-Usage（役割パッケージとして実行。PYTHONPATH に component 直下 /opt/taka-ma/qu-e を通す）:
-    cd /opt/taka-ma/qu-e && PYTHONPATH=/opt/taka-ma/qu-e python sentinel/review_cli.py --mode command --input '<command>' --context '<json>'
-    cd /opt/taka-ma/qu-e && PYTHONPATH=/opt/taka-ma/qu-e python sentinel/review_cli.py --mode diff --input '<diff>' --file-path '<path>'
+Usage（役割パッケージとして実行。PYTHONPATH に component 直下 /opt/taka-ma/qu-e を通す。
+SSH 非ログインシェルには素の python が無いため venv 絶対パスで呼ぶ）:
+    cd /opt/taka-ma/qu-e && PYTHONPATH=/opt/taka-ma/qu-e /opt/taka-ma-env/bin/python sentinel/review_cli.py --mode command --input '<command>' --context '<json>'
+    cd /opt/taka-ma/qu-e && PYTHONPATH=/opt/taka-ma/qu-e /opt/taka-ma-env/bin/python sentinel/review_cli.py --mode diff --input '<diff>' --file-path '<path>'
 """
 
 import argparse
@@ -14,7 +15,7 @@ import json
 
 import yaml
 
-from sentinel.reviewer import QueReviewer
+from sentinel.reviewer import DEFAULT_INFERENCE_LOCK, QueReviewer
 
 
 def _load_config() -> dict:
@@ -29,6 +30,8 @@ def _build_reviewer(config: dict) -> QueReviewer:
         model=config["qu-e"]["model"],
         ollama_host=config["qu-e"]["ollama_url"],
         prompts_dir=config["qu-e"]["prompts_dir"],
+        # file_audit（常駐）と同一パスを指すことで推論を跨プロセス直列化する（§4.2）
+        inference_lock=config["qu-e"].get("inference_lock", DEFAULT_INFERENCE_LOCK),
     )
 
 

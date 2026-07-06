@@ -288,9 +288,9 @@ callback の属性:
 
 | シンボル | 実装ファイル | 役割 |
 |---------|-------------|------|
-| `handle_audit_approve()` / `handle_audit_reject()` | [`handlers/actions.py`](../../src/slack_bot/handlers/actions.py) | callback 受信 → `audit_log_id` で jsonl レコード引き当て → §8.3 経路でタスク投入 |
+| `handle_audit_approve()` / `handle_audit_reject()` | [`handlers/actions.py`](../../src/slack_bot/handlers/actions.py) | callback 受信 → `audit_log_id` で承認レコード引き当て → §8.3 経路でタスク投入 |
 | `_enqueue_audit_action_task()` | [`handlers/actions.py`](../../src/slack_bot/handlers/actions.py) | タスクファイル生成（`source: "slack_action"`、`task_id` / `channel_id` / `thread_ts` を含む） |
-| `find_audit_record()` | [`services/audit_lookup.py`](../../src/slack_bot/services/audit_lookup.py) | A1 §4 の jsonl から `audit_log_id` で引き当て（当日 + 前日まで遡る） |
+| `find_audit_record()` | [`services/audit_lookup.py`](../../src/slack_bot/services/audit_lookup.py) | sa-ru ローカルの file_audit アラート JSON（`{alert_dir}/done/{audit_log_id}.json`）を名前で引き当て（設計書 §8.12「承認レコードの参照元」。qu-e の監査 jsonl は MBP ローカルのため直接 open しない） |
 
 > **NOTE**: 投入された §8.3 タスクは ya-ta が分解し、Approve なら「qu-e の jsonl 追記」、Reject なら「jsonl 追記（qu-e）+ プロセス停止（sa-ru）+ revert（ya-ta が振り分けた LLM）」に分解される（A1 §3.1）。
 

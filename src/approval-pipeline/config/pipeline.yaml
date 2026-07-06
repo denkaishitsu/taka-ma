@@ -1,5 +1,5 @@
 # 承認パイプライン設定
-# 構築手順書: docs/procedures/09-approval-pipeline.md Step 7
+# 構築手順書: docs/procedures/08-approval-pipeline.md Step 2
 
 pipeline:
   tier3_timeout_sec: 300

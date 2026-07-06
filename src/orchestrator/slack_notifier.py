@@ -66,7 +66,10 @@ class SlackNotifier:
             self._client_for(team_id).chat_postMessage(channel=target, text=text, thread_ts=thread_ts)
             logger.info("Slack通知送信 (ws=%s to %s): %s", team_id or "default", target, text[:80])
         except Exception:
-            logger.exception("Slack通知送信失敗")
+            # text を含めずログすると、失敗した通知が何を伝えようとしていたか
+            # （例: "opus 障害: ..." 等の再試行トリガー元メッセージ）が追跡不能になる
+            # （実機検証で診断が阻害される欠陥を確認・是正）。
+            logger.exception("Slack通知送信失敗 (ws=%s to %s): %s", team_id or "default", target, text[:200])
 
     def send_exec_confirm_request(self, exec_request_id: str, summary: str,
                                   channel: str | None = None,
@@ -92,18 +95,20 @@ class SlackNotifier:
         ]
         self._client_for(team_id).chat_postMessage(
             channel=target, thread_ts=thread_ts,
-            text="この内容で着手します（着手 / やり直す）", blocks=blocks,
-        )
+            text="この内容で着手します（着手 / やり直す）", blocks=blocks)
 
     def send_approval_request(self, request_id: str, command: str,
                               instance_id: str, risk_reason: str,
                               context: str = "",
                               channel: str | None = None,
-                              team_id: str | None = None):
+                              team_id: str | None = None,
+                              thread_ts: str | None = None):
         """Tier 3 承認リクエストを Block Kit 付きで送信する。
 
         context（worker stdout の前後文脈）があれば承認者が「何を実行しようとしているか」を
         判断できるよう本文に併記する。command が "unknown" になる場面でも文脈で補えるようにする。
+        thread_ts があれば着手確認・進捗通知と同じ会話スレッドへ返信する（未配線だと通常投稿に
+        なる欠陥を実機検証で確認・是正）。
         """
         target = self._channel_for(team_id, channel)
         blocks = [
@@ -129,7 +134,8 @@ class SlackNotifier:
                  "style": "danger", "action_id": "reject_action", "value": request_id},
             ]},
         ]
-        self._client_for(team_id).chat_postMessage(channel=target, text=f"Tier 3 承認: {command}", blocks=blocks)
+        self._client_for(team_id).chat_postMessage(
+            channel=target, thread_ts=thread_ts, text=f"Tier 3 承認: {command}", blocks=blocks)
 
     def send_file_audit_alert(self, alert: dict):
         """file_audit アラートを Block Kit (Approve/Reject ボタン付き) で送信する（§8.12）。
@@ -168,5 +174,4 @@ class SlackNotifier:
         self._client_for(team_id).chat_postMessage(
             channel=target, thread_ts=thread_ts,
             text=f"ファイル変更検知 [{alert['decision']}] {alert['path']}",
-            blocks=blocks,
-        )
+            blocks=blocks)

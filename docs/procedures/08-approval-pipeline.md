@@ -15,6 +15,9 @@
   - [4. Tier 3 Slack 通知（sudo / `always_escalate_to_human` 該当）](#4-tier-3-slack-通知sudo--always_escalate_to_human-該当)
   - [5. 監査ログ記録](#5-監査ログ記録)
   - [6. `always_deny` 即時拒否](#6-always_deny-即時拒否)
+  - [7. decide デーモン稼働（headless フックの判定実行系）](#7-decide-デーモン稼働headless-フックの判定実行系)
+  - [8. フック経由の allow / deny（MBP からの end-to-end）](#8-フック経由の-allow--denymbp-からの-end-to-end)
+  - [9. fail-closed（デーモン停止時に全ツール deny）](#9-fail-closedデーモン停止時に全ツール-deny)
 - [検証項目](#検証項目)
 - [主要 API（実装本体への索引）](#主要-api実装本体への索引)
   - [設定](#設定)
@@ -22,14 +25,23 @@
 
 ## 概要
 
-対話型 worker CLI（Claude Code / Antigravity CLI / 将来の Codex 等）が出力する y/n プロンプトを汎用 PTY ラッパー（`WorkerPtyWrapper`、構築手順書 05 主要 API 参照）で捕捉し、三段階リスク判定（Tier 1/2/3）に基づいて自動 / 半自動 / 手動承認を行う。設計書 §3 / §8.8 / §8.9 参照。
+worker CLI のツール実行を三段階リスク判定（Tier 1/2/3）に基づいて自動 / 半自動 / 手動承認する。承認要求の取得は実行アダプタごとに異なる（設計書 §3 / §8.5 / §8.8 / §8.9 参照）:
 
-> **NOTE**: 承認パイプラインは独立したサービスではなく **sa-ru の一部** として動作する。sa-ru が y/n を検出した時点でパイプラインが起動するため、独自の launchd 登録は不要。
+- **headless アダプタ（Claude Code）**: MBP の PreToolUse フックが SSH で Mac mini の薄いクライアント（`decide_client.py`）を起動し、**launchd 常駐の decide デーモン**（`decide_daemon.py`・Unix ドメインソケット）が中核 `decide()` を実行する（設計 [Appendix §2.1](../design/Appendix_worker-execution-adapters.md#21-判定実行系--decide-デーモンmac-mini-常駐とフックの薄いクライアント化)）
+- **interactive(pty) アダプタ（agy 対話等）**: 対話型 CLI が出力する y/n プロンプトを汎用 PTY ラッパー（`WorkerPtyWrapper`、構築手順書 05 主要 API 参照）で捕捉し、sa-ru 内（in-process）でパイプラインを起動する
+
+> **NOTE**: interactive 経路の承認パイプラインは **sa-ru の一部** として動作し、独自の launchd 登録は不要。headless 経路の判定実行系のみ decide デーモン（`com.taka-ma.decide-daemon`）として launchd 常駐する（Step 2 で配備）。
 
 #### アーキテクチャ
 
 ```
-sa-ru (Mac mini)
+MBP（worker 側・headless）                Mac mini
+claude -p … の PreToolUse フック
+  ssh mac-mini decide_client … || exit 2 ─→ decide_client（標準ライブラリのみ）
+                                              └ UDS /opt/taka-ma/data/decide.sock
+                                            decide_daemon（launchd 常駐・asyncio 並行）
+                                              └ ApprovalPipeline.decide()
+sa-ru (Mac mini・interactive)
   ├── WorkerPtyWrapper（PTY stdout 監視 → y/n 検出）
   └── approval-pipeline (sa-ru 配下、launchd 不要)
         ├── interceptor    （y/n パターン検出、context から対象コマンド抽出）
@@ -64,27 +76,29 @@ Mac mini（判定・Tier 1〜3 ハンドラ・監査ログ） + MBP（PTY 制御
 ### Step 2: PyInfra実行 (approval-pipeline を配備)
 
 ```bash
-pyinfra @local pyinfra/deploys/approval_pipeline.py
+pyinfra -y @local pyinfra/deploys/approval_pipeline.py
 ```
 
 [`pyinfra/deploys/approval_pipeline.py`](../../pyinfra/deploys/approval_pipeline.py) が下記を冪等に実行する:
 
 | # | 内容 | 実装 |
 |---|------|------|
-| 1 | [`src/approval-pipeline/`](../../src/approval-pipeline/) を `/opt/taka-ma/sa-ru/approval-pipeline/` に sync | `files.sync` |
-| 2 | 設定ファイル `pipeline.yaml` を `/opt/taka-ma/sa-ru/approval-pipeline/config/pipeline.yaml` に配置 | `files.template` |
-| 3 | pytest 実行（`tests/test_interceptor.py` / `tests/test_e2e.py`） | `server.shell` |
+| 1 | pytest 導入（`/opt/taka-ma-env`、テスト実行の前提） | `pip.packages` |
+| 2 | [`src/approval-pipeline/`](../../src/approval-pipeline/) を `/opt/taka-ma/sa-ru/approval-pipeline/` に sync（`config/pipeline.yaml` を含む） | `files.sync` |
+| 3 | 旧 `decide_cli.py` の残骸掃除（デーモンへ吸収済み。`files.sync` は delete しないため明示撤去） | `files.file present=False` |
+| 4 | pytest 実行（`tests/` 配下全件: `test_interceptor.py` / `test_e2e.py` / `test_tier3_crossprocess.py` / `test_decide_daemon.py` / `test_decide_client.py`） | `server.shell` |
+| 5 | decide デーモンの launchd 常駐化（[`com.taka-ma.decide-daemon.plist.j2`](../../pyinfra/templates/com.taka-ma.decide-daemon.plist.j2)・`KeepAlive` で crash 自動再起動） | `files.template` + `server.shell`（bootout → bootstrap リトライ） |
 
 > **NOTE**: pipeline.yaml の設定項目は [`src/approval-pipeline/config/pipeline.yaml`](../../src/approval-pipeline/config/pipeline.yaml) 本体を参照（設計意図は設計書 §3 / §8.9）。
 >
-> **ローダ**: `ApprovalPipeline` は起動時に自モジュール相対の `config/pipeline.yaml`（＝配備先 `/opt/taka-ma/sa-ru/approval-pipeline/config/pipeline.yaml`）をロードし、`audit.log_path`（監査ログ出力先の SSOT）・`safety.always_deny` / `safety.always_escalate_to_human` を取得する。安全床（`safety.*`）は ya-ta の Tier 判定**前**に決定論で照合する（即時拒否＝§6 / 人間直行＝§4）。フローは設計書 §3.3 (0) 静的安全床 / §3.4 フロー図の `SF` ノードを参照。
+> **ローダ**: `ApprovalPipeline` は起動時に自モジュール相対の `config/pipeline.yaml`（＝配備先 `/opt/taka-ma/sa-ru/approval-pipeline/config/pipeline.yaml`）をロードし、`audit.log_path`（監査ログ出力先の SSOT）・`safety.always_deny` / `safety.always_escalate_to_human` を取得する。安全性チェック（`safety.*`）は ya-ta の Tier 判定**前**に決定論で照合する（即時拒否＝§6 / 人間直行＝§4）。フローは設計書 §3.3 (0) 静的安全性チェック / §3.4 フロー図の `SF` ノードを参照。
 
 ## 動作確認
 
 ### 1. pytest 通過（配備直後）
 
 ```bash
-ssh mac-mini "cd /opt/taka-ma/sa-ru/approval-pipeline && /opt/taka-ma-env/bin/python -m pytest tests/ -v"
+ssh mac-mini "cd /opt/taka-ma/sa-ru/approval-pipeline && PYTHONPATH=/opt/taka-ma/ya-ta:/opt/taka-ma/sa-ru/orchestrator /opt/taka-ma-env/bin/python -m pytest tests/ -v"
 ```
 
 | 観点 | 成功 | エラー |
@@ -140,6 +154,50 @@ ssh mac-mini "tail -3 /opt/taka-ma/logs/approval-audit.jsonl"
 | handler 結果 | `decision: deny`（Tier 判定スキップ） | 通常 Tier フローに流れる |
 | 監査ログ | `reason` に `always_deny` 該当が記録される | 通常 reason のみ |
 
+### 7. decide デーモン稼働（headless フックの判定実行系）
+
+```bash
+ssh mac-mini "launchctl print gui/\$(id -u)/com.taka-ma.decide-daemon | grep state"
+ssh mac-mini "ls -l /opt/taka-ma/data/decide.sock"
+```
+
+| 観点 | 成功 | エラー |
+|------|------|--------|
+| launchd 状態 | `state = running` | 不在・spawn 失敗（`/opt/taka-ma/logs/decide-daemon-error.log` を確認） |
+| ソケット | `decide.sock` が存在（srw・オーナーのみ） | 不在（デーモン起動失敗） |
+
+### 8. フック経由の allow / deny（MBP からの end-to-end）
+
+MBP 上から、フックコマンドと同一経路（SSH → decide_client → デーモン）で判定を通す。
+
+```bash
+# Tier 1 相当（read 系）→ exit 0 ＋ permissionDecision:"allow"
+echo '{"tool_name":"Bash","tool_input":{"command":"ls"},"tool_use_id":"t1"}' | \
+  ssh mac-mini "/opt/taka-ma-env/bin/python3 /opt/taka-ma/sa-ru/approval-pipeline/decide_client.py --task-id verify"; echo "exit=$?"
+# always_deny 相当 → stderr に理由・exit 2
+echo '{"tool_name":"Bash","tool_input":{"command":"rm -rf /"},"tool_use_id":"t2"}' | \
+  ssh mac-mini "/opt/taka-ma-env/bin/python3 /opt/taka-ma/sa-ru/approval-pipeline/decide_client.py --task-id verify"; echo "exit=$?"
+```
+
+| 観点 | 成功 | エラー |
+|------|------|--------|
+| allow | stdout に `permissionDecision":"allow"`・exit=0 | exit 非 0、応答なし |
+| deny | stderr に理由・exit=2 | exit 0 で素通り、exit 1 等（契約違反） |
+
+### 9. fail-closed（デーモン停止時に全ツール deny）
+
+```bash
+ssh mac-mini "launchctl bootout gui/\$(id -u)/com.taka-ma.decide-daemon"
+echo '{"tool_name":"Bash","tool_input":{"command":"ls"},"tool_use_id":"t3"}' | \
+  ssh mac-mini "/opt/taka-ma-env/bin/python3 /opt/taka-ma/sa-ru/approval-pipeline/decide_client.py"; echo "exit=$?"
+ssh mac-mini "launchctl bootstrap gui/\$(id -u) ~/Library/LaunchAgents/com.taka-ma.decide-daemon.plist"
+```
+
+| 観点 | 成功 | エラー |
+|------|------|--------|
+| 停止中の判定 | stderr に fail-safe deny・exit=2 | exit 0 / exit 1（fail-open の穴） |
+| 復帰 | bootstrap 後、動作確認 8 の allow が再び通る | 再起動後も判定不能 |
+
 ## 検証項目
 
 > **検証概要**: y/n 承認パイプラインが sa-ru の一部として組み込まれ、対話型 worker CLI からの y/n プロンプトを Tier 1/2/3 に分類し、それぞれ自動承認 / qu-e 審査 / Slack 経由人間承認を実行できることを確認する。`always_deny` 即時拒否、5 分タイムアウト、jsonl 監査ログを含む。
@@ -158,6 +216,9 @@ ssh mac-mini "tail -3 /opt/taka-ma/logs/approval-audit.jsonl"
 | 10 | Tier 3 タイムアウト（`tier3_timeout_sec` 既定 300 秒）で自動 deny | 動作確認 4 |
 | 11 | 全操作が監査ログ（approval-audit.jsonl）に記録される | 動作確認 5 |
 | 12 | `always_deny` リストのコマンドが即座に拒否される | 動作確認 6 |
+| 13 | decide デーモンが launchd 常駐し UDS を待ち受けている | 動作確認 7 |
+| 14 | MBP からフック経路（SSH → decide_client → デーモン）で allow / deny が返る | 動作確認 8 |
+| 15 | デーモン停止時にフック経路が exit 2（fail-closed）となり、read 系の素通りがない | 動作確認 9 |
 
 ## 主要 API（実装本体への索引）
 
@@ -172,12 +233,17 @@ ssh mac-mini "tail -3 /opt/taka-ma/logs/approval-audit.jsonl"
 | `Tier2Handler.handle()` | [`tier2_handler.py`](../../src/approval-pipeline/tier2_handler.py) | Medium Risk: qu-e 審査（§8.8）。qu-e へ **SSH** で `review_cli.py` を 1 ショット実行 → JSON。approve のみ承認、deny / escalate および失敗時は escalate を返す |
 | `Tier3Handler.handle()` | [`tier3_handler.py`](../../src/approval-pipeline/tier3_handler.py) | High Risk: Slack 経由人間承認（§8.9）、`tier3_timeout_sec` で自動 deny |
 | `AuditLogger.log()` | [`audit_logger.py`](../../src/approval-pipeline/audit_logger.py) | jsonl 形式の監査ログ（§3.5） |
+| `DecideDaemon` / `PipelineHolder` | [`decide_daemon.py`](../../src/approval-pipeline/decide_daemon.py) | headless フック判定の常駐サーバ（UDS・asyncio 並行・config mtime 再ロード。設計 Appendix §2.1） |
+| `decide_client.main()` | [`decide_client.py`](../../src/approval-pipeline/decide_client.py) | フックの薄い入口（標準ライブラリのみ）。allow=exit 0 / deny・全異常=exit 2 の出力契約 |
 
 ### 設定
 
 - [`src/approval-pipeline/config/pipeline.yaml`](../../src/approval-pipeline/config/pipeline.yaml) — パイプライン設定を一元管理（`tier3_timeout_sec` / `audit.log_path` / `safety.always_deny` / `safety.always_escalate_to_human`）
+- [`src/orchestrator/config/sa-ru.yaml`](../../src/orchestrator/config/sa-ru.yaml) `headless` ブロック — フックコマンドの組み立て材料（`mini_host` / `decide_client` / `decide_socket` / `python_bin` / `hook_timeout_sec`）
 
 ### テスト
 
 - [`tests/test_interceptor.py`](../../src/approval-pipeline/tests/test_interceptor.py) — y/n パターン検出テスト
 - [`tests/test_e2e.py`](../../src/approval-pipeline/tests/test_e2e.py) — Tier 1 自動承認 / Tier 3 escalate の E2E
+- [`tests/test_decide_daemon.py`](../../src/approval-pipeline/tests/test_decide_daemon.py) — デーモンの契約（allow/deny 変換・fail-closed・並行性・判定タイムアウト）
+- [`tests/test_decide_client.py`](../../src/approval-pipeline/tests/test_decide_client.py) — クライアントの終了コード契約（allow=0 / deny・到達不可=2）を分離実行で検証

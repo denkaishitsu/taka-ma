@@ -96,7 +96,13 @@ def _model_usage() -> str:
 
 def _model_list(say):
     """登録済みモデルを ya-ta.yaml から読み、キー順に整形して Slack へ返す。"""
-    models = model_store.load_models()
+    try:
+        models = model_store.load_models()
+    except (ValueError, OSError) as e:
+        # ValueError=YAML 解析失敗（model_store が YAMLError を正規化）、OSError=読取失敗。
+        # 捕捉しないと ack 後にハンドラが落ち、ユーザーへ何も返らない（M9）。
+        say(f":x: {e}")
+        return
     if not models:
         say(":information_source: 登録モデルはありません")
         return
@@ -157,7 +163,13 @@ def _model_install_or_uninstall(sub: str, tokens: list[str], say):
         say(_model_usage())
         return
     key = tokens[0]
-    conf = model_store.get_model(key)
+    try:
+        conf = model_store.get_model(key)
+    except (ValueError, OSError) as e:
+        # get_model→load_models は壊れた ya-ta.yaml で ValueError（YAMLError 正規化）を投げ得る。
+        # ここで捕捉しないと ack 後にハンドラが落ち、install/uninstall が無応答になる（M9）。
+        say(f":x: {e}")
+        return
     if conf is None:
         if sub == "install":
             say(f":x: 未登録: `{key}`（先に `add` してください）")
@@ -168,6 +180,12 @@ def _model_install_or_uninstall(sub: str, tokens: list[str], say):
 
     is_local = conf.get("type") == "local"
     model_id = conf.get("model_id", "")
+    # ローカルモデルの install は実体 DL（ollama pull）が本体。model_id が無いと
+    # pull を丸ごとスキップしたまま「導入しました」と偽成功を返す（M8）。事前に弾く。
+    if sub == "install" and is_local and not model_id:
+        say(f":x: `{key}` は type:local ですが model_id 未設定です"
+            f"（`/taka-ma-model update {key} --model-id <id>` の後に install してください）")
+        return
     # _ssh は subprocess.TimeoutExpired（RuntimeError/ValueError ではない）を投げ得るため
     # 併せて捕捉する。捕まえ損ねると ack 後にハンドラが落ち、ユーザーへ何も返らない。
     try:

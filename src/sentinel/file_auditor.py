@@ -14,6 +14,7 @@ import datetime
 import json
 import logging
 import os
+import re
 import subprocess
 import uuid
 from fnmatch import fnmatch
@@ -23,6 +24,16 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
 logger = logging.getLogger("qu-e.file_auditor")
+
+# ワイルドカード・区切りのみで構成される「過大パターン」（例: `*`、`**`、`/*`）。
+# .gitignore にこの 1 行があるだけでリポジトリ全体が監査対象から消える（監査バイパス）
+# ため適用しない（§8.12「.gitignore の適用限界」）。`.` は literal なので `.*`（dotfile
+# 除外）等の実用パターンは対象外。
+_BROAD_PATTERN_RE = re.compile(r"\A[*?/\[\]]+\Z")
+
+# LLM 判定に渡す diff の上限文字数（§8.12「diff 要約」）。巨大 diff によるプロンプト肥大
+# （ollama コンテキスト溢れ・判定劣化）を防ぐ。超過分は切り詰めて明示する。
+_DIFF_MAX_CHARS = 4000
 
 
 class GitignoreCache:
@@ -52,10 +63,21 @@ class GitignoreCache:
         cached = self._cache.get(gitignore_path)
         if cached and cached[0] == mtime:
             return cached[1]
-        # 初回 or 編集後: 実ファイルをパース（空行・コメント行は無視パターンに含めない）
+        # 初回 or 編集後: 実ファイルをパース（空行・コメント行は無視パターンに含めない）。
+        # 過大パターンの排除は再パース時（低頻度）に行い、判定ホットパスに載せない。
         with open(gitignore_path) as f:
-            patterns = [line.strip() for line in f
-                        if line.strip() and not line.strip().startswith("#")]
+            patterns = []
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                # 過大パターン（ワイルドカードのみ）は監査バイパスになるため適用しない
+                # （§8.12）。`!` 否定は監査を増やす方向なので過大でも保持してよい。
+                if not line.startswith("!") and _BROAD_PATTERN_RE.match(line):
+                    logger.warning("過大 .gitignore パターンを不適用: %r (%s)",
+                                   line, gitignore_path)
+                    continue
+                patterns.append(line)
         self._cache[gitignore_path] = (mtime, patterns)
         return patterns
 
@@ -87,6 +109,12 @@ class FileAuditHandler(FileSystemEventHandler):
         # ユーザー成果物まで誤って除外し得る）ではなく、このパス配下かどうかで厳密に判定する
         # （Layer3 review で指摘・是正）。
         self.task_context_dir: str | None = config.get("task_context", {}).get("dir")
+        # sa-ru が worker 起動のたびに workspace へ配置する制御ファイル（PreToolUse フック設定
+        # 等）。外部改変ではなく sa-ru 自身が毎タスク生成・上書きする自己生成物であり、監査対象に
+        # すると全タスクで同一パスの escalate/deny アラートを量産する。ファイル名が固定・既知の
+        # システム制御プレーンとして basename で除外する（§8.12 システム制御プレーンの除外）。
+        self.control_plane_files: list[str] = config["file_audit"].get(
+            "control_plane_files", [".taka-hook-settings.json"])
         self.debounce_sec: float = config["file_audit"].get("debounce_sec", 1)
         self.log_dir: str = config["file_audit"]["log_dir"]
         self.alert_dir: str = config["file_audit"]["o_moi_alert_dir"]
@@ -94,6 +122,10 @@ class FileAuditHandler(FileSystemEventHandler):
         self._gitignore = GitignoreCache()
         # debounce 用: path → 集約中タイマー。同パスの連続変更を 1 回の監査にまとめる
         self._pending: dict[str, asyncio.TimerHandle] = {}
+        # debounce ウィンドウ内で同パスに届いた event 種別の集約結果（§8.12 原子的書き込みの集約）。
+        # atomic write（tmp→本体 rename／本体削除→再作成）で delete と create/moved が対で
+        # 来たとき、本体パスの「削除」アラート化を防ぐため modify に集約する。
+        self._agg_event: dict[str, str] = {}
         # ログ出力先は起動時に作っておく（初回書き込みで失敗しないように）
         os.makedirs(self.log_dir, exist_ok=True)
 
@@ -103,6 +135,7 @@ class FileAuditHandler(FileSystemEventHandler):
         静的フィルタの第一段（A1 §1）。設定の固定無視パターンに加え、変更パスの属する
         リポジトリの `.gitignore` を合わせて適用する。パスの各構成要素（ディレクトリ名・
         ファイル名）のいずれかがいずれかのパターンに合致したら除外する。
+        `!` 否定（再包含）は「一致したパスは除外しない＝監査する」と安全側で近似する（§8.12）。
         """
         # qu-e/sa-ru 間の内部通信ディレクトリは既知の絶対パスなので、パス prefix で厳密に
         # 除外する（ベアネーム fnmatch だと同名のユーザー成果物まで巻き込むため対象外）。
@@ -111,6 +144,16 @@ class FileAuditHandler(FileSystemEventHandler):
             or path.startswith(self.task_context_dir.rstrip(os.sep) + os.sep)
         ):
             return True
+        # sa-ru が workspace に配る制御ファイル（`.taka-hook-settings.json` 等）は自己生成物で
+        # 監査対象外。パスは workspace（task_id 可変）配下だがファイル名は固定・既知のため
+        # basename で判定する（§8.12）。この名前のユーザー成果物はまず無く、パス固定・既知
+        # ゆえ「除外ルール書き換えこそ監査」思想（下記 .gitignore）とは競合しない。
+        if os.path.basename(path) in self.control_plane_files:
+            return True
+        # `.gitignore` 自身の変更は静的フィルタの対象外＝常に監査する。除外ルールを
+        # 書き換える変更（例: `*` を書き込んで以降を無監査化する）こそ監査対象（§8.12）。
+        if os.path.basename(path) == ".gitignore":
+            return False
         # パスを構成要素に分解し、各要素単位でパターン照合する（中間ディレクトリの除外も拾うため）
         parts = path.split(os.sep)
         # 固定の無視パターン ∪ そのリポジトリの .gitignore
@@ -118,8 +161,16 @@ class FileAuditHandler(FileSystemEventHandler):
         gitignore = self._find_gitignore(path)
         if gitignore:
             patterns.extend(self._gitignore.get_patterns(gitignore))
+        # `!` 否定（再包含）を分離。否定に一致したパスは除外せず監査する（監査を増やす
+        # 方向の近似。gitignore 本来の last-match-wins は実装しない）。
+        negations = [p[1:] for p in patterns if p.startswith("!") and len(p) > 1]
+        positives = [p for p in patterns if not p.startswith("!")]
+        for pattern in negations:
+            for part in parts:
+                if fnmatch(part, pattern):
+                    return False
         # いずれかの構成要素がいずれかのパターンに合致すれば除外
-        for pattern in patterns:
+        for pattern in positives:
             for part in parts:
                 if fnmatch(part, pattern):
                     return True
@@ -148,45 +199,87 @@ class FileAuditHandler(FileSystemEventHandler):
         """ファイル削除イベント（watchdog からワーカースレッドで呼ばれる）。"""
         self._on_event(event, "deleted")
 
-    def _on_event(self, event, event_type: str):
-        """全イベント共通の入口。除外判定 → debounce 登録までを行う。
+    def on_moved(self, event):
+        """リネーム/移動イベント。移動先を新規変更として監査し、移動元は削除として扱う（§8.12）。
 
-        watchdog のワーカースレッドから呼ばれるため、ここでは重い処理をせず
-        `call_soon_threadsafe` でイベントループ側に橋渡しするに留める。
+        無視される名前（一時ファイル拡張子等）で作成してから目的パスへ rename する変更は
+        on_created/on_modified に映らないため、moved を実装しないと検知ゼロで素通りする。
+        移動先・移動元それぞれに除外判定を適用する。
         """
-        # ディレクトリ自体の変更や無視対象パスは監査しない
-        if event.is_directory or self._should_ignore(event.src_path):
+        if event.is_directory:
             return
-        # debounce: 同パスに集約待ちタイマーが居れば取り消して張り直す（連続保存を 1 回に集約）
-        timer = self._pending.pop(event.src_path, None)
+        self._submit(getattr(event, "dest_path", None), "moved")
+        self._submit(event.src_path, "deleted")
+
+    def _on_event(self, event, event_type: str):
+        """created/modified/deleted 共通の入口（watchdog ワーカースレッド側）。"""
+        if event.is_directory:
+            return
+        self._submit(event.src_path, event_type)
+
+    def _submit(self, path: str, event_type: str):
+        """1 パスの変更を除外判定して debounce へ投入する（全イベント種別の共通口）。
+
+        watchdog のワーカースレッドから呼ばれる。ここでは debounce 台帳（_pending）に
+        一切触れず、`call_soon_threadsafe` でイベントループへ橋渡しするだけに留める。
+        台帳の取り消し・登録を `_debounce`（ループ上）に直列化することで、別スレッド
+        からの pop/cancel 競合による二重監査・取り消し漏れを防ぐ（§8.12 ノイズ抑制）。
+        """
+        if not path or self._should_ignore(path):
+            return
+        self.loop.call_soon_threadsafe(self._debounce, path, event_type)
+
+    def _debounce(self, path: str, event_type: str):
+        """debounce 台帳を更新し、debounce_sec 後に `_audit` を発火するタイマーを張り直す。
+
+        イベントループ上でのみ実行される（台帳アクセスが単一スレッドに閉じるため
+        ロック不要）。待機中に同パスの新たな変更が来ればタイマーを取り消して張り直す
+        ため、最後の変更から debounce_sec 静かになって初めて 1 回だけ監査が走る。
+        event 種別はウィンドウ内で集約し（`_merge_event`）、atomic write の delete↔create
+        共起を modify に畳んでから監査する（§8.12 原子的書き込みの集約）。
+        """
+        self._agg_event[path] = self._merge_event(self._agg_event.get(path), event_type)
+        timer = self._pending.pop(path, None)
         if timer:
             timer.cancel()
-        # スレッド境界を越えてループ側でタイマーを仕掛ける
-        self._pending[event.src_path] = self.loop.call_soon_threadsafe(
-            lambda: self._schedule_audit(event.src_path, event_type)
-        )
-
-    def _schedule_audit(self, path: str, event_type: str):
-        """debounce_sec 後に `_audit` を発火する asyncio タイマーを仕掛ける。
-
-        イベントループ上で実行される。待機中に同パスの新たな変更が来れば
-        `_on_event` がこのタイマーを取り消して張り直すため、最後の変更から
-        debounce_sec 静かになって初めて 1 回だけ監査が走る。
-        """
-        timer = self.loop.call_later(
+        self._pending[path] = self.loop.call_later(
             self.debounce_sec,
-            lambda: asyncio.create_task(self._audit(path, event_type)))
-        self._pending[path] = timer
+            lambda: asyncio.create_task(self._audit(path)))
 
-    async def _audit(self, path: str, event_type: str):
+    @staticmethod
+    def _merge_event(prev: str | None, new: str) -> str:
+        """debounce ウィンドウ内の同一パスの event 種別を集約する（§8.12 原子的書き込みの集約）。
+
+        atomic write（一時ファイル→本体 rename、または本体削除→再作成）では、同じ本体パスに
+        delete と create/moved がウィンドウ内で対で届く。これを素朴に「最後のイベント」で判定
+        すると、順序次第で正当な保存が本体パスの **削除** アラートに化ける。そこで「delete と
+        **新規実体の出現**（created / moved）がウィンドウ内で共起したら modify に集約」する。
+        modified は「存在の出現」ではなく既存実体の更新なので集約対象に含めない——含めると
+        「編集→即削除」（modified→deleted）まで modify に畳み、**真の削除を隠す**ため。delete が
+        create/moved と対にならなければ（真の削除、または編集後削除）**削除として残す**。
+        検知回避（無視名で作成→監査名へ rename）は移動先パスの監査で従来どおり担保される。
+        """
+        # 「新規実体の出現」＝ atomic write でファイルが実在に戻るイベント。modified は含めない。
+        appears = ("created", "moved")
+        if prev is None:
+            return new
+        # delete と新規実体出現の共起 → 更新（modify）に畳む。削除アラート化を防ぐ。
+        if "deleted" in (prev, new) and (prev in appears or new in appears):
+            return "modified"
+        # それ以外は最新種別を採用（両 deleted・modified→deleted 等は削除/更新の意味論を保つ）。
+        return new
+
+    async def _audit(self, path: str):
         """1 件の確定変更を監査する本体（debounce 後にイベントループ上で実行）。
 
         変更を実行中タスクへ紐付けて文脈を集め、qu-e LLM に判定させ、結果を監査ログに
         残し、要対応のものだけ sa-ru へ通知する、という一連を行う。途中で例外が出ても
-        監査ループ全体は止めず、ログに残して握り潰す。
+        監査ループ全体は止めず、ログに残して握り潰す。event 種別は debounce ウィンドウ内で
+        集約済みの値を使う（§8.12、atomic write の削除誤検知はここに届く前に modify へ畳まれる）。
         """
-        # このパスの集約は完了。タイマー台帳から外す
+        # このパスの集約は完了。タイマー台帳と集約 event 台帳から外す
         self._pending.pop(path, None)
+        event_type = self._agg_event.pop(path, "modified")
         try:
             # 変更パスが属する実行中タスクを特定し、文脈（指示文・通知先・状態）を引き当てる（§8.13）。
             # 紐付かない場合は値を既定（空 / "none"）に倒して匿名の変更として続行する。
@@ -202,9 +295,12 @@ class FileAuditHandler(FileSystemEventHandler):
             diff = self._compute_diff_summary(path, event_type)
             result = await self.reviewer.review_file_audit(path, diff, command, status)
 
-            # 監査レコードを組み立てて日付別 jsonl に追記（id は後段の人間承認と突き合わせる鍵）
+            # 監査レコードを組み立てて日付別 jsonl に追記（id は後段の人間承認と突き合わせる鍵）。
+            # `**result` を先に展開し固定キーを後で上書きすることで、LLM 応答由来の値が
+            # 識別・突合キー（id/path/task_id/timestamp/event 等）を汚染するのを防ぐ（固定キー保全）。
             audit_id = uuid.uuid4().hex
             record = {
+                **result,                # decision / reason / confidence / diff_summary
                 "id": audit_id,
                 "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 "event": event_type,
@@ -212,16 +308,20 @@ class FileAuditHandler(FileSystemEventHandler):
                 "task_id": task_id,
                 "command": command,
                 "status": status,
-                **result,                # decision / reason / confidence / diff_summary
             }
             self._append_jsonl(record)
 
-            # approve は記録のみで完結。要対応（deny/escalate）だけ sa-ru に通知する（A1 §2）
-            if result.get("decision") in ("deny", "escalate"):
+            # fail-closed: approve と明示されたときのみ記録で完結し、それ以外（deny/escalate/
+            # 想定外の値）はすべて sa-ru へ通知して人間確認に回す。reviewer 側で decision は
+            # approve/deny/escalate に正規化済みだが、ここでも「approve 以外は通知」を基準にする。
+            if record.get("decision") != "approve":
                 self._push_alert_to_o_moi(audit_id, record, channel_id, thread_ts, team_id)
         except Exception:
             # 1 件の失敗で監視を止めない。原因追跡のためスタックトレースは残す
             logger.exception("file_audit 処理失敗: path=%s", path)
+            # fail-closed: 監査できなかった変更を無音で通さない。判定を得られなかった事実を
+            # 最小情報で人間へ escalate 通知する（監視が沈黙したまま危険変更が通る経路を塞ぐ）。
+            self._push_audit_failure_alert(path, event_type)
 
     def _pick_task_context(self, path: str) -> dict | None:
         """変更パスが属するタスクを workspace 接頭辞で特定する（§8.13、複数並行対応）。
@@ -254,23 +354,30 @@ class FileAuditHandler(FileSystemEventHandler):
         return in_progress[0] if len(in_progress) == 1 else None
 
     def _compute_diff_summary(self, path: str, event_type: str) -> str:
-        """LLM 判定に渡す変更内容の要約を作る。
+        """LLM 判定に渡す変更内容の diff を作る（§8.12「diff 要約」）。
 
-        可能なら `git diff --stat` で実際の変更規模を要約する。git 管理外・git 不在・
-        タイムアウト等で取れない場合は「種別: パス」だけの最小要約に縮退する（判定は
-        止めない）。削除は diff が取れないため種別とパスのみ。
+        可能なら `git diff`（変更内容を含む）で実際の変更を取る。件数のみの `--stat` では
+        qu-e が判定材料ゼロで審査することになるため内容を渡し、肥大化は _DIFF_MAX_CHARS で
+        切り詰める。git 管理外・git 不在・タイムアウト等で取れない場合は「種別: パス」の
+        最小要約に縮退する（判定は止めない）。削除は diff が取れないため種別とパスのみ。
         """
         # 削除済みファイルは diff を取りようがないので種別＋パスで即返す
         if event_type == "deleted":
             return f"deleted: {path}"
         try:
-            # 変更ファイルのあるディレクトリで git diff。stat（増減行数の要約）のみ取得する
+            # 変更ファイルのあるディレクトリで git diff（変更内容を含む本文を取得する）
             result = subprocess.run(
-                ["git", "diff", "--stat", "--", path],
+                ["git", "diff", "--", path],
                 capture_output=True, text=True, timeout=5,
                 cwd=os.path.dirname(path) or ".")
-            # diff が空（未追跡・ステージ外等）でも最低限の要約は返す
-            return (result.stdout or f"{event_type}: {path}").strip()
+            diff = (result.stdout or "").strip()
+            # diff が空（未追跡・コミット直後等）でも最低限の要約は返す
+            if not diff:
+                return f"{event_type}: {path}"
+            # 巨大 diff はプロンプト肥大（コンテキスト溢れ・判定劣化）を防ぐため切り詰める
+            if len(diff) > _DIFF_MAX_CHARS:
+                diff = diff[:_DIFF_MAX_CHARS] + "\n...(truncated)"
+            return diff
         except Exception:
             # git が無い/失敗しても監査は続行。最小要約に縮退する
             return f"{event_type}: {path}"
@@ -295,13 +402,15 @@ class FileAuditHandler(FileSystemEventHandler):
         audit ログ id・チャンネル・ワークスペース（team_id）・スレッドも同梱する。
         push 失敗は監査本体を巻き込まないようログのみで握り潰す。
         """
-        # sa-ru 側が承認フローを組み立てるのに必要な一式をまとめる
+        # sa-ru 側が承認フローを組み立てるのに必要な一式をまとめる。
+        # 各フィールドは .get で安全に取り出し、キー欠落で push 自体が KeyError で
+        # 落ちる（＝アラート無音ロスト）ことを防ぐ（fail-closed）。
         payload = {
             "audit_log_id": audit_id,
             "task_id": record.get("task_id", ""),
-            "path": record["path"],
-            "decision": record["decision"],
-            "reason": record["reason"],
+            "path": record.get("path", ""),
+            "decision": record.get("decision", "escalate"),
+            "reason": record.get("reason", ""),
             "confidence": record.get("confidence", 0.0),
             "diff_summary": record.get("diff_summary", ""),
             "command": record.get("command", ""),
@@ -321,6 +430,36 @@ class FileAuditHandler(FileSystemEventHandler):
         except Exception:
             # 通知が落ちても監査記録（jsonl）は残っている。原因追跡のためログのみ残す
             logger.exception("file_audit alert push 失敗: audit_id=%s", audit_id)
+
+    def _push_audit_failure_alert(self, path: str, event_type: str):
+        """監査処理自体が例外で失敗した事実を人間へ escalate 通知する（fail-closed）。
+
+        判定結果を得られなかった＝「危険かもしれない変更が監査を素通りした」状態のため、
+        最小情報（対象パス・種別）で escalate アラートを組み立てて push する。通知先の
+        文脈（channel/thread/team）は失敗時点で不明なので空にし、sa-ru 側の既定投稿先
+        フォールバックに委ねる。この二次処理でさらに例外が出ても監査ループは止めない。
+        """
+        try:
+            audit_id = uuid.uuid4().hex
+            record = {
+                "id": audit_id,
+                "path": path,
+                "decision": "escalate",
+                "reason": f"file_audit 処理が例外で失敗（event={event_type}）。人間確認が必要",
+                "confidence": 0.0,
+                "diff_summary": "",
+                "task_id": "",
+                "command": "",
+                "status": "none",
+            }
+            # 監査証跡にも失敗を残す（残せなくても通知は試みる）
+            try:
+                self._append_jsonl(record)
+            except Exception:
+                logger.exception("失敗 escalate の jsonl 追記に失敗: audit_id=%s", audit_id)
+            self._push_alert_to_o_moi(audit_id, record, channel_id="", thread_ts=None, team_id="")
+        except Exception:
+            logger.exception("失敗 escalate 通知の組み立てに失敗: path=%s", path)
 
 
 def start_audit(config: dict, reviewer, task_context_store: dict,

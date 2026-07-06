@@ -10,6 +10,8 @@ import asyncio
 
 from ai_gateway.risk_classifier import RiskClassifier as AiGatewayRiskClassifier
 
+from approval_types import operation_str
+
 
 class RiskClassifier:
     """ya-ta にリスク分類を依頼する（in-process）。"""
@@ -18,17 +20,18 @@ class RiskClassifier:
         """ya-ta（ai_gateway）のリスク分類器を内部に抱えて初期化する。"""
         self._gateway = AiGatewayRiskClassifier(config)
 
-    async def classify(self, prompt: 'InterceptedPrompt') -> dict:
+    async def classify(self, pending: 'PendingApproval') -> dict:
         """ya-ta にリスク分類を依頼。
 
         Returns: `{"tier": 1|2|3, "reason": str, ...}`。Tier 3（人間承認）では reason を
         Slack 承認リクエストの risk_reason として提示するため、tier だけでなく dict 全体を返す。
         """
-        return await self._call_ai_gateway(prompt)
+        return await self._call_ai_gateway(pending)
 
-    async def _call_ai_gateway(self, prompt: 'InterceptedPrompt') -> dict:
+    async def _call_ai_gateway(self, pending: 'PendingApproval') -> dict:
         """ai_gateway.RiskClassifier.classify を in-process 実行（同期 → to_thread）。
 
+        構造化 PendingApproval を操作文字列に整形して ya-ta へ渡す（ya-ta の I/F は文字列のまま）。
         ai_gateway 側はパースエラー時に Tier 3（人間判断）へフォールバックする（設計書 §8.4）。
         """
-        return await asyncio.to_thread(self._gateway.classify, prompt.command)
+        return await asyncio.to_thread(self._gateway.classify, operation_str(pending))

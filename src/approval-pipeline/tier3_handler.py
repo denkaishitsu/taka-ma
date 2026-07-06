@@ -21,7 +21,10 @@ import datetime
 import json
 import logging
 import os
+import time
 import uuid
+
+from approval_types import Decision, operation_str
 
 logger = logging.getLogger("sa-ru.tier3")
 
@@ -62,31 +65,37 @@ class Tier3Handler:
         """承認リクエストの一意 ID（Slack ボタン value／承認ファイル名で特定）。"""
         return uuid.uuid4().hex
 
-    async def handle(self, prompt, pty_wrapper, ctx=None):
-        """承認ファイルを pending 作成 → Slack 送信 → status 変化をポーリング → 終端で PTY に y/n。
+    async def handle(self, pending, ctx=None) -> Decision:
+        """承認ファイルを pending 作成 → Slack 送信 → status 変化をポーリング → 終端で Decision を返す。
 
-        ctx（ApprovalPipeline.process が渡す）から instance_id / risk_reason /
+        ctx（ApprovalPipeline.decide が渡す）から instance_id / risk_reason /
         team_id / channel / task_id を受け取り、承認リクエストを送信元ワークスペースへ返す。
+        allow/deny の物理的な伝達（y/n 送信・フック応答）には関与しない（中核は CLI 非依存）。
         """
         ctx = ctx or {}
         request_id = self._generate_request_id()
-        instance_id = ctx.get("instance_id") or getattr(pty_wrapper, "instance_id", "")
+        instance_id = ctx.get("instance_id", "")
         risk_reason = ctx.get("risk_reason", "")
         team_id = ctx.get("team_id")
         channel = ctx.get("channel")
         task_id = ctx.get("task_id", "")
-        # 承認者が「何を実行しようとしているか」を判断できるよう、worker stdout の前後文脈を渡す。
-        context = getattr(prompt, "context", "")
+        thread_ts = ctx.get("thread_ts")
+        # 承認者が「何を実行しようとしているか」を判断できるよう、前後文脈と操作文字列を渡す。
+        context = getattr(pending, "context", "")
+        command = operation_str(pending)
 
         approval_path = os.path.join(self.approval_dir, f"{request_id}.json")
 
         # 承認ファイルを status=pending で作成（§8.10 フロー 1）。
+        # command は人間可読の操作文字列、tool_name/tool_input は構造化データ（後方互換で併記）。
         # team_id / channel_id は応答先ワークスペース特定用の記録。
         self._write_record(approval_path, {
             "request_id": request_id,
             "task_id": task_id,
             "instance_id": instance_id,
-            "command": prompt.command,
+            "command": command,
+            "tool_name": pending.tool_name,
+            "tool_input": pending.tool_input,
             "context": context,
             "tier": 3,
             "risk_reason": risk_reason,
@@ -96,6 +105,7 @@ class Tier3Handler:
             "decided_by": None,
             "team_id": team_id or "",
             "channel_id": channel or "",
+            "thread_ts": thread_ts,
         })
 
         # Slack に Block Kit 承認リクエストを送信（送信元 WS へ。SlackNotifier は同期メソッド）。
@@ -103,22 +113,29 @@ class Tier3Handler:
         try:
             self.slack_notifier.send_approval_request(
                 request_id=request_id,
-                command=prompt.command,
+                command=command,
                 instance_id=instance_id,
                 risk_reason=risk_reason,
                 context=context,
                 channel=channel,
                 team_id=team_id,
+                thread_ts=thread_ts,
             )
         except Exception:
             logger.exception("Tier3 承認リクエストの Slack 送信に失敗。安全側で deny します: %s", request_id)
-            pty_wrapper.deny()
             self._mark_status(approval_path, STATUS_ERROR)
             self._finalize(approval_path)
-            return {"action": "denied", "reason": "slack_error", "handler": "tier3_human"}
+            return Decision(allow=False, handler="tier3_human", reason="slack_error")
 
         # status 変化を 1 秒間隔でポーリング（最大 5 分）。u-zu が approved / rejected に更新する。
-        decision = await self._poll_decision(approval_path)
+        # decide_deadline（デーモンの外側タイムアウト締切）があるときは、その内側に収める。
+        # 前段（リスク分類・qu-e 審査）の消費時間で残余が 300 秒を割っても、Tier3 が外側より
+        # 先に timeout を確定させ、監査記録・done/ 退避・timeout 理由を必ず残す（V11 の包含）。
+        budget = TIMEOUT_SECONDS
+        dl = ctx.get("decide_deadline")
+        if dl is not None:
+            budget = max(0, min(TIMEOUT_SECONDS, int(dl - time.monotonic())))
+        decision = await self._poll_decision(approval_path, budget)
         if decision is None:
             # ポーリングが時間切れ。ただし最後の読取と本処理の間に u-zu が決定を書く競合があるため、
             # timeout を主張するのは「まだ pending」のときだけ。既に決定済みならそれを尊重する（最終裁定）。
@@ -126,36 +143,35 @@ class Tier3Handler:
 
         try:
             if decision == STATUS_APPROVED:
-                pty_wrapper.approve()
-                return {"action": "approved", "handler": "tier3_human"}
+                return Decision(allow=True, handler="tier3_human")
             if decision == STATUS_REJECTED:
-                pty_wrapper.deny()
-                return {"action": "denied", "handler": "tier3_human"}
+                return Decision(allow=False, handler="tier3_human")
 
             # timeout（または想定外 status）→ 自動 deny し Slack へ通知（§8.10）。
-            # 通知失敗が deny 確定（pty 済）を覆さないよう、送信は例外を握って続行する。
-            pty_wrapper.deny()
+            # 通知失敗が deny 確定を覆さないよう、送信は例外を握って続行する。
             try:
                 self.slack_notifier.notify(
-                    f"承認タイムアウト（5分）: 自動 deny しました (ID: {request_id})",
-                    channel=channel, team_id=team_id,
+                    f"承認タイムアウト: 自動 deny しました (ID: {request_id})",
+                    channel=channel, team_id=team_id, thread_ts=thread_ts,
                 )
             except Exception:
-                logger.exception("タイムアウト通知の送信に失敗（deny は確定済み）: %s", request_id)
-            return {"action": "denied", "reason": "timeout", "handler": "tier3_human"}
+                logger.exception("タイムアウト通知の送信に失敗（deny は確定）: %s", request_id)
+            return Decision(allow=False, handler="tier3_human", reason="timeout")
         finally:
             # 決定済みの承認ファイルは done/ へ退避（履歴保持＋ディレクトリ肥大防止）。
             self._finalize(approval_path)
 
-    async def _poll_decision(self, approval_path: str) -> str | None:
+    async def _poll_decision(self, approval_path: str,
+                             budget: int = TIMEOUT_SECONDS) -> str | None:
         """承認ファイルの status を 1 秒間隔で読み、approved / rejected を検知して返す。
 
-        5 分以内に決まらなければ None（タイムアウト）。ファイル読取は同期 I/O のため、
-        event loop を塞がないよう to_thread でワーカスレッドに逃がす（共有 FS で遅延しても他の
-        コルーチン＝dispatcher/worker を止めない）。
+        budget 秒（既定 5 分・decide_deadline があれば残余に切詰め）以内に決まらなければ
+        None（タイムアウト）。ファイル読取は同期 I/O のため、event loop を塞がないよう
+        to_thread でワーカスレッドに逃がす（共有 FS で遅延しても他のコルーチン＝
+        dispatcher/worker を止めない）。
         """
         elapsed = 0
-        while elapsed < TIMEOUT_SECONDS:
+        while elapsed < budget:
             await asyncio.sleep(POLL_INTERVAL)
             elapsed += POLL_INTERVAL
             status = await asyncio.to_thread(self._read_status, approval_path)

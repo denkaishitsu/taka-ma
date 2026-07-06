@@ -66,3 +66,48 @@ def test_save_is_atomic_on_role_failure(users_file):
     with pytest.raises(ValueError):
         user_store.update_user("U1", "bogus")
     assert user_store.load_users()["U1"]["role"] == "owner"
+
+
+# --- Task #89: Owner 不変条件（最後の owner ロックアウト防止）と排他ロック ---
+
+def test_remove_last_owner_blocked(users_file):
+    # owner が 1 人だけのとき、その owner の削除は拒否（ロックアウト防止）
+    user_store.add_user("U1", "alice", "owner")
+    with pytest.raises(ValueError, match="最後の owner"):
+        user_store.remove_user("U1")
+    assert "U1" in user_store.load_users()
+
+
+def test_demote_last_owner_blocked(users_file):
+    # owner が 1 人だけのとき、その owner の降格は拒否
+    user_store.add_user("U1", "alice", "owner")
+    with pytest.raises(ValueError, match="最後の owner"):
+        user_store.update_user("U1", "user")
+    assert user_store.load_users()["U1"]["role"] == "owner"
+
+
+def test_remove_owner_allowed_when_another_owner_exists(users_file):
+    # owner が 2 人いれば片方の削除は許可（不変条件は「最低 1 人」）
+    user_store.add_user("U1", "alice", "owner")
+    user_store.add_user("U2", "bob", "owner")
+    user_store.remove_user("U1")
+    assert "U1" not in user_store.load_users()
+    assert user_store.load_users()["U2"]["role"] == "owner"
+
+
+def test_demote_owner_allowed_when_another_owner_exists(users_file):
+    user_store.add_user("U1", "alice", "owner")
+    user_store.add_user("U2", "bob", "owner")
+    user_store.update_user("U1", "admin")
+    assert user_store.load_users()["U1"]["role"] == "admin"
+
+
+def test_users_lock_context_manager_defined():
+    # M10: read-modify-write を直列化する排他ロックが公開されている
+    assert hasattr(user_store, "_users_lock")
+
+
+def test_owner_count_ignores_roleless_record(users_file, monkeypatch):
+    # role 欄欠落の壊れたレコードは owner に数えない（KeyError を出さない）
+    user_store.save_users({"U1": {"name": "x"}, "U2": {"name": "y", "role": "owner"}})
+    assert user_store._owner_count(user_store.load_users()) == 1

@@ -156,3 +156,13 @@ def test_write_is_atomic_no_tmp_left(yata_file):
     # 一時ファイル(.tmp)を残さない
     leftovers = [p for p in os.listdir(yata_file.parent) if p.endswith(".tmp")]
     assert leftovers == []
+
+
+# --- Task #89 (M9): 壊れた ya-ta.yaml の YAMLError を ValueError に正規化 ---
+
+def test_load_models_broken_yaml_raises_valueerror(tmp_path, monkeypatch):
+    path = tmp_path / "ya-ta.yaml"
+    path.write_text("models:\n  a: [unclosed\n")   # 不正 YAML
+    monkeypatch.setenv("TAKA_MA_YATA_PATH", str(path))
+    with pytest.raises(ValueError, match="解析に失敗"):
+        model_store.load_models()

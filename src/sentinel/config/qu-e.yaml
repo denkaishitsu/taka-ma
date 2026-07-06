@@ -2,6 +2,9 @@ qu-e:
   model: "qwen3.6:35b-a3b-q4_K_M"
   ollama_url: "http://localhost:11434"
   prompts_dir: "/opt/taka-ma/qu-e/sentinel/prompts"   # プロンプトテンプレート格納先（役割パッケージ直下）
+  # 推論の直列化ロック（§4.2）。file_audit（常駐 main.py）と Tier2 審査（review_cli の別プロセス）が
+  # 同一パスを flock し、同一 ollama モデルへの同時推論を 1 件ずつに直列化する（相互遅延→二重 escalate を防ぐ）。
+  inference_lock: "/opt/taka-ma/data/qu-e-inference.lock"
 
 health_check:
   interval_sec: 30
@@ -27,6 +30,8 @@ file_audit:
     # FileAuditHandler._should_ignore の task_context_dir 絶対パス判定で行う
     # （実機検証で自己参照的な誤 escalate を確認・是正、Layer3 review でベアネーム版の
     # 巻き込みリスクを指摘・是正）。
+  control_plane_files:             # sa-ru が workspace に配る制御ファイル（自己生成物）を監査除外（§8.12）
+    - ".taka-hook-settings.json"   # PreToolUse フック設定（worker 起動ごとに sa-ru が生成・上書き）
   # .gitignore は判定実行時に mtime チェックで再読み込み（A1 §1、mtime のみキャッシュ）
   debounce_sec: 1                  # ノイズ抑制: 同パス連続変更を集約する時間（A1 §1）
 

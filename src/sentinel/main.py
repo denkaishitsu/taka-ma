@@ -22,7 +22,7 @@ import yaml
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
-from sentinel.reviewer import QueReviewer
+from sentinel.reviewer import DEFAULT_INFERENCE_LOCK, QueReviewer
 from sentinel.health_checker import HealthChecker
 from sentinel.resource_optimizer import ResourceOptimizer
 from sentinel.file_auditor import start_audit, rotate_jsonl
@@ -51,17 +51,22 @@ class TaskContextHandler(FileSystemEventHandler):
         self._load(event)
 
     def _load(self, event):
-        """task_context json を読み込み、status により store を更新または除去する。
-
-        作成・更新の両イベントから共通で呼ばれる。終了系 status（completed/failed）は
-        store から外し、それ以外（in_progress 等）は最新内容で上書きする。読み込み中の
-        書き込み等で壊れた json を踏んでも監視を止めないよう、例外はログに残して握り潰す。
-        """
+        """イベント経由の入口。ディレクトリ・json 以外を除外して load_file へ委譲する。"""
         # 監視ディレクトリ直下の json 以外（ディレクトリ・一時ファイル）は対象外
         if event.is_directory or not event.src_path.endswith(".json"):
             return
+        self.load_file(event.src_path)
+
+    def load_file(self, path: str):
+        """task_context json を読み込み、status により store を更新または除去する。
+
+        watchdog イベントと起動時初期スキャン（§8.13）の両方から呼ばれる共通実体。
+        終了系 status（completed/failed）は store から外し、それ以外（in_progress 等）は
+        最新内容で上書きする。読み込み中の書き込み等で壊れた json を踏んでも監視を
+        止めないよう、例外はログに残して握り潰す。
+        """
         try:
-            with open(event.src_path) as f:
+            with open(path) as f:
                 ctx = json.load(f)
             # task_id の無いファイルは紐付け先が無いので無視
             task_id = ctx.get("task_id")
@@ -79,20 +84,31 @@ class TaskContextHandler(FileSystemEventHandler):
             logger.info("task_context received: task_id=%s status=%s", task_id, status)
         except Exception:
             # 壊れた json 等を踏んでも受信ループは止めない
-            logger.exception("task_context 読み込み失敗: %s", event.src_path)
+            logger.exception("task_context 読み込み失敗: %s", path)
 
 
 async def health_check_loop(checker: HealthChecker, interval: int):
-    """interval 秒間隔でヘルスチェックを実行し、warning/critical 時にログ警告。"""
+    """interval 秒間隔でヘルスチェックを実行し、warning/critical 時にログ警告。
+
+    1 回の反復の例外（設定キー欠落・psutil の一時失敗等）でループを止めない
+    （§4.2「常駐ループの堅牢化」）。ループが例外で消滅するとプロセス生存のまま
+    監視だけが止まり false healthy になるため、記録して次周期へ継続する。
+    """
     while True:
-        # check_all() は psutil.cpu_percent(interval=1) と subprocess.run(ping) の同期ブロックを含むため
-        # asyncio.to_thread で別スレッド実行し、event loop を塞がない。
-        result = await asyncio.to_thread(checker.check_all)
-        overall = result["overall"]
-        if overall != "healthy":
-            logger.warning("ヘルスチェック: %s — %s", overall, result)
-        else:
-            logger.info("ヘルスチェック: healthy")
+        try:
+            # check_all() は psutil.cpu_percent(interval=1) と subprocess.run(ping) の同期ブロックを含むため
+            # asyncio.to_thread で別スレッド実行し、event loop を塞がない。
+            result = await asyncio.to_thread(checker.check_all)
+            overall = result["overall"]
+            if overall != "healthy":
+                logger.warning("ヘルスチェック: %s — %s", overall, result)
+            else:
+                logger.info("ヘルスチェック: healthy")
+        except asyncio.CancelledError:
+            # シャットダウン時の cancel はループ終了の正規経路。握り潰さず伝播する
+            raise
+        except Exception:
+            logger.exception("ヘルスチェック反復失敗（ループは継続）")
         await asyncio.sleep(interval)
 
 
@@ -118,21 +134,29 @@ async def resource_notify_loop(optimizer: ResourceOptimizer, thresholds: dict,
 
     送信トリガは「推奨並行数が現行値から変化したとき」（メモリ使用率しきい値の跨ぎ）。
     SSH push 失敗時はログ記録のみで継続する（次周期で再送される）。
+    推奨値の算出自体の例外（しきい値キー欠落・psutil 一時失敗等）でもループを止めない
+    （§4.2「常駐ループの堅牢化」。従来は push のみ guard され算出の例外でループが沈黙死した）。
     """
     last_sent = None
     while True:
-        payload = await asyncio.to_thread(
-            optimizer.notify_payload,
-            thresholds["memory_warning"], thresholds["memory_critical"],
-        )
-        recommended = payload["recommended_heavy_instances"]
-        if recommended != last_sent:
-            try:
-                await asyncio.to_thread(_push_resource_notify, payload, notify_dir, ssh_host)
-                last_sent = recommended
-                logger.info("リソース最適化通知 push: %s", payload)
-            except Exception:
-                logger.exception("リソース最適化通知 push 失敗: %s", payload)
+        try:
+            payload = await asyncio.to_thread(
+                optimizer.notify_payload,
+                thresholds["memory_warning"], thresholds["memory_critical"],
+            )
+            recommended = payload["recommended_heavy_instances"]
+            if recommended != last_sent:
+                try:
+                    await asyncio.to_thread(_push_resource_notify, payload, notify_dir, ssh_host)
+                    last_sent = recommended
+                    logger.info("リソース最適化通知 push: %s", payload)
+                except Exception:
+                    logger.exception("リソース最適化通知 push 失敗: %s", payload)
+        except asyncio.CancelledError:
+            # シャットダウン時の cancel はループ終了の正規経路。握り潰さず伝播する
+            raise
+        except Exception:
+            logger.exception("リソース最適化通知 反復失敗（ループは継続）")
         await asyncio.sleep(interval)
 
 
@@ -169,6 +193,8 @@ async def main():
         model=config["qu-e"]["model"],
         ollama_host=config["qu-e"]["ollama_url"],
         prompts_dir=config["qu-e"]["prompts_dir"],
+        # Tier2（review_cli の別プロセス）と同一パスを指し推論を跨プロセス直列化する（§4.2）
+        inference_lock=config["qu-e"].get("inference_lock", DEFAULT_INFERENCE_LOCK),
     )
 
     thresholds = config["health_check"]["thresholds"]
@@ -210,6 +236,14 @@ async def main():
     ctx_observer = Observer()
     ctx_observer.schedule(ctx_handler, ctx_dir, recursive=False)
     ctx_observer.start()
+
+    # 起動時初期スキャン（§8.13）: qu-e 停止中に push された既存 task_context を読み込む。
+    # 取りこぼすと実行中タスクの変更が匿名（status=none）と誤判定されアラートが濫発する。
+    # Observer 起動「後」に走査することでスキャンとイベントの隙間を無くす（同一ファイルを
+    # 両経路で読んでも load_file は上書き（冪等）なので二重読みは無害）。
+    for name in sorted(os.listdir(ctx_dir)):
+        if name.endswith(".json"):
+            ctx_handler.load_file(os.path.join(ctx_dir, name))
 
     stop_event = asyncio.Event()
 

@@ -20,8 +20,9 @@ routing:
 # モデル登録 — ルーティング先の定義
 # キー名 = ユーザーが :モデル名 で指定する名前（完全一致）
 #
-# methods: 対応する呼び出し経路の配列
-#   - pty:        SSH + PTY ラッパー（pexpect + tmux）。対話型タスク、y/n プロンプト介入が必要なもの
+# methods: 対応する呼び出し経路（実行アダプタ）の配列
+#   - headless:   claude -p（非対話・stream-json）+ PreToolUse フック承認。Claude Code 専用
+#   - pty:        SSH + PTY ラッパー（pexpect + tmux）。agy 対話等、y/n 介入が要る汎用対話 CLI 用
 #   - subprocess: SSH + subprocess 単発実行。マルチモーダル単発・cross-review・フォールバックなど対話不要なもの
 # 複数指定可（例: gemini は pty と subprocess の両方に対応）。
 # 経路選択は orchestrator がタスクの性質（対話 / 単発、cross-review、マルチモーダル）から動的に決める。
@@ -34,7 +35,7 @@ models:
     full_name: "claude-opus-4.8"
     type: api
     vendor: anthropic
-    methods: [pty]
+    methods: [headless]
     command: claude
     model_flag: "--model opus" # heavy デフォルト（明示指定必須。claude CLI 既定は端末の ~/.claude/settings.json
                                 # の model 設定に従うため無指定だと Opus 4.8 が保証されない。実機検証で確認済）
@@ -45,7 +46,7 @@ models:
     full_name: "claude-fable-5"
     type: api
     vendor: anthropic
-    methods: [pty]
+    methods: [headless]
     command: claude
     model_flag: "--model fable"   # claude CLI の --model はエイリアス（fable/opus/sonnet/haiku）を取る。
                                    # full_name の "claude-fable-5" は不可（実機検証で拒否を確認）
@@ -56,7 +57,7 @@ models:
     full_name: "claude-opus-4.6"
     type: api
     vendor: anthropic
-    methods: [pty]
+    methods: [headless]
     command: claude
     model_flag: ""
     capabilities: [code, design, reasoning, implementation]
@@ -66,7 +67,7 @@ models:
     full_name: "claude-sonnet-4.6"
     type: api
     vendor: anthropic
-    methods: [pty]
+    methods: [headless]
     command: claude
     model_flag: "--model sonnet"   # エイリアス指定（"sonnet-4.6"は無効値・実機検証で拒否を確認）
     capabilities: [code, reasoning]
@@ -76,7 +77,7 @@ models:
     full_name: "claude-haiku-4.5"
     type: api
     vendor: anthropic
-    methods: [pty]
+    methods: [headless]
     command: claude
     model_flag: "--model haiku"   # エイリアス指定（"haiku-4.5"は無効値・実機検証で拒否を確認）
     capabilities: [light-task, qa]

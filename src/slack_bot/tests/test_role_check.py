@@ -90,3 +90,22 @@ def test_admin_cannot_touch_privileged():
 def test_non_admin_cannot_manage():
     assert role_check.can_manage_user("user", None, "user") is False
     assert role_check.can_manage_user(None, None, "user") is False
+
+
+# --- Task #89 (M11): role 欠落レコードで KeyError→無応答にしない ---
+
+def test_roleless_record_denied_not_crash(tmp_path, monkeypatch):
+    # role 欄が欠落した壊れたレコードは、例外ではなく未認可(False)として拒否する
+    path = tmp_path / "users.yaml"
+    monkeypatch.setenv("TAKA_MA_USERS_PATH", str(path))
+    user_store.save_users({"U_BROKEN": {"name": "x"}})   # role 欠落
+    assert role_check.check_role("U_BROKEN", "user") is False
+    assert role_check.get_role("U_BROKEN") is None
+
+
+def test_unknown_role_string_denied(tmp_path, monkeypatch):
+    # ROLE_ORDER に無い role 文字列はレベル0扱いで拒否
+    path = tmp_path / "users.yaml"
+    monkeypatch.setenv("TAKA_MA_USERS_PATH", str(path))
+    user_store.save_users({"U9": {"name": "x", "role": "superuser"}})
+    assert role_check.check_role("U9", "user") is False

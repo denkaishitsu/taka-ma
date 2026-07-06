@@ -80,6 +80,11 @@ def load_models() -> dict:
             data = yaml.safe_load(f) or {}
     except FileNotFoundError:
         return {}
+    except yaml.YAMLError as e:
+        # 壊れた ya-ta.yaml は YAMLError（OSError でも ValueError でもない）を投げる。
+        # そのまま伝播すると handler の except (ValueError, OSError) を素通りして
+        # ack 後にハンドラが落ち、ユーザーへ何も返らない（M9）。ValueError に正規化する。
+        raise ValueError(f"ya-ta.yaml の解析に失敗しました: {e}") from e
     return data.get("models") or {}
 
 
@@ -164,7 +169,12 @@ def _render_entry(key: str, conf: dict) -> list[str]:
 def _validated_write(lines: list[str], key: str, must_exist: bool) -> None:
     """編集後の行を結合 → yaml 再パースで models[key] の有無を検証 → 原子的に書き出す。"""
     text = "".join(lines)
-    parsed = (yaml.safe_load(text) or {}).get("models") or {}
+    try:
+        parsed = (yaml.safe_load(text) or {}).get("models") or {}
+    except yaml.YAMLError as e:
+        # 行編集の結果が壊れた YAML になった場合。壊れたファイルを書き出さず、
+        # YAMLError を handler が扱える ValueError に正規化して中断する（M9）。
+        raise ValueError(f"編集後の ya-ta.yaml が不正な YAML になりました: {e}") from e
     if must_exist and key not in parsed:
         raise ValueError(f"内部エラー: 編集後に {key} が models に見つかりません")
     if not must_exist and key in parsed:

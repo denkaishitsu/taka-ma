@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.taka-ma.decide-daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/taka-ma-env/bin/python</string>
+        <string>/opt/taka-ma/sa-ru/approval-pipeline/decide_daemon.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/opt/taka-ma/sa-ru/approval-pipeline</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/opt/taka-ma/logs/decide-daemon.log</string>
+    <key>StandardErrorPath</key>
+    <string>/opt/taka-ma/logs/decide-daemon-error.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin</string>
+        <!-- 判定中核の import 解決先。orchestrator（slack_notifier）を含めることが必須
+             （欠けると decide 系が import 断線で全ツール deny 相当になる。設計 Appendix §2.1） -->
+        <key>PYTHONPATH</key>
+        <string>/opt/taka-ma/sa-ru/approval-pipeline:/opt/taka-ma/ya-ta:/opt/taka-ma/sa-ru/orchestrator</string>
+    </dict>
+</dict>
+</plist>

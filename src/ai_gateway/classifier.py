@@ -92,19 +92,26 @@ class TaskClassifier:
             self._build_capability_prompt()
         )
 
-        # プロンプト＋タスクをローカル ollama（ya-ta モデル）に渡して判定 JSON を得る
-        stdout = run_ollama(
-            self.ai_gateway_model,
-            f"{system_prompt}\n\nタスク: {command}",
-            timeout=60,
-        )
         try:
+            # プロンプト＋タスクをローカル ollama（ya-ta モデル）に渡して判定 JSON を得る。
+            # ollama 非ゼロ終了は run_ollama が RuntimeError を送出し、下の except で
+            # 安全側フォールバック（heavy）へ落ちる（設計書 §8.4「ollama 実行失敗の検知」）。
+            stdout = run_ollama(
+                self.ai_gateway_model,
+                f"{system_prompt}\n\nタスク: {command}",
+                timeout=60,
+            )
             # category 欠落は判定不成立とみなしフォールバックへ落とす
             parsed = json.loads(extract_json(stdout))
             if "category" not in parsed:
                 raise KeyError("category missing")
+            # confidence 欠損/null は既定 1.0 に正規化する。null のまま閾値比較すると
+            # TypeError で分類が落ちるため（設計書 §8.4「confidence 欠損値の正規化」）。
+            confidence = parsed.get("confidence")
+            if confidence is None:
+                confidence = 1.0
             # 判定ログ: モデルの生判定（light→heavy 強制の前）を記録。
-            # §119 Phase 2（誤判定パターン抽出→分類プロンプト改善）の基盤。
+            # 判定ログは Phase 2（誤判定パターン抽出→分類プロンプト改善）の基盤。
             # ログ書き込み失敗は分類本体を壊さない。
             try:
                 self.logger.log_decision(
@@ -112,15 +119,16 @@ class TaskClassifier:
                     category=parsed.get("category", ""),
                     model=parsed.get("model") or "",
                     reason=parsed.get("reason", ""),
-                    confidence=parsed.get("confidence", 1.0),
+                    confidence=confidence,
                 )
             except Exception:
                 pass
             # confidence < 0.8 の light → heavy 強制
-            if parsed.get("category") == "light" and parsed.get("confidence", 1.0) < 0.8:
+            if parsed.get("category") == "light" and confidence < 0.8:
                 parsed["category"] = "heavy"
             return parsed
-        except (json.JSONDecodeError, KeyError):
-            # 判定不能なら安全側に倒して heavy 扱い（軽く見て取りこぼすより重く回す）（設計書 §8.4）
+        except (json.JSONDecodeError, KeyError, TypeError, RuntimeError):
+            # 判定不能・ollama 実行失敗なら安全側に倒して heavy 扱い
+            # （軽く見て取りこぼすより重く回す）（設計書 §8.4）
             return {"category": "heavy", "model": None,
                     "reason": "parse error - default to heavy", "confidence": 0.0}

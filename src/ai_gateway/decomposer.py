@@ -40,16 +40,36 @@ class TaskDecomposer:
         with open(PROMPTS_DIR / "decompose_task.md") as f:
             system_prompt = f.read().replace("{categories}", categories)
 
-        # プロンプト＋ユーザー指示をローカル ollama（ya-ta モデル）に渡しサブタスク JSON を得る
-        stdout = run_ollama(
-            self.model,
-            f"{system_prompt}\n\nユーザー指示: {command}",
-            timeout=60,
-        )
         try:
-            # サブタスクごとに生判定をログし、信頼度の低い light を heavy へ格上げする
+            # プロンプト＋ユーザー指示をローカル ollama（ya-ta モデル）に渡しサブタスク JSON を得る。
+            # ollama 非ゼロ終了は run_ollama が RuntimeError を送出し、下の except で
+            # 安全側フォールバックへ落ちる（設計書 §8.4「ollama 実行失敗の検知」）。
+            stdout = run_ollama(
+                self.model,
+                f"{system_prompt}\n\nユーザー指示: {command}",
+                timeout=60,
+            )
             subtasks = json.loads(extract_json(stdout))
-            for s in subtasks:
+            # 構造検証: 「サブタスクの配列」でなければフォールバックへ（設計書 §8.4）
+            if not isinstance(subtasks, list) or not subtasks:
+                raise ValueError("分解出力がサブタスク配列でない")
+            # サブタスクごとに生判定をログし、信頼度の低い light を heavy へ格上げする
+            for i, s in enumerate(subtasks, start=1):
+                # 各要素は最低限 command / category を持つこと（欠く場合はフォールバック）
+                if not isinstance(s, dict) or "command" not in s or "category" not in s:
+                    raise ValueError("サブタスクに command/category が無い")
+                # step 欠落は配列順の連番で補完する。下流の依存解決（_execute_chain）が
+                # step を前提とするため、欠落を放置すると当該サブタスクが無音でロストする。
+                if s.get("step") is None:
+                    s["step"] = i
+                # depends_on 欠落は空リスト（依存なし）に正規化する
+                if s.get("depends_on") is None:
+                    s["depends_on"] = []
+                # confidence 欠損/null は既定 1.0 に正規化する。null のまま閾値比較すると
+                # TypeError で分解全体が落ちるため（設計書 §8.4「confidence 欠損値の正規化」）。
+                confidence = s.get("confidence")
+                if confidence is None:
+                    confidence = 1.0
                 # 判定ログ: モデルの生判定（light→heavy 強制の前）をサブタスク単位で記録する。
                 # 強制後ではなく生判定を残すのは、Phase 2 が「モデルがどう誤ったか」を学習対象に
                 # するため（設計書 §8.4.1）。ログ書き込み失敗は分解本体を壊さない。
@@ -59,14 +79,15 @@ class TaskDecomposer:
                         category=s.get("category", ""),
                         model=s.get("model") or "",
                         reason=s.get("reason", ""),
-                        confidence=s.get("confidence", 1.0),
+                        confidence=confidence,
                     )
                 except Exception:
                     pass
                 # confidence < 0.8 の light → heavy 強制（設計書 §2.2, §8.4）
-                if s.get("category") == "light" and s.get("confidence", 1.0) < 0.8:
+                if s.get("category") == "light" and confidence < 0.8:
                     s["category"] = "heavy"
             return subtasks
-        except (json.JSONDecodeError, KeyError):
-            # フォールバック: 元の指示を1件の heavy として扱う（設計書 §8.4）
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError, RuntimeError):
+            # フォールバック: パースエラー・構造不正・ollama 実行失敗のいずれも、
+            # 元の指示を1件の heavy として扱う（設計書 §8.4）
             return [{"step": 1, "command": command, "category": "heavy", "depends_on": []}]

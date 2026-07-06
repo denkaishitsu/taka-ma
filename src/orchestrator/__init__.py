@@ -16,6 +16,7 @@ import logging
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 from watchdog.observers import Observer
@@ -27,29 +28,51 @@ from ai_gateway.risk_classifier import RiskClassifier
 from orchestrator.process_manager import RemoteProcessManager
 from orchestrator.slack_notifier import SlackNotifier
 from orchestrator.pty_wrapper import WorkerPtyWrapper
+from orchestrator.headless_runner import WorkerHeadlessRunner, build_hook_settings
 from orchestrator.concurrency import DynamicConcurrencyLimiter
 from orchestrator.conversation import ConversationManager
 from orchestrator.resource_monitor import ResourceMonitor
-from orchestrator.file_queue import FileQueue
+from orchestrator.file_queue import FileQueue, atomic_write_json
+
+# Claude Code の対話モードは worker 完了時に EOF しない（tmux セッション内に常駐し続ける）ため、
+# 「EOF＝完了」だけではタスク完了を検知できず、実際は完了しているのに PTY タイムアウトで
+# failed 扱いになる欠陥を実機検証で確認・是正。当初は "for shortcuts"（入力待ちフッター）や
+# "tokens" を含む生成中ステータスの文言をアンカーに完了判定を試みたが、生成中インジケータの
+# 絵文字・文言は実機観測のたびに異なり（"↓ N tokens" のときも "✢N tokens" のときもある）、
+# 文言ベースの検知は本質的に脆いことを2回の実機検証で確認した。Claude Code の非対話モード
+# （`claude -p --output-format stream-json`）が permission_denials 等の構造化 JSON で完了を
+# 返すことを一次ソース確認済みだが、そちらへの本格移行は承認パイプライン全体の再設計を伴う
+# 別タスク（#80）とし、当面は文言に依存しない「タスク送信後、一定の起動猶予を過ぎてから、
+# 一定時間まったく新規出力が来ない」という無音時間ベースの完了判定を暫定策として用いる。
+# 既知の限界（隠さない）: 実行中のツール呼び出し（例: 遅い Bash コマンド）が
+# _IDLE_QUIET_SEC を超えて無出力になった場合、誤って完了扱いする可能性が残る
+# （#80 の構造化プロトコルへの移行で解消予定）。
+_TASK_STARTUP_GRACE_SEC = 20  # タスク送信後、この秒数が経つまでは無音でも完了とみなさない
+_IDLE_QUIET_SEC = 20          # 起動猶予後、この秒数以上新規出力が無ければ完了とみなす
 
 
 def _select_method(model_conf: dict, use_case: str = "default") -> str:
     """モデルの methods 配列と用途から呼び出し経路を選択する。
 
     use_case:
-      - "default":      通常の振り分け。methods に pty があれば pty、無ければ subprocess
+      - "default":      通常の振り分け。headless > pty > subprocess の優先で選ぶ
       - "cross_review": 並行投入用。subprocess 優先（対話不要）
       - "multimodal":   マルチモーダル単発。subprocess 優先
 
-    旧 method (単数) フィールドにも後方互換で対応する。
+    headless は Claude Code 専用の非対話経路（claude -p + stream-json + PreToolUse フック）。
+    interactive(pty) は agy 対話等の汎用対話 CLI 用。旧 method (単数) にも後方互換で対応する。
     """
     methods = model_conf.get("methods")
     if methods is None:
         legacy = model_conf.get("method")
         methods = [legacy] if legacy else []
 
+    # cross_review / multimodal は対話不要のため、subprocess を持つなら最優先で単発実行する。
     if use_case in ("cross_review", "multimodal") and "subprocess" in methods:
         return "subprocess"
+    # 通常経路は headless（構造化・確定的）を最優先、次に interactive(pty)、最後に subprocess。
+    if "headless" in methods:
+        return "headless"
     if "pty" in methods:
         return "pty"
     if "subprocess" in methods:
@@ -140,8 +163,7 @@ class ResourceNotifyHandler(FileSystemEventHandler):
             )
             logger.info(
                 "リソース最適化通知: max_heavy_instances=%d（memory=%s%%, level=%s）",
-                recommended, notify.get("memory_usage"), notify.get("level"),
-            )
+                recommended, notify.get("memory_usage"), notify.get("level"))
             shutil.move(event.src_path, f"{self.done_dir}/{Path(event.src_path).name}")
         except Exception:
             logger.exception("リソース最適化通知処理失敗: %s", event.src_path)
@@ -150,7 +172,7 @@ class ResourceNotifyHandler(FileSystemEventHandler):
 class Orchestrator:
     """sa-ru の中核。タスク受付から分解・連鎖実行・承認・通知までの常駐ループ群を束ねる。
 
-    run() で dispatcher（タスク監視→分解→キュー投入）、light/heavy ワーカー、会話・着手確認・
+    run で dispatcher（タスク監視→分解→キュー投入）、light/heavy ワーカー、会話・着手確認・
     制御の各受信ループ、リソース監視を asyncio.gather で並行起動する。file_audit アラートと
     リソース最適化通知は別スレッドの watchdog Observer で受ける。各ループは _supervise で包み、
     1 つが落ちても全体を巻き添えにせず再起動する（自己修復）。設計書 §1.3 / §2.2 / §8.4 / §10。
@@ -203,7 +225,8 @@ class Orchestrator:
         # タスクキューの dir は config を唯一の源にする（u-zu の writer task_queue.py と同じキー。
         # 他キューと流儀を揃え、定数直書きで writer と乖離する SSOT ギャップを作らない）。
         self.task_dir = config.get("task_queue", {}).get("dir", TASK_DIR)
-        self.conversation = ConversationManager(config, self.slack, task_dir=self.task_dir)
+        self.conversation = ConversationManager(config, self.slack, task_dir=self.task_dir,
+                                                 classifier=self.classifier)
         # 会話/着手確認の dir は config を唯一の源にする（exec_confirm と同じ流儀。定数の二重定義を避ける）
         self.conversation_dir = config["conversation"]["dir"]
         self.conversation_poll = config["conversation"].get("poll_interval_sec", 2)
@@ -239,6 +262,15 @@ class Orchestrator:
 
     async def run(self):
         """dispatcher + 2ワーカーを並行起動。watchdog Observer は別スレッドで起動（§8.12）。"""
+        # 起動時の予約回収（reserve-then-crash 回復・§8.3）。前プロセスが accepted/in_progress の
+        # まま落ちたタスクは claim('init') に拾われず恒久滞留するため、init へ戻して再処理させる。
+        # 真の起動点（run）で 1 回だけ実施する（_dispatcher に置くと _supervise 再起動時に実行中の
+        # in_progress タスクまで init へ戻し二重実行を招く）。
+        reclaimed = self.task_q.reclaim({"accepted", "in_progress"}, "init")
+        if reclaimed:
+            logger.warning(
+                "起動時の予約回収: accepted/in_progress の %d 件を init へ戻して再処理する", reclaimed)
+
         alert_dir = self.config["file_audit"]["alert_dir"]
         os.makedirs(alert_dir, exist_ok=True)
         self.file_audit_handler = FileAuditHandler(alert_dir, self.slack, self.process_mgr)
@@ -278,7 +310,7 @@ class Orchestrator:
     async def _supervise(self, make_coro, name: str):
         """常駐ループを監督し、未捕捉例外で死んでも他ループを巻き添えにせず再起動する（自己修復）。
 
-        run() は asyncio.gather でループ群を束ねるため、1 つが例外を送出すると gather 全体が停止し
+        run は asyncio.gather でループ群を束ねるため、1 つが例外を送出すると gather 全体が停止し
         daemon が落ちる。各ループをこのラッパーで包み、例外はログして短い待機後に再起動する。
         CancelledError（正常停止要求）は伝播させる。
         """
@@ -314,7 +346,7 @@ class Orchestrator:
             # 落とし（in_progress のまま放置すると claim('init') で再取得されず恒久ロストになる）、
             # ユーザーへ通知してループは継続する。
             try:
-                self._update_status(task_file, "in_progress")
+                await self._update_status(task_file, "in_progress")
 
                 # DeepSeek-R1 でタスクを分解（設計書 §8.4, §10.2）
                 subtasks = await asyncio.to_thread(
@@ -323,19 +355,19 @@ class Orchestrator:
 
                 # /exam_gw ドライラン: 判定結果のみ返却し、実行しない（設計書 §2.2）
                 if task.get("dry_run"):
-                    self.slack.notify(
+                    await self._notify(
                         self._format_exam_result(subtasks),
                         task.get("channel_id"),
                         team_id=task.get("team_id"),
-                    )
-                    self._update_status(task_file, "completed")
+                        thread_ts=task.get("thread_ts"))
+                    await self._update_status(task_file, "completed")
                     continue
 
-                self.slack.notify(
+                await self._notify(
                     f"タスク受付: {len(subtasks)}件のサブタスクに分解",
                     task.get("channel_id"),
                     team_id=task.get("team_id"),
-                )
+                    thread_ts=task.get("thread_ts"))
 
                 # 連鎖実行を非同期タスクとして起動（dispatcher はブロックしない）
                 asyncio.create_task(
@@ -344,20 +376,20 @@ class Orchestrator:
             except Exception as e:
                 logger.exception("タスクの分解/受付に失敗: %s", task_file)
                 try:
-                    self._update_status(task_file, "failed", result=str(e))
+                    await self._update_status(task_file, "failed", result=str(e))
                 except Exception:
                     logger.exception("failed への更新に失敗: %s", task_file)
                 try:
-                    self.slack.notify(
+                    await self._notify(
                         f"タスクの受付に失敗しました: {e}",
                         task.get("channel_id"),
                         team_id=task.get("team_id"),
-                    )
+                        thread_ts=task.get("thread_ts"))
                 except Exception:
                     logger.exception("受付失敗通知の送信に失敗: %s", task_file)
 
     # NOTE: タスク分解は TaskDecomposer (ai_gateway/decomposer.py) が担う。
-    # _dispatcher() から self.decomposer.decompose() を呼び出す。
+    # _dispatcher から self.decomposer.decompose を呼び出す。
     # 分解結果: [{"step": 1, "command": "...", "category": "heavy", "depends_on": []}, ...]
 
     # ── 会話ループ: u-zu の発話を脳 LLM で会話・要約（§8.3 (A)） ──
@@ -371,26 +403,24 @@ class Orchestrator:
         """
         await self.conversation_q.run(
             self._handle_conversation_message,
-            ready_status="init", reserve_status="processing", quarantine_on_error=False,
-        )
+            ready_status="init", reserve_status="processing", quarantine_on_error=False)
 
     async def _handle_conversation_message(self, msg_file: str, msg: dict):
         """会話メッセージ 1 件を処理する。脳 LLM 呼び出しは同期ブロックのため to_thread で実行する。
 
         失敗は握りつぶさずユーザーへ返す（無言ドロップ防止）。例外をここで吸収するため、呼び出し元の
-        run() は常に done/ へ退避する（現行挙動どおり「処理を試みたら done」）。通知自体の失敗は無視。
+        run は常に done/ へ退避する（現行挙動どおり「処理を試みたら done」）。通知自体の失敗は無視。
         """
         try:
             await asyncio.to_thread(self.conversation.handle_message, msg)
         except Exception:
             logger.exception("会話メッセージ処理失敗: %s", msg_file)
             try:
-                self.slack.notify(
+                await self._notify(
                     "すみません、処理に失敗しました。もう一度お願いします。",
                     msg.get("channel_id"),
                     team_id=msg.get("team_id"),
-                    thread_ts=msg.get("thread_ts"),
-                )
+                    thread_ts=msg.get("thread_ts"))
             except Exception:
                 logger.exception("会話失敗通知の送信に失敗")
 
@@ -399,10 +429,10 @@ class Orchestrator:
     async def _control_loop(self):
         """制御コマンドキュー（controls/）を監視し、命令を実行して結果を Slack へ返す。
 
-        u-zu は別プロセスなので停止本体 process_mgr.stop_ollama()（SSOT）を直接呼べない。
+        u-zu は別プロセスなので停止本体 process_mgr.stop_ollama（SSOT）を直接呼べない。
         u-zu が controls/ に書いた命令をここで拾い、対応操作へ委譲する（経路 Slack→u-zu→sa-ru）。
         SSH を伴う停止は同期ブロックのため to_thread で別スレッド実行する（他ループと同様）。
-        処理済みは done/ に退避（再処理防止）。stop_ollama() は §7.1 どおり再起動せず、次の推論で
+        処理済みは done/ に退避（再処理防止）。stop_ollama は §7.1 どおり再起動せず、次の推論で
         ollama が自動再ロードする。
         """
         # status=pending を取得する。予約書換はしない（reserve_status 未指定）: 単一消費者なので予約
@@ -412,11 +442,10 @@ class Orchestrator:
         # ストームになるため failed/ へ隔離してループは継続する（gather 経由の全体停止も防ぐ）。
         await self.control_q.run(
             self._handle_control_record,
-            ready_status="pending", quarantine_on_error=True,
-        )
+            ready_status="pending", quarantine_on_error=True)
 
     async def _handle_control_record(self, ctl_file: str, ctl: dict):
-        """制御命令 1 件を実行する。失敗は run() へ送出し failed/ 隔離に委ねる。"""
+        """制御命令 1 件を実行する。失敗は run へ送出し failed/ 隔離に委ねる。"""
         await self._handle_control(ctl)
 
     async def _handle_control(self, ctl: dict):
@@ -442,11 +471,10 @@ class Orchestrator:
             logger.warning("未知の制御命令を受信: %s", command)
             msg = f":x: 未知の制御命令です: `{command}`"
         try:
-            self.slack.notify(
+            await self._notify(
                 msg, ctl.get("channel_id"),
                 team_id=ctl.get("team_id"),
-                thread_ts=ctl.get("thread_ts"),
-            )
+                thread_ts=ctl.get("thread_ts"))
         except Exception:
             logger.exception("制御命令の結果通知に失敗: %s", command)
 
@@ -469,10 +497,10 @@ class Orchestrator:
                 status = record.get("status")
                 if status == "pending":
                     if self._is_confirm_expired(record):
-                        self._finalize_confirm(path, record, "timeout")
+                        await self._finalize_confirm(path, record, "timeout")
                     continue
                 if status in ("confirmed", "rejected"):
-                    self._finalize_confirm(path, record, status)
+                    await self._finalize_confirm(path, record, status)
             await asyncio.sleep(self.exec_confirm_poll)
 
     @property
@@ -498,7 +526,7 @@ class Orchestrator:
         now = datetime.datetime.now(created.tzinfo)
         return (now - created).total_seconds() > self.exec_confirm_timeout
 
-    def _finalize_confirm(self, path: str, record: dict, outcome: str):
+    async def _finalize_confirm(self, path: str, record: dict, outcome: str):
         """着手確認を決着させる。先に done/ へ退避してから決着アクションを行う。
 
         退避を先に行う理由: (a) アクション失敗や退避失敗が次スキャンでの再決着＝確定タスクの二重生成を
@@ -523,14 +551,63 @@ class Orchestrator:
         except Exception:
             logger.exception("着手確認の決着処理失敗: %s (%s)", path, outcome)
             try:
-                self.slack.notify(
+                await self._notify(
                     ":x: 着手確認の処理に失敗しました。お手数ですがもう一度お願いします。",
                     record.get("channel_id"),
                     team_id=record.get("team_id"),
-                    thread_ts=record.get("thread_ts"),
-                )
+                    thread_ts=record.get("thread_ts"))
             except Exception:
                 logger.exception("着手確認の失敗通知の送信に失敗: %s", path)
+
+    def _validate_subtask_graph(self, subtasks: list[dict]) -> str | None:
+        """サブタスク分解の依存グラフを検証し、不正なら理由文字列を、健全なら None を返す（設計書 §10.3）。
+
+        検出項目:
+          - 重複 step: step をキーに futures/results を張るため、重複すると後勝ちで
+            サブタスクが 1 件静かに消える（誤った完了判定・二重 set_result 例外の原因）。
+          - 自己依存: step が自身に依存すると自分の futures を await して即デッドロック。
+          - 循環依存: step 群が相互に依存すると互いの futures を永久 await してデッドロック。
+        存在しない step への依存（dangling）は実行時に無視される（_execute_subtask_in_chain の
+        `if dep not in futures: continue`）ため、ここでは循環判定の辺からも除外する。
+        """
+        steps = [s["step"] for s in subtasks]
+        seen: set = set()
+        dups: set = set()
+        for st in steps:
+            if st in seen:
+                dups.add(st)
+            seen.add(st)
+        if dups:
+            return f"重複した step 番号があります: {sorted(dups)}"
+
+        step_set = set(steps)
+        graph: dict = {}
+        for s in subtasks:
+            st = s["step"]
+            deps = s.get("depends_on", []) or []
+            if st in deps:
+                return f"Step {st} が自分自身に依存しています"
+            # 存在する step への辺のみ張る（dangling は実行時無視と揃える）
+            graph[st] = [d for d in deps if d in step_set]
+
+        # DFS 3色塗りで循環検出（GRAY 到達＝後退辺＝循環）
+        WHITE, GRAY, BLACK = 0, 1, 2
+        color = {st: WHITE for st in step_set}
+
+        def _has_cycle(u) -> bool:
+            color[u] = GRAY
+            for v in graph.get(u, []):
+                if color[v] == GRAY:
+                    return True
+                if color[v] == WHITE and _has_cycle(v):
+                    return True
+            color[u] = BLACK
+            return False
+
+        for st in step_set:
+            if color[st] == WHITE and _has_cycle(st):
+                return f"depends_on に循環があります（Step {st} を含む閉路）"
+        return None
 
     async def _execute_chain(self, task_file: str, task: dict, subtasks: list[dict]):
         """サブタスクを依存関係に基づき連鎖実行する。
@@ -538,6 +615,19 @@ class Orchestrator:
         """
         channel = task.get("channel_id")
         team_id = task.get("team_id")   # 応答先ワークスペース（複数WS運用時のトークン選択用）
+        thread_ts = task.get("thread_ts")  # 実行中通知を会話スレッドへ返す（設計書 §8.3）
+
+        # 実行前にサブタスクグラフを検証する（設計書 §10.3「実行前検証」）。重複 step は
+        # futures/results が step をキーにするため後勝ちで静かに 1 件消え、循環・自己依存は
+        # 互いの futures を永久 await してデッドロックする。いずれも実行前に failed で弾き、理由を返す。
+        graph_error = self._validate_subtask_graph(subtasks)
+        if graph_error:
+            await self._update_status(task_file, "failed", result=graph_error)
+            await self._notify(
+                f"タスク失敗: サブタスク分解が不正です — {graph_error}", channel,
+                team_id=team_id, thread_ts=thread_ts)
+            return
+
         results = {}       # step番号 → 実行結果
         futures = {}       # step番号 → asyncio.Future（完了通知用）
         subtask_map = {s["step"]: s for s in subtasks}
@@ -551,8 +641,7 @@ class Orchestrator:
             for subtask in subtasks:
                 t = asyncio.create_task(
                     self._execute_subtask_in_chain(
-                        task, subtask, results, futures, channel,
-                    )
+                        task, subtask, results, futures, channel)
                 )
                 pending_tasks.append(t)
 
@@ -563,17 +652,29 @@ class Orchestrator:
             failed_steps = [s["step"] for s in subtasks if s["step"] not in results]
             if not failed_steps:
                 final_result = results[subtasks[-1]["step"]]
-                self._update_status(task_file, "completed", result=final_result)
-                self.slack.notify(f"タスク完了:\n```{final_result[:500]}```", channel, team_id=team_id)
+                await self._update_status(task_file, "completed", result=final_result)
+                await self._notify(f"タスク完了:\n```{final_result[:500]}```", channel,
+                                  team_id=team_id, thread_ts=thread_ts)
             else:
-                self._update_status(task_file, "failed")
-                self._notify_failure(task, subtasks, results, failed_steps, channel, team_id)
+                await self._update_status(task_file, "failed")
+                await self._notify_failure(task, subtasks, results, failed_steps, channel, team_id, thread_ts)
 
         except Exception as e:
-            self._update_status(task_file, "failed", result=str(e))
-            self.slack.notify(f"タスク失敗: {e}", channel, team_id=team_id)
+            await self._update_status(task_file, "failed", result=str(e))
+            await self._notify(f"タスク失敗: {e}", channel, team_id=team_id, thread_ts=thread_ts)
 
-    def _notify_failure(self, task, subtasks, results, failed_steps, channel, team_id=None):
+    async def _notify(self, text, channel=None, *, team_id=None, thread_ts=None):
+        """Slack 送信をイベントループから切り離す薄いラッパー（§10.7）。
+
+        SlackNotifier.notify は slack-sdk の同期 HTTP 送信で、失敗・遅延時に応答まで
+        スレッドを占有する。常駐ループ上で直接呼ぶと 1 通の遅い送信で全ループが凍結するため、
+        別スレッド（to_thread）へ逃がして await する。イベントループ外（watchdog スレッド等）は
+        従来どおり self.slack.notify を直接呼んでよい。
+        """
+        await asyncio.to_thread(
+            self.slack.notify, text, channel, team_id=team_id, thread_ts=thread_ts)
+
+    async def _notify_failure(self, task, subtasks, results, failed_steps, channel, team_id=None, thread_ts=None):
         """失敗時の詳細通知（設計書 §10.3）"""
         lines = ["⚠ タスク失敗", "", f"【元の指示】", task["command"], "", "【サブタスク結果】"]
         for s in subtasks:
@@ -584,56 +685,70 @@ class Orchestrator:
                 lines.append(f"  Step {step}: {s['command']} ({s['category']}) → ❌ 失敗")
             else:
                 lines.append(f"  Step {step}: {s['command']} ({s['category']}) → ⏭ スキップ")
-        self.slack.notify("\n".join(lines), channel, team_id=team_id)
+        await self._notify("\n".join(lines), channel, team_id=team_id, thread_ts=thread_ts)
 
     async def _execute_subtask_in_chain(self, task: dict, subtask: dict,
                                          results: dict, futures: dict,
                                          channel: str):
-        """単一サブタスクを実行する。依存がある場合は先に完了を待つ。"""
+        """単一サブタスクを実行する。依存がある場合は先に完了を待つ。
+
+        このサブタスクの完了通知 futures[step] は、成功・依存先失敗・ワーカー例外・投入失敗の
+        いずれの経路でも必ず解決する（設計書 §10.3「Future 解決の不変条件」）。未解決のまま
+        抜けると、この step に依存する後続サブタスクの `await futures[dep]` が永久ブロックし、
+        _execute_chain の gather も戻らず（タスクは in_progress のまま恒久ハング）になるため、
+        全経路を try で囲い、例外時は futures[step] へ伝播させて cascading skip を機能させる。
+        """
         step = subtask["step"]
         command = subtask["command"]
         category = subtask["category"]  # DeepSeek-R1 が分解時に判定済み
         depends_on = subtask.get("depends_on", [])
 
-        # 依存するサブタスクの完了を待つ（複数依存対応）
-        dep_results = []
-        for dep in depends_on:
-            if dep in futures:
+        try:
+            # 依存するサブタスクの完了を待つ（複数依存対応）
+            dep_results = []
+            for dep in depends_on:
+                if dep not in futures:
+                    continue
                 try:
                     await futures[dep]
-                    dep_results.append(f"Step {dep}: {results[dep]}")
-                except Exception:
-                    # 依存先が失敗 → cascading skip
-                    futures[step].set_exception(
-                        RuntimeError(f"依存先 Step {dep} が失敗したためスキップ")
-                    )
-                    return
+                except Exception as dep_err:
+                    # 依存先が失敗 → cascading skip（下の except で futures[step] へ伝播）
+                    raise RuntimeError(
+                        f"依存先 Step {dep} が失敗したためスキップ") from dep_err
+                dep_results.append(f"Step {dep}: {results[dep]}")
 
-        # 依存ステップの結果を入力に組み込む
-        if dep_results:
-            context = "\n".join(dep_results)
-            command = f"前のステップの結果:\n{context}\n\n上記を踏まえて: {command}"
+            # 依存ステップの結果を入力に組み込む
+            if dep_results:
+                context = "\n".join(dep_results)
+                command = f"前のステップの結果:\n{context}\n\n上記を踏まえて: {command}"
 
-        self.slack.notify(f"  サブタスク {step}: {category}", channel, team_id=task.get("team_id"))
+            await self._notify(f"  サブタスク {step}: {category}", channel,
+                              team_id=task.get("team_id"), thread_ts=task.get("thread_ts"))
 
-        # キューに投入し、ワーカーに実行させる
-        result_future = asyncio.get_event_loop().create_future()
-        queue_item = {
-            **task,
-            "_command": command,
-            "_category": category,
-            "_step": step,
-            "_result_future": result_future,
-        }
+            # キューに投入し、ワーカーに実行させる
+            result_future = asyncio.get_event_loop().create_future()
+            queue_item = {
+                **task,
+                "_command": command,
+                "_category": category,
+                "_step": step,
+                "_result_future": result_future,
+            }
 
-        await self._enqueue(queue_item)
+            await self._enqueue(queue_item)
 
-        # ワーカーの実行完了を待つ
-        output = await result_future
-        results[step] = output
-        futures[step].set_result(output)
+            # ワーカーの実行完了を待つ（ワーカーが例外をセットしたらここで送出される）
+            output = await result_future
+            results[step] = output
+            futures[step].set_result(output)
 
-        self.slack.notify(f"  サブタスク {step}/{len(futures)} 完了", channel, team_id=task.get("team_id"))
+            await self._notify(f"  サブタスク {step}/{len(futures)} 完了", channel,
+                              team_id=task.get("team_id"), thread_ts=task.get("thread_ts"))
+        except Exception as e:
+            # 成功通知の失敗（set_result 後）はここに来るが futures[step] は解決済みなので
+            # 二重解決しない。未解決のときのみ例外を伝播して後続の永久 await を防ぐ。
+            if not futures[step].done():
+                futures[step].set_exception(e)
 
     async def _enqueue(self, item: dict):
         """カテゴリに応じたキューにタスクを投入（満杯時は空きを待つ）"""
@@ -696,6 +811,7 @@ class Orchestrator:
         result_future = item["_result_future"]
         channel = item.get("channel_id")
         team_id = item.get("team_id")
+        thread_ts = item.get("thread_ts")
 
         # cross-review 分岐: 2 つ以上のモデル指定で並行投入
         user_specified = item.get("_model")
@@ -734,33 +850,53 @@ class Orchestrator:
                     output = await asyncio.to_thread(
                         self.process_mgr.run_model_subprocess, model_name, model_conf, command
                     )
-                else:  # pty — 対話型 worker CLI 全般（Claude Code / Gemini CLI / 将来の Codex 等）
+                else:  # headless（Claude Code）/ pty（agy 対話等の汎用対話 CLI）
                     model_flag = model_conf.get("model_flag", "")
                     cli_command = model_conf.get("command", "claude")
-                    instance_id = f"{item['task_id']}-step{step}"
+                    # instance_id に model_name を含める。含めないと通常フォールバックの2候補目
+                    # 以降が1候補目と同じ workspace/セッション名になり、1候補目失敗時に生存し続ける
+                    # 資源と名前衝突する（Layer3 review で検出・是正）。
+                    instance_id = f"{item['task_id']}-step{step}-{model_name}"
                     workspace = self._workspace_for(item["task_id"])
-                    output = await self._run_worker_pty(instance_id, cli_command, command, channel, model_flag, workspace, team_id=team_id, task_id=item["task_id"])
+                    if method == "headless":
+                        output = await self._run_worker_headless(instance_id, cli_command, command, model_flag, workspace, channel=channel, team_id=team_id, task_id=item["task_id"], thread_ts=thread_ts)
+                    else:
+                        output = await self._run_worker_pty(instance_id, cli_command, command, channel, model_flag, workspace, team_id=team_id, task_id=item["task_id"], thread_ts=thread_ts)
 
                 if is_fallback:
-                    self.slack.notify(
-                        f"  {candidates[0]} 障害 → {model_name} で実行（fallback）", channel, team_id=team_id
+                    await self._notify(
+                        f"  {candidates[0]} 障害 → {model_name} で実行（fallback）", channel,
+                        team_id=team_id, thread_ts=thread_ts
                     )
                 result_future.set_result(output)
                 return
 
             except Exception as e:
                 last_error = e
-                self.slack.notify(f"  {model_name} 障害: {e}", channel, team_id=team_id)
+                await self._notify(f"  {model_name} 障害: {e}", channel, team_id=team_id, thread_ts=thread_ts)
                 continue
 
-        # 全候補失敗
-        if category == "light":
+        # 全候補失敗。ただしユーザーが `:モデル名` で明示指定した場合は「そのモデルのみで
+        # 実行（障害時もフォールバックしない）」契約のため昇格・再投入をしない（本関数冒頭の
+        # docstring参照）。昇格すると同じ instance_id で worker を再起動しようとし、直前の
+        # tmux セッションがまだ生存していて名前衝突する欠陥を実機検証で確認・是正。
+        if category == "light" and not user_specified:
             # light 全失敗 → heavy に昇格して再投入
             item["_category"] = "heavy"
-            self.slack.notify(f"  light 全失敗。heavy に昇格: {last_error}", channel, team_id=team_id)
+            await self._notify(f"  light 全失敗。heavy に昇格: {last_error}", channel,
+                              team_id=team_id, thread_ts=thread_ts)
             await self._enqueue(item)
         else:
-            # heavy 全失敗 → Future に例外をセット（_execute_chain で捕捉、User へ failed 通知）
+            # heavy 全失敗 / 明示指定モデル失敗 → Future に例外をセット
+            # （_execute_chain で捕捉、User へ failed 通知）。
+            # candidates が空（該当 category の routing.category_defaults が未設定など）だと
+            # ループが 1 度も回らず last_error が None のままになる。set_exception(None) は
+            # TypeError を送出し result_future が未解決のまま worker タスクが死んで恒久ハングに
+            # なるため、意味のある例外へ差し替えてから解決する。
+            if last_error is None:
+                last_error = RuntimeError(
+                    f"実行可能なモデル候補がありません（category={category}, "
+                    f"model={user_specified}）")
             result_future.set_exception(last_error)
 
     async def _execute_cross_review(self, item: dict, models: list[str]):
@@ -776,6 +912,7 @@ class Orchestrator:
         result_future = item["_result_future"]
         channel = item.get("channel_id")
         team_id = item.get("team_id")
+        thread_ts = item.get("thread_ts")
 
         async def _run_one(model_name: str) -> tuple[str, str | Exception]:
             """1 モデルで cross-review を実行し、(モデル名, 出力 or 例外) を返す。
@@ -790,13 +927,16 @@ class Orchestrator:
                     output = await asyncio.to_thread(
                         self.process_mgr.run_model_subprocess, model_name, model_conf, command
                     )
-                else:  # pty — heavy 枠を個別取得
+                else:  # headless（Claude）/ pty（汎用対話 CLI）— いずれも heavy 枠を個別取得
                     model_flag = model_conf.get("model_flag", "")
                     cli_command = model_conf.get("command", "claude")
                     instance_id = f"{item['task_id']}-step{step}-{model_name}"
                     workspace = self._workspace_for(item["task_id"])
                     async with self.heavy_limiter:
-                        output = await self._run_worker_pty(instance_id, cli_command, command, channel, model_flag, workspace, team_id=team_id, task_id=item["task_id"])
+                        if method == "headless":
+                            output = await self._run_worker_headless(instance_id, cli_command, command, model_flag, workspace, channel=channel, team_id=team_id, task_id=item["task_id"], thread_ts=thread_ts)
+                        else:
+                            output = await self._run_worker_pty(instance_id, cli_command, command, channel, model_flag, workspace, team_id=team_id, task_id=item["task_id"], thread_ts=thread_ts)
                 return (model_name, output)
             except Exception as e:
                 return (model_name, e)
@@ -806,7 +946,8 @@ class Orchestrator:
         failures = [(m, r) for m, r in results if isinstance(r, Exception)]
 
         for m, e in failures:
-            self.slack.notify(f"  cross-review: {m} 失敗（結果から除外）: {e}", channel, team_id=team_id)
+            await self._notify(f"  cross-review: {m} 失敗（結果から除外）: {e}", channel,
+                              team_id=team_id, thread_ts=thread_ts)
 
         if not successes:
             result_future.set_exception(
@@ -814,13 +955,28 @@ class Orchestrator:
             )
             return
 
-        # ya-ta（DeepSeek-R1 32B）で知的統合
-        integrated = await asyncio.to_thread(self._integrate_cross_review, command, successes)
+        # ya-ta（DeepSeek-R1 32B）で知的統合。統合が失敗（ollama 非 0 終了・タイムアウト）
+        # しても result_future を必ず解決する。未解決のまま抜けると、この step の
+        # _execute_subtask_in_chain が `await result_future` で永久ブロックする。
+        try:
+            integrated = await asyncio.to_thread(
+                self._integrate_cross_review, command, successes)
+        except Exception as e:
+            await self._notify(f"  cross-review 統合に失敗: {e}", channel,
+                              team_id=team_id, thread_ts=thread_ts)
+            result_future.set_exception(e)
+            return
         result_future.set_result(integrated)
 
     def _integrate_cross_review(self, command: str, results: list[tuple[str, str]]) -> str:
         """各モデルの結果を ya-ta（DeepSeek-R1 32B）で知的統合する。
         Mac mini 上の ollama 経由で DeepSeek-R1 32B（ya-ta と同モデル）に投入。
+
+        ollama 実行の失敗を検出し例外化する（設計書 §2.2 / §10.3）。従来は returncode を無視して
+        result.stdout をそのまま返していたため、ollama が非 0 終了（モデル未 pull・OOM 等）
+        したとき空文字を「統合成功」として返していた。TimeoutExpired（180s 超）も送出され
+        呼び出し元 _execute_cross_review で捕捉されず result_future が未解決になっていた。
+        いずれも RuntimeError に畳んで呼び出し元へ返し、future を確実に解決させる。
         """
         sections = "\n\n".join(f"### {m}\n{r}" for m, r in results)
         prompt = (
@@ -831,14 +987,20 @@ class Orchestrator:
             f"## 各モデルの回答\n{sections}\n\n"
             "## 統合回答（あなたが作成）"
         )
-        result = subprocess.run(
-            ["ollama", "run", "deepseek-r1:32b"],  # ya-ta と同モデル
-            input=prompt,
-            capture_output=True, text=True, timeout=180,
-        )
+        try:
+            result = subprocess.run(
+                ["ollama", "run", "deepseek-r1:32b"],  # ya-ta と同モデル
+                input=prompt,
+                capture_output=True, text=True, timeout=180)
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError("cross-review 統合がタイムアウトしました（ya-ta 180s）") from e
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"cross-review 統合失敗（ollama rc={result.returncode}）: "
+                f"{result.stderr.strip()[:200]}")
         return result.stdout
 
-    async def _run_worker_pty(self, instance_id: str, cli_command: str, command: str, channel: str, model_flag: str = "", workspace: str | None = None, team_id: str | None = None, task_id: str = "") -> str:
+    async def _run_worker_pty(self, instance_id: str, cli_command: str, command: str, channel: str, model_flag: str = "", workspace: str | None = None, team_id: str | None = None, task_id: str = "", thread_ts: str | None = None) -> str:
         """対話型 worker CLI を PTY 経由で実行する汎用ラッパー呼び出し。
 
         Claude Code / Gemini CLI / Codex 等を共通の WorkerPtyWrapper で扱う。
@@ -847,12 +1009,12 @@ class Orchestrator:
 
         駆動ループ（§8.5 / 08-approval-pipeline）:
           worker 起動 → タスク投入 → stdout を逐次読取 → y/n プロンプト検出時は
-          ApprovalPipeline.process() で承認/拒否（Tier1 自動 / Tier2 qu-e / Tier3 人間）→
+          ApprovalPipeline.process で承認/拒否（Tier1 自動 / Tier2 qu-e / Tier3 人間）→
           worker 完了（EOF）まで継続 → 蓄積した stdout を最終出力として返す。
 
-        pexpect は同期ブロックのため _drive() を to_thread で別スレッド実行する。承認は
+        pexpect は同期ブロックのため _drive を to_thread で別スレッド実行する。承認は
         async（Tier3 が Slack 応答を await）なので、run_coroutine_threadsafe で event loop に委譲し
-        結果を待つ（pipeline 内で wrapper.approve()/deny() が呼ばれる）。
+        結果を待つ（pipeline 内で wrapper.approve/deny が呼ばれる）。
         """
         loop = asyncio.get_running_loop()
         wrapper = WorkerPtyWrapper(instance_id, command=cli_command, model_flag=model_flag, cwd=workspace)
@@ -861,41 +1023,119 @@ class Orchestrator:
             """PTY を起動してタスクを流し、承認プロンプトを捌きながら出力を集めて返す。
 
             pexpect でブロッキングに読むため別スレッド（to_thread）で回す前提の同期関数。
-            y/n プロンプトを検出したら approve/deny を裏で判定し、結果を wrapper に書き戻す。
+            agy 対話等の汎用対話 CLI が出すレガシー y/n テキストのプロンプトを検出したら
+            approve/deny を裏で判定し、結果を wrapper に書き戻す（Claude Code は headless
+            アダプタへ移行したため、本経路は Ink メニューを扱わない）。
             """
             import pexpect
-            from interceptor import detect_prompt
+            from interceptor import detect_prompt, strip_ansi
+
             wrapper.start()
-            wrapper.send_task(command)
             chunks: list[str] = []
             context_buf: list[str] = []
-            patterns = [r"\[y/n\]", r"\(yes/no\)", r"Allow\?", pexpect.EOF, pexpect.TIMEOUT]
-            while True:
-                idx = wrapper.child.expect(patterns)
+            prompt_patterns = [r"\[y/n\]", r"\(yes/no\)", r"Allow\?"]
+
+            def _consume() -> None:
+                """直近でマッチしたレガシー y/n プロンプトを承認パイプライン（Tier1/2/3）へ回す。"""
                 before = wrapper.child.before or ""
-                chunks.append(before)
-                context_buf.extend(before.splitlines())
-                if idx in (0, 1, 2):           # y/n プロンプト検出
-                    matched = wrapper.child.after or ""
-                    prompt = detect_prompt(matched, context_buf)
-                    if prompt is None:
-                        continue
-                    asyncio.run_coroutine_threadsafe(
-                        self.approval_pipeline.process(
-                            prompt, wrapper, instance_id,
-                            team_id=team_id, channel=channel, task_id=task_id,
-                        ), loop
-                    ).result()
-                elif idx == 3:                 # EOF — worker 完了
+                # chunks（最終出力）/ context_buf（Tier3 承認リクエストの Context 欄・
+                # extract_command の対象）は ANSI を除去してから積む。生のまま積むと
+                # Context 欄が制御コードだらけで文字化けし、extract_command の
+                # "Run:"/"Write to:" 判定も阻害される（実機検証で確認・是正）。
+                chunks.append(strip_ansi(before))
+                context_buf.extend(strip_ansi(before).splitlines())
+                matched = wrapper.child.after or ""
+                combined = before + matched
+                prompt = detect_prompt(combined, context_buf)
+                if prompt is None:
+                    return
+                asyncio.run_coroutine_threadsafe(
+                    self.approval_pipeline.process(
+                        prompt, wrapper, instance_id,
+                        team_id=team_id, channel=channel, task_id=task_id, thread_ts=thread_ts), loop
+                ).result()
+
+            # 起動直後にタスク投入前の承認プロンプトを出す CLI があるため、先に片付ける。
+            # 先にタスクを送ると、プロンプト表示中にタスク文字列が入力へ紛れ込む恐れがある。
+            # 出ない CLI は 5 秒でタイムアウトして通常フローへ進む（実害のある待ちにはならない）。
+            try:
+                idx = wrapper.child.expect(prompt_patterns + [pexpect.EOF], timeout=5)
+                if idx == len(prompt_patterns):        # EOF — 起動直後に終了（異常系）
+                    chunks.append(strip_ansi(wrapper.child.before or ""))
+                    return "".join(chunks)
+                _consume()
+            except pexpect.exceptions.TIMEOUT:
+                pass  # 起動時プロンプトなし。通常フローへ。
+
+            wrapper.send_task(command)
+            send_time = time.monotonic()
+            patterns = prompt_patterns + [pexpect.EOF, pexpect.TIMEOUT]
+            menu_count = len(prompt_patterns)
+            eof_idx = menu_count
+            while True:
+                # 起動猶予（_TASK_STARTUP_GRACE_SEC）を過ぎるまでは pexpect 既定の長い
+                # timeout（300 秒、TIMEOUT に到達したら異常とみなす）のまま待つ。猶予を過ぎたら
+                # 以降は短い quiet timeout に切り替え、「無音」を完了シグナルとして扱う。
+                elapsed = time.monotonic() - send_time
+                call_timeout = _IDLE_QUIET_SEC if elapsed >= _TASK_STARTUP_GRACE_SEC else None
+                idx = wrapper.child.expect(patterns, timeout=call_timeout)
+                if idx < menu_count:                   # プロンプト検出
+                    _consume()
+                elif idx == eof_idx:                   # EOF — worker 完了（agy 等、非対話 CLI 用）
+                    chunks.append(strip_ansi(wrapper.child.before or ""))
                     break
-                else:                          # TIMEOUT
+                else:                                  # TIMEOUT
+                    chunks.append(strip_ansi(wrapper.child.before or ""))
+                    if call_timeout is not None:
+                        # 起動猶予後の無音＝対話モードは EOF しないため、これが唯一の完了シグナル
+                        # （実機検証で確認・是正）。
+                        break
                     raise RuntimeError(f"worker PTY timeout: {instance_id}")
             return "".join(chunks)
 
         try:
             return await asyncio.to_thread(_drive)
         finally:
-            wrapper.close()
+            # close は tmux kill-session の SSH（同期ブロッキング）を含むため、イベントループを
+            # 凍結させないよう別スレッドで実行する（§10.7）。
+            await asyncio.to_thread(wrapper.close)
+
+    async def _run_worker_headless(self, instance_id: str, cli_command: str, command: str,
+                                   model_flag: str = "", workspace: str | None = None, *,
+                                   channel: str | None = None, team_id: str | None = None,
+                                   task_id: str = "", thread_ts: str | None = None) -> str:
+        """Claude Code を headless（claude -p + stream-json + PreToolUse フック）で実行する。
+
+        interactive(pty) 経路（_run_worker_pty）の Claude 版置き換え。対話モードを覗き見て y/n を
+        送るのではなく、非対話 1 プロセスで実行し、各ツールの承認は PreToolUse フックが同期ゲートする
+        （設計 §8.5 headless アダプタ）。
+
+        起動前に PreToolUse フックの settings を生成して MBP の workspace に書き込む。フックは MBP で
+        発火し、SSH（ControlMaster 多重化）で Mac mini の decide クライアント → 常駐 decide デーモン
+        （中核 decide()）を呼ぶ（設計 Appendix §2.1）。Tier3 承認リクエストの応答先
+        （team_id / channel / thread_ts / task_id）はフック stdin に乗らないため、ここで settings の
+        フックコマンド引数へ焼き込む。
+        """
+        hcfg = self.config["headless"]
+        # フック settings を生成（フックコマンド＝ssh mini decide_client → デーモン UDS、task 文脈を argv へ焼込）。
+        settings = build_hook_settings(
+            hcfg["mini_host"], hcfg["decide_client"], hcfg["decide_socket"],
+            task_id=task_id, team_id=team_id, channel=channel, thread_ts=thread_ts,
+            instance_id=instance_id, timeout_sec=hcfg.get("hook_timeout_sec", 310),
+            python_bin=hcfg.get("python_bin", "/opt/taka-ma-env/bin/python3"))
+        # settings を MBP 上の workspace に書き込む（_push_task_context と同じ ssh の cat > 方式）。
+        # claude -p --settings がこのファイルを読んでフックを有効化する。
+        settings_path = f"{workspace}/.taka-hook-settings.json"
+        await asyncio.to_thread(
+            self.process_mgr.run_ssh_command,
+            f"mkdir -p {workspace} && cat > {settings_path}",
+            stdin_text=json.dumps(settings, ensure_ascii=False))
+        # SSH 越しに claude -p を起動し、stream-json を解析して最終出力を得る。
+        runner = WorkerHeadlessRunner(
+            instance_id, command=cli_command, model_flag=model_flag,
+            ssh_host=self._mbp_host, cwd=workspace, hook_settings_path=settings_path)
+        result = await runner.run(command, timeout=hcfg.get("run_timeout_sec", 1800))
+        return result.text
 
     # ── /exam_gw ドライラン結果フォーマット ──
 
@@ -941,24 +1181,46 @@ class Orchestrator:
     # ── アーカイブローテート ──
 
     async def _daily_cleanup(self):
-        """タスクアーカイブ（done/）の古いディレクトリを削除。判定ログは学習データのため永続保持。"""
+        """タスクアーカイブ（done/）の古いディレクトリを削除。判定ログは学習データのため永続保持。
+
+        この関数は例外を外へ送出しない（設計書 §10.7）。_dispatcher は日付が変わった最初の周回で本関数を
+        呼び、その後に last_cleanup_date を更新する。ここで OSError（listdir/rmtree の権限・I/O
+        エラー等）を送出すると last_cleanup_date 更新前に _dispatcher が死に、_supervise が
+        再起動しても last_cleanup_date はローカル変数ゆえ None に戻るため、毎起動で同じ cleanup を
+        叩いては即死する無限再起動（タスクを 1 件も捌けないライブロック）に陥る。listdir 全体と
+        各エントリ削除を try で囲み、失敗はログのみで飲み込んで周回を前進させる。
+        """
         retention = self.config["cleanup"]["retention_days"]
         threshold = datetime.date.today() - datetime.timedelta(days=retention)
 
         done_dir = f"{self.task_dir}/done"
-        if os.path.exists(done_dir):
-            for name in os.listdir(done_dir):
-                try:
-                    if datetime.date.fromisoformat(name) < threshold:
-                        shutil.rmtree(os.path.join(done_dir, name))
-                except ValueError:
-                    pass
+        if not os.path.exists(done_dir):
+            return
+        try:
+            names = os.listdir(done_dir)
+        except OSError:
+            logger.exception("done アーカイブの走査に失敗（cleanup をスキップ）: %s", done_dir)
+            return
+        for name in names:
+            try:
+                if datetime.date.fromisoformat(name) < threshold:
+                    shutil.rmtree(os.path.join(done_dir, name))
+            except ValueError:
+                pass  # 日付形式でない名前（想定外の混入）は対象外
+            except OSError:
+                # 個々のディレクトリ削除失敗（権限・使用中など）は握りつぶし次へ。
+                # ここで送出すると dispatcher ライブロックの原因になる（本 docstring 参照）。
+                logger.exception("アーカイブ削除に失敗（スキップ）: %s", name)
 
     # ── ユーティリティ ──
 
-    def _update_status(self, path: str, status: str, result: str = None):
+    async def _update_status(self, path: str, status: str, result: str = None):
         """タスクファイルの status を更新する。completed/failed はアーカイブ。
         in_progress / completed / failed 遷移時に qu-e へタスクコンテキストを push する（§8.13）。
+
+        qu-e への push は SSH（同期・接続タイムアウトまで待つ）を含むため、イベントループを
+        凍結させないよう to_thread で別スレッド実行する（§10.7）。ファイル I/O は高速なローカル
+        操作のためそのまま行う。
         """
         with open(path) as f:
             task = json.load(f)
@@ -966,12 +1228,13 @@ class Orchestrator:
         task["updated_at"] = datetime.datetime.now().isoformat()
         if result:
             task["result"] = result
-        with open(path, "w") as f:
-            json.dump(task, f, ensure_ascii=False, indent=2)
+        # 状態遷移の書換も原子書込に統一（§8.3 書込の原子性）。書込中クラッシュで壊れた task が
+        # 本パスに残り、次回起動の予約回収スキャンを誤らせるのを防ぐ。
+        atomic_write_json(path, task)
 
-        # §8.13 タスクコンテキスト共有(qu-e へ SSH push)
+        # §8.13 タスクコンテキスト共有(qu-e へ SSH push)。SSH の同期ブロッキングを別スレッドへ逃がす。
         if status in ("in_progress", "completed", "failed"):
-            self._push_task_context(task)
+            await asyncio.to_thread(self._push_task_context, task)
 
         # completed/failed のファイルを done/{日付}/ に移動（ディレクトリ走査の肥大化防止）
         if status in ("completed", "failed"):
@@ -1010,8 +1273,7 @@ class Orchestrator:
         try:
             self.process_mgr.run_ssh_command(
                 f"mkdir -p {remote_dir} && cat > {remote_dir}/{task_id}.json",
-                stdin_text=payload,
-            )
+                stdin_text=payload)
         except Exception:
             logger.exception("task_context push 失敗: task_id=%s", task_id)
 
