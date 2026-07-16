@@ -50,14 +50,21 @@ class _FakeNotifier:
 
 
 CONFIG = {
-    "sa-ru": {"model": "dummy-brain"},
-    "ya-ta": {"model": "dummy-classifier-model"},
+    "sa-ru": {"model": "dummy-brain", "ollama_host": "http://localhost:11434",
+              "converse_timeout_sec": 120},
+    # llm_timeout_sec は ya-ta.yaml 必須キー（コード側既定なし・SSOT）のためテスト config にも供給する
+    "ya-ta": {"model": "dummy-classifier-model", "llm_timeout_sec": 180},
     "models": {"opus": {"model_flag": "--model opus"}, "gemini": {"model_flag": ""}},
 }
 
 
 def _manager(tmp_dir):
-    config = {**CONFIG, "exec_confirm": {"dir": tmp_dir}}
+    # sessions_dir は sa-ru.yaml 必須キー（同上）。既存アサーションが tmp_dir（確認レコード置き場）
+    # の空を検査するため、セッション置き場は別の一時 dir に分離する
+    config = {**CONFIG, "exec_confirm": {"dir": tmp_dir},
+              "conversation": {"sessions_dir": tempfile.mkdtemp(prefix="sessions-"),
+                               # session_ttl_sec も #103 で必須キー化（実効値と同値）
+                               "session_ttl_sec": 3600}}
     classifier = TaskClassifier(config)
     return ConversationManager(config, _FakeNotifier(), task_dir=tmp_dir, classifier=classifier)
 
@@ -116,7 +123,7 @@ def test_handle_message_invalid_model_notifies_and_skips_confirm(monkeypatch):
     msg = {"conversation_id": "c3", "text": "READMEを直して :gpt5", "user_id": "U1",
            "team_id": "T1", "channel_id": "C1", "thread_ts": "333.444"}
 
-    monkeypatch.setattr(mgr, "_invoke_llm", lambda history, force: {
+    monkeypatch.setattr(mgr, "_invoke_llm", lambda history, force, progress=None: {
         "ready": True, "summary": "READMEの誤字を修正する", "reply": "",
     })
 

@@ -61,8 +61,10 @@ def _uzu_write(path, status):
     return True
 
 
-def _handler(tmp):
-    return t3.Tier3Handler(slack_notifier=FakeNotifier(), approval_dir=tmp)
+def _handler(tmp, *, timeout_sec=300, poll_interval_sec=1):
+    """timeout/poll は #103 で yaml SSOT 化され構築時注入の必須引数になった（実効値と同値を渡す）。"""
+    return t3.Tier3Handler(slack_notifier=FakeNotifier(), approval_dir=tmp,
+                           timeout_sec=timeout_sec, poll_interval_sec=poll_interval_sec)
 
 
 # ── 回帰: 競合の最終裁定（承認を握り潰さない） ──
@@ -88,11 +90,16 @@ def test_claim_timeout_sets_timeout_when_still_pending():
 
 # ── end-to-end: approve / reject / timeout ──
 
-def _run_decided(status, monkey_timeout=2.0):
-    """handle() を回し、ポーリング中に u-zu が status を書く e2e。"""
+def _run_decided(status, timeout_sec=2.0):
+    """handle() を回し、ポーリング中に u-zu が status を書く e2e。
+
+    timeout/poll は構築時注入（#103）のため、旧モジュール定数の差し替えではなく
+    コンストラクタで短縮値を渡す。
+    """
     tmp = tempfile.mkdtemp()
     notifier = FakeNotifier()
-    h = t3.Tier3Handler(slack_notifier=notifier, approval_dir=tmp)
+    h = t3.Tier3Handler(slack_notifier=notifier, approval_dir=tmp,
+                        timeout_sec=timeout_sec, poll_interval_sec=0.05)
 
     async def scenario():
         async def flip():
@@ -106,12 +113,7 @@ def _run_decided(status, monkey_timeout=2.0):
         )
         return res
 
-    orig_poll, orig_to = t3.POLL_INTERVAL, t3.TIMEOUT_SECONDS
-    t3.POLL_INTERVAL, t3.TIMEOUT_SECONDS = 0.05, monkey_timeout
-    try:
-        res = asyncio.run(scenario())
-    finally:
-        t3.POLL_INTERVAL, t3.TIMEOUT_SECONDS = orig_poll, orig_to
+    res = asyncio.run(scenario())
     return res, notifier, tmp
 
 
@@ -133,37 +135,29 @@ def test_e2e_reject():
 def test_e2e_timeout():
     tmp = tempfile.mkdtemp()
     notifier = FakeNotifier()
-    h = t3.Tier3Handler(slack_notifier=notifier, approval_dir=tmp)
-    orig_poll, orig_to = t3.POLL_INTERVAL, t3.TIMEOUT_SECONDS
-    t3.POLL_INTERVAL, t3.TIMEOUT_SECONDS = 0.05, 0.2
-    try:
-        res = asyncio.run(h.handle(_pending(), ctx={"instance_id": "i"}))
-    finally:
-        t3.POLL_INTERVAL, t3.TIMEOUT_SECONDS = orig_poll, orig_to
+    h = t3.Tier3Handler(slack_notifier=notifier, approval_dir=tmp,
+                        timeout_sec=0.2, poll_interval_sec=0.05)
+    res = asyncio.run(h.handle(_pending(), ctx={"instance_id": "i"}))
     assert not res.allow and res.reason == "timeout"
     assert any("タイムアウト" in n for n in notifier.notes)
 
 
 def test_e2e_deadline_clamps_poll_budget():
-    """decide_deadline（デーモン外側タイムアウトの締切）が固定 300 秒より近いとき、
+    """decide_deadline（デーモン外側タイムアウトの締切）が timeout_sec=300 秒より近いとき、
     ポーリングは締切の内側で timeout を確定させる（前段消費時間で残余が縮んでも
-    「内側が先に確定」を保つ・T08-V11 の包含）。TIMEOUT_SECONDS は既定のまま
+    「内側が先に確定」を保つ・T08-V11 の包含）。timeout_sec は実効値のまま
     （300 秒）にし、締切だけで短く切れることを検証する。"""
     import time as _time
     tmp = tempfile.mkdtemp()
     notifier = FakeNotifier()
-    h = t3.Tier3Handler(slack_notifier=notifier, approval_dir=tmp)
-    orig_poll = t3.POLL_INTERVAL
-    t3.POLL_INTERVAL = 0.05
-    try:
-        started = _time.monotonic()
-        res = asyncio.run(h.handle(_pending(), ctx={
-            "instance_id": "i",
-            "decide_deadline": _time.monotonic() + 1.0,  # 残余 1 秒 ＜ 既定 300 秒
-        }))
-        elapsed = _time.monotonic() - started
-    finally:
-        t3.POLL_INTERVAL = orig_poll
+    h = t3.Tier3Handler(slack_notifier=notifier, approval_dir=tmp,
+                        timeout_sec=300, poll_interval_sec=0.05)
+    started = _time.monotonic()
+    res = asyncio.run(h.handle(_pending(), ctx={
+        "instance_id": "i",
+        "decide_deadline": _time.monotonic() + 1.0,  # 残余 1 秒 ＜ timeout_sec 300 秒
+    }))
+    elapsed = _time.monotonic() - started
     assert not res.allow and res.reason == "timeout"
     assert elapsed < 10                                  # 300 秒待ちに入っていない
     # timeout でも監査・退避は通常どおり（done/ へ移動し孤児 pending を残さない）
@@ -174,7 +168,8 @@ def test_e2e_deadline_clamps_poll_budget():
 
 def test_slack_failure_denies_and_cleans_up():
     tmp = tempfile.mkdtemp()
-    h = t3.Tier3Handler(slack_notifier=FakeNotifier(fail=True), approval_dir=tmp)
+    h = t3.Tier3Handler(slack_notifier=FakeNotifier(fail=True), approval_dir=tmp,
+                        timeout_sec=300, poll_interval_sec=1)
     res = asyncio.run(h.handle(_pending(), ctx={"instance_id": "i"}))
     assert not res.allow and res.reason == "slack_error"
     assert [f for f in os.listdir(tmp) if f.endswith(".json")] == []   # 孤児 pending なし

@@ -21,15 +21,19 @@ class Tier2Handler:
     させる中間層。qu-e が approve なら自動承認、deny / escalate なら人間（Tier 3）へ上げる。
     """
 
-    def __init__(self, ssh_host: str = "mbp", qu_e_dir: str = "/opt/taka-ma/qu-e"):
+    def __init__(self, ssh_host: str = "mbp", qu_e_dir: str = "/opt/taka-ma/qu-e", *,
+                 timeout_sec: float):
         """qu-e への SSH 接続先と配備ディレクトリを保持する。
 
         Args:
             ssh_host: qu-e が動く MBP の SSH ホスト名（NF-01: コンポーネント間通信は SSH）。
             qu_e_dir: qu-e のソース配備先。review_cli.py の実行 cwd / PYTHONPATH に使う。
+            timeout_sec: review_cli 1 ショット（SSH + qu-e LLM 審査）の応答待ち上限秒
+                （sa-ru.yaml approval.tier2_timeout_sec が唯一の源。コード側に既定値なし）。
         """
         self.ssh_host = ssh_host
         self.qu_e_dir = qu_e_dir
+        self.timeout_sec = timeout_sec
 
     async def handle(self, pending, ctx=None) -> Decision:
         """qu-e に審査させ、approve なら allow・それ以外は Tier 3 へエスカレートする Decision を返す。
@@ -64,7 +68,7 @@ class Tier2Handler:
         try:
             result = await asyncio.to_thread(
                 subprocess.run, ["ssh", self.ssh_host, remote],
-                capture_output=True, text=True, timeout=120,
+                capture_output=True, text=True, timeout=self.timeout_sec,
             )
             if result.returncode != 0:
                 return {"decision": "escalate", "reason": f"qu-e review SSH failed: {result.stderr.strip()}"}

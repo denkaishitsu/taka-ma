@@ -31,8 +31,8 @@ _BASE_FLAGS = [
 def build_hook_settings(mini_host: str, decide_client: str, decide_socket: str, *,
                         task_id: str = "", team_id: str | None = None,
                         channel: str | None = None, thread_ts: str | None = None,
-                        instance_id: str = "", timeout_sec: int = 310,
-                        python_bin: str = "/opt/taka-ma-env/bin/python3") -> dict:
+                        instance_id: str = "", timeout_sec: int,
+                        python_bin: str) -> dict:
     """PreToolUse フックの settings dict を生成する（headless アダプタ用）。
 
     フックは worker と同じ MBP で発火するが、承認判定は Mac mini 常駐の decide デーモンが
@@ -50,14 +50,16 @@ def build_hook_settings(mini_host: str, decide_client: str, decide_socket: str, 
         ツールが承認を素通りし得る（fail-open）ため、exit 0/2 以外で終わる経路を持たない。
 
     timeout_sec はフックの上限。クライアントの応答待ち（308 秒）・デーモンの 1 判定上限
-    （305 秒）より外側の既定 310 秒（Tier3 の人間待ち最大 300 秒を切らない）。
+    （305 秒）より外側の 310 秒（Tier3 の人間待ち最大 300 秒を切らない）を sa-ru.yaml
+    headless.hook_timeout_sec で与える（コード側に既定値なし・SSOT）。
 
     Args:
         mini_host: MBP から見た Mac mini の SSH ホスト名（config の ssh ブロックで定義）。
         decide_client: Mac mini 上の decide_client.py の絶対パス。
         decide_socket: Mac mini 上の decide デーモンの Unix ドメインソケットパス。
-        python_bin: Mac mini 上の decide_client.py 実行バイナリ。標準ライブラリのみのため
-            素の python3 でも動くが、存在が deploy（01-common-base）で保証される venv を既定にする。
+        python_bin: Mac mini 上の decide_client.py 実行バイナリ（sa-ru.yaml headless.python_bin
+            が唯一の源）。標準ライブラリのみのため素の python3 でも動くが、存在が deploy
+            （01-common-base）で保証される venv を指す。
     """
     args = ["--socket", decide_socket, "--task-id", task_id, "--instance-id", instance_id]
     if team_id:

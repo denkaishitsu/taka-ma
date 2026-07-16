@@ -5,6 +5,8 @@ qu-e:
   # 推論の直列化ロック（§4.2）。file_audit（常駐 main.py）と Tier2 審査（review_cli の別プロセス）が
   # 同一パスを flock し、同一 ollama モデルへの同時推論を 1 件ずつに直列化する（相互遅延→二重 escalate を防ぐ）。
   inference_lock: "/opt/taka-ma/data/qu-e-inference.lock"
+  review_timeout_sec: 60  # 審査 LLM（ollama HTTP）1 回の応答待ち上限（秒）。file_audit / Tier2 /
+                          # コミット前ゲート共通。コード側に既定値なし（SSOT）
 
 health_check:
   interval_sec: 30
@@ -17,6 +19,8 @@ health_check:
 # ファイル監査（A1 確定事項 §1 検知 / §4 保存）
 file_audit:
   # 検知（A1 §1）— watchdog（FSEvents、event-driven）
+  # 静的ルート。実開発リポジトリ（§8.13 workspace が静的ルート外を指すとき）は
+  # DynamicWatchManager がタスク期間中だけ動的に登録・解除する（§8.12 動的監視）
   watch_paths:
     - "/opt/taka-ma"
   ignore_patterns:                 # 静的フィルタ（.gitignore と合成）
@@ -41,6 +45,10 @@ file_audit:
   retention_days: 90                                 # 保持日数（qu-e.yaml で切替可）
   # ローテーション: 起動時 + 日次に削除（retention_days 超過ファイル、main.py が実行）
   # 各レコードは id フィールド（uuid4 hex、Slack ボタン callback で特定）
+
+  # コミット前ゲート（§8.12）— 動的監視対象の git リポジトリへ pre-commit 監査フックを自動導入
+  commit_gate:
+    install_hook: true             # false で自動導入を止める（既存フックは常に上書きしない）
 
   # 通知（A1 §2 / §8.12）— deny/escalate を sa-ru に SSH push
   o_moi_alert_dir: "/opt/taka-ma/data/file-audit-alerts"  # sa-ru 側の alert 受信先（Mac mini）

@@ -80,7 +80,7 @@ pyinfra -y @local pyinfra/deploys/orchestrator.py
 | # | 内容 | 実装 |
 |---|------|------|
 | 1 | Python パッケージ導入（`slack-sdk` / `python-dotenv` / `pexpect` / `pyyaml`） | `pip.packages` |
-| 2 | `ollama pull gemma4:12b`（オーケストレーター推論モデル・マルチモーダル） | `server.shell` |
+| 2 | 脳モデルの `ollama pull`＋`num_ctx` 焼込（モデル名・値は `sa-ru.yaml` の `model`/`num_ctx` が単一ソース。現行 Qwen3.6-35B-A3B・32K） | `server.shell` |
 | 3 | [`src/orchestrator/`](../../src/orchestrator/) を `/opt/taka-ma/sa-ru/orchestrator/` に sync | `files.sync` |
 | 4 | データディレクトリ作成（`/opt/taka-ma/data/{tasks,tasks/done,approvals}`） | `files.directory` |
 | 5 | 設定ファイル `sa-ru.yaml` をテンプレートから生成・配置 | `files.template` |
@@ -230,7 +230,7 @@ ssh mac-mini "ls /opt/taka-ma/data/exec-confirmations/"
 
 | # | 検証項目 |
 |---|---------|
-| 1 | `ollama run gemma4:12b` で推論が動作する |
+| 1 | 脳モデル（`sa-ru.yaml` の `model`、現行 `qwen3.6:35b-a3b-q4_K_M`）で推論が動作し、`ollama ps` の CONTEXT が 32768 である |
 | 2 | `/opt/taka-ma/data/{tasks,tasks/done,approvals,conversations,exec-confirmations}` が存在する（会話/着手確認 dir は起動時に自動作成） |
 | 3 | 汎用 PTY ラッパー（`WorkerPtyWrapper`）が対話型 worker CLI（Claude Code / Antigravity CLI 等）の y/n プロンプトを検知できる（実機検証は 08 で実施） |
 | 4 | `run_ssh_command()` で MBP 上の Gemma 4 31B が実行できる |
@@ -260,7 +260,7 @@ ssh mac-mini "ls /opt/taka-ma/data/exec-confirmations/"
 - [`Orchestrator.run()`](../../src/orchestrator/__init__.py) — dispatcher + worker_light + worker_heavy を並行起動
 - [`Orchestrator._dispatcher()`](../../src/orchestrator/__init__.py) — タスクファイル監視・分解・キュー投入
 - [`Orchestrator._conversation_loop() / _handle_conversation_message()`](../../src/orchestrator/__init__.py) — 会話キュー監視 → `ConversationManager.handle_message()` へ（§8.3 (A)）。ファイル取り回しは共有 `FileQueue`
-- [`Orchestrator._exec_confirmation_loop() / _finalize_confirm()`](../../src/orchestrator/__init__.py) — 着手確認の決着検知。confirmed→確定タスク生成、rejected/timeout→実行せず通知（§8.10b）。走査は `FileQueue.iter_records()`（壊れレコードは failed/ 隔離）
+- [`Orchestrator._exec_confirmation_loop() / _finalize_confirm()`](../../src/orchestrator/__init__.py) — 着手確認の決着検知。confirmed→確定タスク生成、rejected→実行せず通知、pending は期限なしで待つ（§8.10b）。走査は `FileQueue.iter_records()`（壊れレコードは failed/ 隔離）
 - [`FileQueue`](../../src/orchestrator/file_queue.py) — 各待受の列挙・パース・壊れファイル隔離（failed/）・done/ 退避を集約する共有ファイルキュー。tasks/conversations/controls/exec-confirmations が利用。待受方式（これら 4 経路は poll 据え置き／watchdog は file_audit・リソース通知に限定）の選択方針と根拠は [design §8.15](../design/design-development-system.md)
 - [`ConversationManager`](../../src/orchestrator/conversation.py) — 会話セッション保持・脳 LLM（`sa-ru.model`）呼び出し・要約提示（`_present_summary`）・確定タスク生成（`create_exec_task`）。プロンプトは [`prompts/converse.md`](../../src/orchestrator/prompts/converse.md)
 - [`Orchestrator._execute_chain()`](../../src/orchestrator/__init__.py) — サブタスク連鎖実行（依存・cascading skip 対応）

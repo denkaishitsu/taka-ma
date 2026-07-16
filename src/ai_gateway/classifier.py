@@ -33,6 +33,13 @@ class TaskClassifier:
     def __init__(self, config):
         """設定から判定用モデルと登録済みモデル一覧を取り出し、判定ロガーを用意する。"""
         self.ai_gateway_model = config["ya-ta"]["model"]
+        # 接続先はマージ済み config の sa-ru.ollama_host を唯一の源にする（設計書 §8.4）
+        self.ollama_host = config["sa-ru"]["ollama_host"]
+        # タイムアウトは ya-ta.yaml を唯一の供給元とする（設計書 §8.4。コード側に既定値を
+        # 置くと供給元が二重になるため必須アクセス。欠落時は KeyError で即落とす）
+        self.llm_timeout = config["ya-ta"]["llm_timeout_sec"]
+        # 思考の有効/無効（None=モデル既定・§8.4）
+        self.llm_think = config["ya-ta"].get("llm_think")
         self.models = config.get("models", {})
         # :モデル名 指定の検証に使う登録済みモデル名の集合
         self.valid_models = set(self.models.keys())
@@ -94,12 +101,14 @@ class TaskClassifier:
 
         try:
             # プロンプト＋タスクをローカル ollama（ya-ta モデル）に渡して判定 JSON を得る。
-            # ollama 非ゼロ終了は run_ollama が RuntimeError を送出し、下の except で
+            # ollama 実行失敗は run_ollama が RuntimeError を送出し、下の except で
             # 安全側フォールバック（heavy）へ落ちる（設計書 §8.4「ollama 実行失敗の検知」）。
             stdout = run_ollama(
                 self.ai_gateway_model,
                 f"{system_prompt}\n\nタスク: {command}",
-                timeout=60,
+                timeout=self.llm_timeout,
+                host=self.ollama_host,
+                think=self.llm_think,
             )
             # category 欠落は判定不成立とみなしフォールバックへ落とす
             parsed = json.loads(extract_json(stdout))

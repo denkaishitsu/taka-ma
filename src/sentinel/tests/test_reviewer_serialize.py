@@ -13,8 +13,9 @@ from reviewer import QueReviewer
 
 
 def _reviewer(prompts_dir, lock):
+    # review_timeout_sec は #103 で yaml SSOT 化され必須引数になった（実効値と同値を渡す）
     return QueReviewer(model="m", ollama_host="http://x", prompts_dir=prompts_dir,
-                       inference_lock=lock)
+                       inference_lock=lock, review_timeout_sec=60)
 
 
 def _write_prompt(tmp):

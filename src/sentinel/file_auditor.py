@@ -15,7 +15,9 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
+import threading
 import uuid
 from fnmatch import fnmatch
 from pathlib import Path
@@ -102,20 +104,21 @@ class FileAuditHandler(FileSystemEventHandler):
         self.task_context = task_context_store
         # watchdog はワーカースレッドでコールバックするため、本ループに投げ直して async 化する
         self.loop = loop
-        # file_audit 設定の取り出し（無視ルール・集約待ち時間・出力先・通知先）
-        self.ignore_patterns: list[str] = config["file_audit"].get("ignore_patterns", [])
+        # file_audit 設定の取り出し（無視ルール・集約待ち時間・出力先・通知先）。
+        # いずれも qu-e.yaml を唯一の源にする（コード既定値なし。欠落は起動時に KeyError で
+        # 即落とし診断位置を揃える）
+        self.ignore_patterns: list[str] = config["file_audit"]["ignore_patterns"]
         # sa-ru が SSH push する qu-e 自身の制御プレーンディレクトリ（§8.13）。固定の絶対パスが
         # 既知なので、ignore_patterns のベアネーム fnmatch（"task-context" という名前の
         # ユーザー成果物まで誤って除外し得る）ではなく、このパス配下かどうかで厳密に判定する
         # （Layer3 review で指摘・是正）。
-        self.task_context_dir: str | None = config.get("task_context", {}).get("dir")
+        self.task_context_dir: str = config["task_context"]["dir"]
         # sa-ru が worker 起動のたびに workspace へ配置する制御ファイル（PreToolUse フック設定
         # 等）。外部改変ではなく sa-ru 自身が毎タスク生成・上書きする自己生成物であり、監査対象に
         # すると全タスクで同一パスの escalate/deny アラートを量産する。ファイル名が固定・既知の
         # システム制御プレーンとして basename で除外する（§8.12 システム制御プレーンの除外）。
-        self.control_plane_files: list[str] = config["file_audit"].get(
-            "control_plane_files", [".taka-hook-settings.json"])
-        self.debounce_sec: float = config["file_audit"].get("debounce_sec", 1)
+        self.control_plane_files: list[str] = config["file_audit"]["control_plane_files"]
+        self.debounce_sec: float = config["file_audit"]["debounce_sec"]
         self.log_dir: str = config["file_audit"]["log_dir"]
         self.alert_dir: str = config["file_audit"]["o_moi_alert_dir"]
         self.ssh_host: str = config["file_audit"]["mac_mini_host"]
@@ -431,13 +434,15 @@ class FileAuditHandler(FileSystemEventHandler):
             # 通知が落ちても監査記録（jsonl）は残っている。原因追跡のためログのみ残す
             logger.exception("file_audit alert push 失敗: audit_id=%s", audit_id)
 
-    def _push_audit_failure_alert(self, path: str, event_type: str):
-        """監査処理自体が例外で失敗した事実を人間へ escalate 通知する（fail-closed）。
+    def _push_audit_failure_alert(self, path: str, event_type: str, reason: str | None = None):
+        """監査機構自体の失敗を人間へ escalate 通知する（fail-closed）。
 
         判定結果を得られなかった＝「危険かもしれない変更が監査を素通りした」状態のため、
         最小情報（対象パス・種別）で escalate アラートを組み立てて push する。通知先の
         文脈（channel/thread/team）は失敗時点で不明なので空にし、sa-ru 側の既定投稿先
         フォールバックに委ねる。この二次処理でさらに例外が出ても監査ループは止めない。
+        監査処理の例外のほか、動的監視の登録失敗（§8.12。監視できないまま沈黙する状態）
+        からも reason を差し替えて使う。
         """
         try:
             audit_id = uuid.uuid4().hex
@@ -445,7 +450,7 @@ class FileAuditHandler(FileSystemEventHandler):
                 "id": audit_id,
                 "path": path,
                 "decision": "escalate",
-                "reason": f"file_audit 処理が例外で失敗（event={event_type}）。人間確認が必要",
+                "reason": reason or f"file_audit 処理が例外で失敗（event={event_type}）。人間確認が必要",
                 "confidence": 0.0,
                 "diff_summary": "",
                 "task_id": "",
@@ -462,12 +467,151 @@ class FileAuditHandler(FileSystemEventHandler):
             logger.exception("失敗 escalate 通知の組み立てに失敗: path=%s", path)
 
 
+class DynamicWatchManager:
+    """実行中タスクの実開発リポジトリを動的に watchdog 監視へ登録・解除する（§8.12 動的監視）。
+
+    watch_paths（静的ルート）は起動時に固定で監視するが、実開発リポジトリ
+    （例: MBP ~/DevDev/xxx の git clone）は場所が事前に決まらない。task_context（§8.13）の
+    workspace を受けて、タスク期間中（in_progress）だけ observer.schedule し、終了
+    （completed/failed）で解除する。同一リポジトリを複数タスクが並行使用している間は
+    解除しない（参照カウント）。symlink を静的ルート内へ張る方式は watchdog/FSEvents が
+    symlink 先のイベントを検知しないため不可（2026-07-14 実測）で、本方式を採る。
+    """
+
+    def __init__(self, observer, handler, static_roots: list[str], commit_gate: dict):
+        """動的監視マネージャを構築する。
+
+        Args:
+            observer: 稼働中の watchdog Observer（schedule/unschedule を呼ぶ）。
+            handler: FileAuditHandler。動的登録先のイベントも静的ルートと同一の監査経路に
+                流す。登録失敗の escalate 通知（fail-closed）にも使う。
+            static_roots: 起動時から監視済みの watch_paths。この配下は登録済みのため
+                動的登録しない（二重イベント防止）。
+            commit_gate: qu-e.yaml file_audit.commit_gate（pre-commit フック自動導入の設定。
+                install_hook キー必須=yaml が唯一の源、コード側に既定値なし）。
+        """
+        self.observer = observer
+        self.handler = handler
+        self._static_roots = [os.path.abspath(os.path.expanduser(p)) for p in static_roots]
+        # install_hook は構築時（qu-e 起動時）に読み切る。ここで添字アクセスしておかないと、
+        # yaml の commit_gate がコメントのみ（None）や install_hook 欠落のとき、最初の動的
+        # 監視登録（_install_commit_hook）まで発覚が遅れ、フックだけ黙って未導入になる
+        # （欠落は起動時に即落とす、の診断位置合わせ）
+        self._install_hook: bool = commit_gate["install_hook"]
+        # path → (ObservedWatch, そのパスを使用中の task_id 集合)。参照カウントの台帳
+        self._watches: dict[str, tuple[object, set[str]]] = {}
+        # task_id → 登録先 path（解除・付け替えの逆引き）
+        self._task_path: dict[str, str] = {}
+        # sync() は task_context Observer のワーカースレッドと起動時初期スキャン
+        # （メインスレッド）の両方から呼ばれるため、台帳の更新を直列化する
+        self._lock = threading.Lock()
+
+    def sync(self, task_id: str, ctx: dict | None):
+        """task_context 1 件の受信を動的監視へ反映する（登録・付け替え・解除の共通口）。
+
+        ctx=None（終了系 status）または workspace 無しは解除。workspace が静的ルート
+        配下なら登録不要（付け替えで静的圏内へ戻った場合の後始末として解除だけ行う）。
+        """
+        workspace = (ctx or {}).get("workspace")
+        with self._lock:
+            if not workspace:
+                self._unregister(task_id)
+                return
+            path = os.path.abspath(os.path.expanduser(workspace))
+            if self._covered_by_static(path):
+                self._unregister(task_id)
+                return
+            prev = self._task_path.get(task_id)
+            if prev == path:
+                return
+            if prev:
+                self._unregister(task_id)
+            self._register(task_id, path)
+
+    def _covered_by_static(self, path: str) -> bool:
+        """path が静的 watch_paths のいずれかの配下（既に監視済み）かを返す。"""
+        for root in self._static_roots:
+            if path == root or path.startswith(root.rstrip(os.sep) + os.sep):
+                return True
+        return False
+
+    def _register(self, task_id: str, path: str):
+        """path の監視を登録する（登録済みなら参照カウントに task_id を足すだけ）。"""
+        entry = self._watches.get(path)
+        if entry:
+            entry[1].add(task_id)
+            self._task_path[task_id] = path
+            return
+        try:
+            watch = self.observer.schedule(self.handler, path, recursive=True)
+        except Exception:
+            logger.exception("動的監視の登録失敗: path=%s task_id=%s", path, task_id)
+            # fail-closed: 監視できないまま沈黙すると、このタスクの変更が無監査で通る。
+            # その事実を人間へ escalate 通知する（§8.12 動的監視「登録失敗の fail-closed」）
+            self.handler._push_audit_failure_alert(
+                path, "watch",
+                reason=f"実開発リポジトリの動的監視の登録に失敗（task_id={task_id}）。"
+                       "この間の変更は監査されない。人間確認が必要")
+            return
+        self._watches[path] = (watch, {task_id})
+        self._task_path[task_id] = path
+        logger.info("動的監視 登録: path=%s task_id=%s", path, task_id)
+        self._install_commit_hook(path)
+
+    def _unregister(self, task_id: str):
+        """task_id の登録を外し、参照が尽きたパスの監視を解除する。"""
+        path = self._task_path.pop(task_id, None)
+        if not path:
+            return
+        entry = self._watches.get(path)
+        if not entry:
+            return
+        watch, users = entry
+        users.discard(task_id)
+        # タスク中に clone されたリポジトリ（登録時は .git 不在）にも導入できるよう、
+        # タスク終了時にも pre-commit フック導入を試みる（§8.12 コミット前ゲート「導入」）
+        self._install_commit_hook(path)
+        if users:
+            return
+        try:
+            self.observer.unschedule(watch)
+            logger.info("動的監視 解除: path=%s", path)
+        except Exception:
+            logger.exception("動的監視の解除失敗: path=%s", path)
+        self._watches.pop(path, None)
+
+    def _install_commit_hook(self, path: str):
+        """workspace が git リポジトリなら pre-commit 監査フックを自動導入する（§8.12）。
+
+        既存フックは上書きしない（ユーザーのリポジトリ設定を壊さない）。導入の要否は
+        qu-e.yaml file_audit.commit_gate.install_hook（yaml が唯一の源・コード既定値なし）。
+        導入失敗はコミットゲートが掛からないだけで監査（watchdog）自体は生きているため、
+        ログのみで継続する。
+        """
+        if not self._install_hook:
+            return
+        if not os.path.isdir(os.path.join(path, ".git")):
+            return
+        target = os.path.join(path, ".git", "hooks", "pre-commit")
+        if os.path.exists(target):
+            return
+        src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks", "pre-commit")
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.copyfile(src, target)
+            os.chmod(target, 0o755)
+            logger.info("pre-commit 監査フック導入: %s", target)
+        except OSError:
+            logger.exception("pre-commit フック導入失敗: %s", target)
+
+
 def start_audit(config: dict, reviewer, task_context_store: dict,
-                loop: asyncio.AbstractEventLoop) -> Observer:
-    """ファイル監査を開始し、稼働中の watchdog Observer を返す。
+                loop: asyncio.AbstractEventLoop) -> tuple[Observer, FileAuditHandler]:
+    """ファイル監査を開始し、稼働中の watchdog Observer と監査ハンドラを返す。
 
     設定の watch_paths を再帰監視し、各変更を FileAuditHandler へ流す。返した
-    Observer は呼び出し側が保持し、停止時に stop/join する想定。
+    Observer は呼び出し側が保持し、停止時に stop/join する想定。ハンドラは
+    DynamicWatchManager（動的登録先へ同じ監査経路を流す）の構築に使う。
     """
     handler = FileAuditHandler(config, reviewer, task_context_store, loop)
     observer = Observer()
@@ -475,7 +619,7 @@ def start_audit(config: dict, reviewer, task_context_store: dict,
     for path in config["file_audit"]["watch_paths"]:
         observer.schedule(handler, path, recursive=True)
     observer.start()
-    return observer
+    return observer, handler
 
 
 def rotate_jsonl(log_dir: str, retention_days: int):

@@ -192,6 +192,8 @@ ssh mbp "tail -50 /opt/taka-ma/logs/qu-e.log | grep ヘルスチェック"
 | 11 | task_context: sa-ru から SSH push された json を即時受信し、メモリ store に反映される（§8.13 / A1 §5） | 動作確認 6 |
 | 11b | file_audit: 並行実行中の複数タスクで、変更パスが属する `workspace` から正しい task_id に帰属する（一致なし・複数 in_progress 時は非帰属、§8.13） | コードレビュー（`_pick_task_context`） |
 | 11c | task_context: 受信した `thread_ts` が store に保持され、実行中タスクの file_audit アラートが同一 Slack スレッドへ Thread 返信される（§8.12） | 動作確認 6 |
+| 11d | file_audit: 静的 `watch_paths` 外の実開発リポジトリ（task_context の `workspace`）がタスク期間中だけ動的に監視され、終了時に解除される（§8.12 動的監視。共有中は解除しない・登録失敗は escalate） | 分離実行テスト（`tests/test_repo_audit_102.py`） |
+| 11e | commit_gate: 動的監視対象の git リポジトリへ pre-commit フックが自動導入され（既存フックは非上書き）、staged diff が approve のときのみコミットが通る（§8.12 コミット前ゲート、fail-closed） | 分離実行テスト（同上）／実機 |
 | 12 | ヘルスチェックが CPU / Memory / Disk / Network を周期取得し、healthy/warning/critical を判定 | 動作確認 7 |
 | 13 | メモリ使用量が想定範囲内（qu-e 単体 ~19GB、Gemma 4 31B との共存 OK） | 実機モニタリング |
 | 14 | ログが `/opt/taka-ma/logs/qu-e.log` に出力される | 動作確認 1 |
@@ -211,6 +213,9 @@ ssh mbp "tail -50 /opt/taka-ma/logs/qu-e.log | grep ヘルスチェック"
 | `rotate_jsonl()` | [`file_auditor.py`](../../src/sentinel/file_auditor.py) | retention_days 超過の jsonl 削除（A1 §4） |
 | `TaskContextHandler` | [`main.py`](../../src/sentinel/main.py) | watchdog で `/opt/taka-ma/data/task-context/` を監視、json 読み込み → store 反映（`workspace` 含む、§8.13） |
 | `FileAuditHandler._pick_task_context(path)` | [`file_auditor.py`](../../src/sentinel/file_auditor.py) | 変更パスを各タスクの `workspace` 接頭辞で照合し、並行実行中の正しい task_id を特定（最長一致、曖昧時は非帰属、§8.13） |
+| `DynamicWatchManager` | [`file_auditor.py`](../../src/sentinel/file_auditor.py) | 実開発リポジトリの動的監視。task_context の `workspace` をタスク期間中だけ observer に登録・終了で解除（参照カウント）。git リポジトリへ pre-commit フックを自動導入（§8.12 動的監視／コミット前ゲート） |
+| `commit_audit_cli.py` | [`commit_audit_cli.py`](../../src/sentinel/commit_audit_cli.py) | コミット前監査ゲートの 1 ショット CLI。staged diff を審査し approve のみ exit 0。監査 jsonl に `event="commit"` で追記（§8.12） |
+| `hooks/pre-commit` | [`hooks/pre-commit`](../../src/sentinel/hooks/pre-commit) | 自動導入される git pre-commit フック本体（sh）。監査基盤不在時は警告して素通し、基盤ありでの判定不能は fail-closed で中断 |
 | `ResourceOptimizer.recommended_heavy_instances()` / `notify_payload()` | [`resource_optimizer.py`](../../src/sentinel/resource_optimizer.py) | メモリ使用率から推奨 heavy 並行数を算出し、§8.14 通知 payload（recommended_heavy_instances / memory_usage / level）を生成 |
 | `resource_notify_loop()` | [`main.py`](../../src/sentinel/main.py) | `notify_interval_sec` 間隔で推奨並行数を算出し、前回値から変化時に sa-ru へ SSH push（§8.14、フロー図 [Appendix_resource-optimization-flow.md](../design/Appendix_resource-optimization-flow.md)） |
 | `health_check_loop()` / `main()` | [`main.py`](../../src/sentinel/main.py) | 起動シーケンス（Observer 起動 + 起動時 retention rotation + 日次 rotation / リソース通知 asyncio task） |

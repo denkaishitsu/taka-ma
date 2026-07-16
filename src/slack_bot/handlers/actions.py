@@ -104,7 +104,7 @@ def register_actions(app):
         if resolve_exec_confirm(exec_request_id, "confirmed", decided_by=user):
             say(f":rocket: <@{user}> が着手を承認しました", thread_ts=thread_ts)
         else:
-            say(":warning: この確認は既に処理済みか、期限切れです", thread_ts=thread_ts)
+            say(":warning: この確認は既に処理済みです", thread_ts=thread_ts)
 
     @app.action("exec_reject")
     def handle_exec_reject(ack, body, say):
@@ -123,7 +123,7 @@ def register_actions(app):
         if resolve_exec_confirm(exec_request_id, "rejected", decided_by=user):
             say(f":arrows_counterclockwise: <@{user}> がやり直しを選びました。会話を続けてください", thread_ts=thread_ts)
         else:
-            say(":warning: この確認は既に処理済みか、期限切れです", thread_ts=thread_ts)
+            say(":warning: この確認は既に処理済みです", thread_ts=thread_ts)
 
     @app.action("audit_approve")
     def handle_audit_approve(ack, body, say):

@@ -14,6 +14,7 @@ import datetime
 import json
 import logging
 import os
+import shlex
 import shutil
 import subprocess
 import time
@@ -24,6 +25,7 @@ from watchdog.events import FileSystemEventHandler
 
 from ai_gateway.decomposer import TaskDecomposer
 from ai_gateway.classifier import TaskClassifier
+from ai_gateway.llm import GenerationProgress, run_ollama
 from ai_gateway.risk_classifier import RiskClassifier
 from orchestrator.process_manager import RemoteProcessManager
 from orchestrator.slack_notifier import SlackNotifier
@@ -81,10 +83,10 @@ def _select_method(model_conf: dict, use_case: str = "default") -> str:
 
 logger = logging.getLogger("sa-ru.orchestrator")
 
-TASK_DIR = "/opt/taka-ma/data/tasks"
+# タスクキューの dir / ポーリング間隔は sa-ru.yaml の task_queue ブロックを唯一の源にする
+# （旧 TASK_DIR / POLL_INTERVAL 定数は yaml と二重定義だったため撤去）。
 # 承認ファイルのディレクトリは Tier3Handler（approval-pipeline/tier3_handler.py）が
 # `TAKA_MA_APPROVAL_DIR` で一元管理する。ここでは持たない（旧・未使用定数を撤去）。
-POLL_INTERVAL = 5  # 秒
 
 
 class FileAuditHandler(FileSystemEventHandler):
@@ -201,6 +203,10 @@ class Orchestrator:
         self.process_mgr = RemoteProcessManager(ssh_host=mbp_host, ssh_timeout=ssh_timeout)
         self.slack = SlackNotifier()
 
+        # LLM 処理待ちのハートビート通知間隔（§10.8）。sa-ru.yaml の heartbeat.interval_sec を
+        # 唯一の源とし、コードに既定値を置かない（欠落は ssh ブロックと同様に起動時に即落とす）
+        self._heartbeat_interval = config["heartbeat"]["interval_sec"]
+
         # 承認パイプライン（worker の y/n 介入。ya-ta=in-process / qu-e=SSH、§8.8〜§8.9）。
         # 実体は approval-pipeline パッケージ（08 で /opt/taka-ma/sa-ru/approval-pipeline へ配備、
         # 設計上「sa-ru の一部」）に存在する。設計 §08「パイプラインは y/n 検出時に起動」に従い、
@@ -221,28 +227,28 @@ class Orchestrator:
         )
 
         # 会話フロントエンド。u-zu からの発話を脳 LLM で会話・要約し、人間の着手確認を
-        # 得てから確定タスク（status=init）を TASK_DIR に生成する。生成後は既存 dispatcher が拾う。
-        # タスクキューの dir は config を唯一の源にする（u-zu の writer task_queue.py と同じキー。
-        # 他キューと流儀を揃え、定数直書きで writer と乖離する SSOT ギャップを作らない）。
-        self.task_dir = config.get("task_queue", {}).get("dir", TASK_DIR)
+        # 得てから確定タスク（status=init）を task_queue.dir に生成する。生成後は既存 dispatcher が拾う。
+        # タスクキューの dir / ポーリング間隔は config を唯一の源にする（u-zu の writer
+        # task_queue.py と同じキー。コードに既定値を置かず、欠落は起動時に即落とす）。
+        self.task_dir = config["task_queue"]["dir"]
+        self.task_poll = config["task_queue"]["poll_interval_sec"]
         self.conversation = ConversationManager(config, self.slack, task_dir=self.task_dir,
                                                  classifier=self.classifier)
-        # 会話/着手確認の dir は config を唯一の源にする（exec_confirm と同じ流儀。定数の二重定義を避ける）
+        # 会話/着手確認の dir・ポーリング間隔は config を唯一の源にする（コード既定値なし・二重定義を避ける）
         self.conversation_dir = config["conversation"]["dir"]
-        self.conversation_poll = config["conversation"].get("poll_interval_sec", 2)
+        self.conversation_poll = config["conversation"]["poll_interval_sec"]
         self.exec_confirm_dir = config["exec_confirm"]["dir"]
-        self.exec_confirm_poll = config["exec_confirm"].get("poll_interval_sec", 2)
-        self.exec_confirm_timeout = config["exec_confirm"].get("timeout_sec", 300)
+        self.exec_confirm_poll = config["exec_confirm"]["poll_interval_sec"]
 
         # 制御コマンド受信（§8.10c）。u-zu が controls/ に書く制御命令（手動 ollama 停止等）を
-        # 監視し対応操作へ委譲する。dir は config を唯一の源にする（他キューと同じ流儀・二重定義を避ける）。
+        # 監視し対応操作へ委譲する。dir・間隔は config を唯一の源にする（他キューと同じ流儀・二重定義を避ける）。
         self.control_dir = config["control"]["dir"]
-        self.control_poll = config["control"].get("poll_interval_sec", 2)
+        self.control_poll = config["control"]["poll_interval_sec"]
 
         # 各待受の取り回し（列挙・パース・壊れファイル隔離・done/ 退避）を共有 FileQueue に集約する。
         # ループ固有の判断（ready とする status・処理後の扱い）は各ループ側に残す。
         # 待受方式は現状の poll を踏襲。
-        self.task_q = FileQueue(self.task_dir, poll_interval=POLL_INTERVAL)
+        self.task_q = FileQueue(self.task_dir, poll_interval=self.task_poll)
         self.conversation_q = FileQueue(self.conversation_dir, poll_interval=self.conversation_poll)
         self.control_q = FileQueue(self.control_dir, poll_interval=self.control_poll)
         self.exec_confirm_q = FileQueue(self.exec_confirm_dir, poll_interval=self.exec_confirm_poll)
@@ -338,7 +344,7 @@ class Orchestrator:
             # updated_at は claim が予約時に刻む。壊れた task ファイルは failed/ へ隔離され止まらない）。
             picked = self.task_q.claim("init", reserve_status="accepted")
             if not picked:
-                await asyncio.sleep(POLL_INTERVAL)
+                await asyncio.sleep(self.task_poll)
                 continue
 
             task_file, task = picked
@@ -348,9 +354,13 @@ class Orchestrator:
             try:
                 await self._update_status(task_file, "in_progress")
 
-                # DeepSeek-R1 でタスクを分解（設計書 §8.4, §10.2）
-                subtasks = await asyncio.to_thread(
-                    self.decomposer.decompose, task["command"]
+                # ya-ta モデルでタスクを分解（設計書 §8.4, §10.2）。分解 LLM の無応答区間は
+                # ハートビートで進捗を同スレッドへ返す（§10.8）
+                subtasks = await self._run_with_heartbeat(
+                    "タスク分解", self.decomposer.decompose, task["command"],
+                    channel=task.get("channel_id"),
+                    team_id=task.get("team_id"),
+                    thread_ts=task.get("thread_ts"),
                 )
 
                 # /exam_gw ドライラン: 判定結果のみ返却し、実行しない（設計書 §2.2）
@@ -412,7 +422,13 @@ class Orchestrator:
         run は常に done/ へ退避する（現行挙動どおり「処理を試みたら done」）。通知自体の失敗は無視。
         """
         try:
-            await asyncio.to_thread(self.conversation.handle_message, msg)
+            # 脳 LLM の無応答区間はハートビートで進捗を同スレッドへ返す（§10.8）
+            await self._run_with_heartbeat(
+                "会話応答の生成", self.conversation.handle_message, msg,
+                channel=msg.get("channel_id"),
+                team_id=msg.get("team_id"),
+                thread_ts=msg.get("thread_ts"),
+            )
         except Exception:
             logger.exception("会話メッセージ処理失敗: %s", msg_file)
             try:
@@ -481,24 +497,21 @@ class Orchestrator:
     # ── 着手確認ループ: 確認の決着を検知して確定タスクを生成（§8.3 (B)） ──
 
     async def _exec_confirmation_loop(self):
-        """着手確認レコードをポーリングし、決着（confirmed / rejected / timeout）を処理する。
+        """着手確認レコードをポーリングし、決着（confirmed / rejected）を処理する。
 
         - confirmed: ConversationManager.create_exec_task で確定タスク（status=init）を生成
                      → 既存 dispatcher が拾う（以降は現行フロー無改変）
         - rejected:  実行せず会話継続を促す
-        - pending が timeout_sec を超過: 自動 timeout（§8.10 の 5 分タイムアウトと同方針）
+        pending は人間がボタンで決着させるまで待ち続ける（§8.10b。自動 timeout で締め直しを
+        強いない。§8.10 承認と違い同期で待つ worker プロセスが無いため期限が不要）。
         処理済みレコードは done/ に退避する。
         """
         while True:
-            # 全件走査（pending の timeout 判定と confirmed/rejected の決着を同時に見るため pick-one では
+            # 全件走査（pending を残したまま confirmed/rejected だけ決着させるため pick-one では
             # なく iter_records を使う）。共有 FileQueue 経由のため、壊れたレコードは failed/ へ隔離される
             # （従来この経路だけ隔離せず continue していたドリフトを解消）。
             for path, record in self.exec_confirm_q.iter_records():
                 status = record.get("status")
-                if status == "pending":
-                    if self._is_confirm_expired(record):
-                        await self._finalize_confirm(path, record, "timeout")
-                    continue
                 if status in ("confirmed", "rejected"):
                     await self._finalize_confirm(path, record, status)
             await asyncio.sleep(self.exec_confirm_poll)
@@ -516,15 +529,6 @@ class Orchestrator:
             self._approval_pipeline = ApprovalPipeline(
                 self.config, slack_notifier=self.slack, ssh_host=self._mbp_host)
         return self._approval_pipeline
-
-    def _is_confirm_expired(self, record: dict) -> bool:
-        """pending の着手確認が timeout_sec を超過したか判定する。"""
-        try:
-            created = datetime.datetime.fromisoformat(record["created_at"])
-        except (KeyError, ValueError):
-            return False
-        now = datetime.datetime.now(created.tzinfo)
-        return (now - created).total_seconds() > self.exec_confirm_timeout
 
     async def _finalize_confirm(self, path: str, record: dict, outcome: str):
         """着手確認を決着させる。先に done/ へ退避してから決着アクションを行う。
@@ -546,8 +550,6 @@ class Orchestrator:
                 self.conversation.create_exec_task(record)
             elif outcome == "rejected":
                 self.conversation.notify_rejected(record)
-            elif outcome == "timeout":
-                self.conversation.notify_timeout(record)
         except Exception:
             logger.exception("着手確認の決着処理失敗: %s (%s)", path, outcome)
             try:
@@ -652,16 +654,24 @@ class Orchestrator:
             failed_steps = [s["step"] for s in subtasks if s["step"] not in results]
             if not failed_steps:
                 final_result = results[subtasks[-1]["step"]]
-                await self._update_status(task_file, "completed", result=final_result)
-                await self._notify(f"タスク完了:\n```{final_result[:500]}```", channel,
-                                  team_id=team_id, thread_ts=thread_ts)
+                result_path = await self._update_status(task_file, "completed", result=final_result)
+                # 結果は切り詰めず分割送信し、正本（結果ファイル）のパスを必ず併記する（§8.9）
+                await self._notify_chunked(
+                    f"タスク完了（結果ファイル: {result_path}）:", final_result,
+                    channel, team_id=team_id, thread_ts=thread_ts)
+                # 完了結果を発生元の会話セッションへ還流する（§8.9「会話への還流」）。
+                # ファイル I/O とロック取得を含むため to_thread でループから切り離す（§10.7）
+                await asyncio.to_thread(
+                    self.conversation.append_task_result, task, final_result, result_path)
             else:
-                await self._update_status(task_file, "failed")
-                await self._notify_failure(task, subtasks, results, failed_steps, channel, team_id, thread_ts)
+                result_path = await self._update_status(task_file, "failed")
+                await self._notify_failure(task, subtasks, results, failed_steps, channel,
+                                           team_id, thread_ts, result_path=result_path)
 
         except Exception as e:
-            await self._update_status(task_file, "failed", result=str(e))
-            await self._notify(f"タスク失敗: {e}", channel, team_id=team_id, thread_ts=thread_ts)
+            result_path = await self._update_status(task_file, "failed", result=str(e))
+            await self._notify(f"タスク失敗: {e}\n結果ファイル: {result_path}",
+                               channel, team_id=team_id, thread_ts=thread_ts)
 
     async def _notify(self, text, channel=None, *, team_id=None, thread_ts=None):
         """Slack 送信をイベントループから切り離す薄いラッパー（§10.7）。
@@ -674,8 +684,62 @@ class Orchestrator:
         await asyncio.to_thread(
             self.slack.notify, text, channel, team_id=team_id, thread_ts=thread_ts)
 
-    async def _notify_failure(self, task, subtasks, results, failed_steps, channel, team_id=None, thread_ts=None):
-        """失敗時の詳細通知（設計書 §10.3）"""
+    async def _run_with_heartbeat(self, label, func, *args,
+                                  channel=None, team_id=None, thread_ts=None):
+        """同期 LLM 呼び出しを別スレッドで実行しつつ、完了まで一定間隔で進捗を返す（§10.8）。
+
+        func には GenerationProgress を progress キーワードで渡す（func 側が run_ollama へ
+        引き回し、生成スレッドが受信チャンクごとにトークン数を刻む）。通知間隔ごとに
+        「何の処理が・何秒経過・生成トークン数」を発話と同じスレッドへ返す。「あと何秒」は
+        原理的に算出できないため報告しない。ハートビート送信の失敗は本処理に影響させない
+        （ログのみ・次周期で再試行）。本処理の完了・例外で即座に打ち切る（完了後に
+        「処理中」を届けない）。func の戻り値・例外はそのまま呼び出し元へ返す。
+        """
+        progress = GenerationProgress()
+        start = time.monotonic()
+        work = asyncio.ensure_future(asyncio.to_thread(func, *args, progress=progress))
+        while True:
+            done, _ = await asyncio.wait({work}, timeout=self._heartbeat_interval)
+            if done:
+                return work.result()  # 例外もここで元のまま再送出される
+            elapsed = int(time.monotonic() - start)
+            try:
+                await self._notify(
+                    f"⏳ {label}を処理中です（{elapsed}秒経過・生成 {progress.tokens} トークン）",
+                    channel, team_id=team_id, thread_ts=thread_ts)
+            except Exception:
+                logger.exception("ハートビート通知の送信に失敗（本処理は継続）: %s", label)
+
+    # Slack 1 メッセージに収める本文の上限（Slack の text 上限 4,000 字より余裕を持つ）
+    NOTIFY_CHUNK_CHARS = 3500
+    # 分割送信の最大メッセージ数。超過分は送らないが、全文は併記した結果ファイルが正本の
+    # ため情報は失われない（切り詰め廃止の趣旨は「全文へ到達できる経路を常に残す」§8.9）
+    NOTIFY_MAX_CHUNKS = 8
+
+    async def _notify_chunked(self, header: str, body: str, channel=None, *,
+                              team_id=None, thread_ts=None):
+        """長文結果を切り詰めず分割送信する（§8.9「完了通知の内容規律」）。
+
+        1 通目は header（結果ファイルパス併記済み）+ 本文先頭。以降は本文の続きを
+        NOTIFY_CHUNK_CHARS ごとに送る。NOTIFY_MAX_CHUNKS を超える極端な長文は
+        打ち切りを明示し、全文は結果ファイルへ誘導する。
+        """
+        chunks = [body[i:i + self.NOTIFY_CHUNK_CHARS]
+                  for i in range(0, len(body), self.NOTIFY_CHUNK_CHARS)] or [""]
+        truncated = len(chunks) > self.NOTIFY_MAX_CHUNKS
+        chunks = chunks[:self.NOTIFY_MAX_CHUNKS]
+        for i, chunk in enumerate(chunks):
+            prefix = header + "\n" if i == 0 else f"（続き {i + 1}/{len(chunks)}）\n"
+            await self._notify(f"{prefix}```{chunk}```", channel,
+                               team_id=team_id, thread_ts=thread_ts)
+        if truncated:
+            await self._notify(
+                "（本文が長いため以降の送信を省略しました。全文は上記の結果ファイルを参照してください）",
+                channel, team_id=team_id, thread_ts=thread_ts)
+
+    async def _notify_failure(self, task, subtasks, results, failed_steps, channel,
+                              team_id=None, thread_ts=None, result_path=None):
+        """失敗時の詳細通知（設計書 §10.3。結果ファイルパスを併記する §8.9）"""
         lines = ["⚠ タスク失敗", "", f"【元の指示】", task["command"], "", "【サブタスク結果】"]
         for s in subtasks:
             step = s["step"]
@@ -685,6 +749,8 @@ class Orchestrator:
                 lines.append(f"  Step {step}: {s['command']} ({s['category']}) → ❌ 失敗")
             else:
                 lines.append(f"  Step {step}: {s['command']} ({s['category']}) → ⏭ スキップ")
+        if result_path:
+            lines += ["", f"結果ファイル: {result_path}"]
         await self._notify("\n".join(lines), channel, team_id=team_id, thread_ts=thread_ts)
 
     async def _execute_subtask_in_chain(self, task: dict, subtask: dict,
@@ -857,7 +923,7 @@ class Orchestrator:
                     # 以降が1候補目と同じ workspace/セッション名になり、1候補目失敗時に生存し続ける
                     # 資源と名前衝突する（Layer3 review で検出・是正）。
                     instance_id = f"{item['task_id']}-step{step}-{model_name}"
-                    workspace = self._workspace_for(item["task_id"])
+                    workspace = self._resolve_workspace(item)
                     if method == "headless":
                         output = await self._run_worker_headless(instance_id, cli_command, command, model_flag, workspace, channel=channel, team_id=team_id, task_id=item["task_id"], thread_ts=thread_ts)
                     else:
@@ -931,7 +997,7 @@ class Orchestrator:
                     model_flag = model_conf.get("model_flag", "")
                     cli_command = model_conf.get("command", "claude")
                     instance_id = f"{item['task_id']}-step{step}-{model_name}"
-                    workspace = self._workspace_for(item["task_id"])
+                    workspace = self._resolve_workspace(item)
                     async with self.heavy_limiter:
                         if method == "headless":
                             output = await self._run_worker_headless(instance_id, cli_command, command, model_flag, workspace, channel=channel, team_id=team_id, task_id=item["task_id"], thread_ts=thread_ts)
@@ -987,18 +1053,13 @@ class Orchestrator:
             f"## 各モデルの回答\n{sections}\n\n"
             "## 統合回答（あなたが作成）"
         )
-        try:
-            result = subprocess.run(
-                ["ollama", "run", "deepseek-r1:32b"],  # ya-ta と同モデル
-                input=prompt,
-                capture_output=True, text=True, timeout=180)
-        except subprocess.TimeoutExpired as e:
-            raise RuntimeError("cross-review 統合がタイムアウトしました（ya-ta 180s）") from e
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"cross-review 統合失敗（ollama rc={result.returncode}）: "
-                f"{result.stderr.strip()[:200]}")
-        return result.stdout
+        # ya-ta 分解脳と同モデルで統合する（モデル名の SSOT は ya-ta.yaml。直書きすると
+        # モデル入替時に取り残される — 実際に deepseek 直書きが入替 grep から漏れた前科）。
+        # HTTP API 経由（§8.4）。OllamaError は RuntimeError 派生のため、呼び出し元の
+        # 「統合失敗 → 当該ステップ failed」処理（§2.2）にそのまま乗る。
+        return run_ollama(self.config["ya-ta"]["model"], prompt,
+                          timeout=self.config["ya-ta"]["llm_timeout_sec"],
+                          host=self.config["sa-ru"]["ollama_host"])
 
     async def _run_worker_pty(self, instance_id: str, cli_command: str, command: str, channel: str, model_flag: str = "", workspace: str | None = None, team_id: str | None = None, task_id: str = "", thread_ts: str | None = None) -> str:
         """対話型 worker CLI を PTY 経由で実行する汎用ラッパー呼び出し。
@@ -1116,13 +1177,15 @@ class Orchestrator:
         （team_id / channel / thread_ts / task_id）はフック stdin に乗らないため、ここで settings の
         フックコマンド引数へ焼き込む。
         """
+        # headless 運用値（フック timeout・python パス・全体上限）は sa-ru.yaml の headless
+        # ブロックを唯一の源にする（コード既定値なし。欠落は KeyError で即落とし診断位置を揃える）
         hcfg = self.config["headless"]
         # フック settings を生成（フックコマンド＝ssh mini decide_client → デーモン UDS、task 文脈を argv へ焼込）。
         settings = build_hook_settings(
             hcfg["mini_host"], hcfg["decide_client"], hcfg["decide_socket"],
             task_id=task_id, team_id=team_id, channel=channel, thread_ts=thread_ts,
-            instance_id=instance_id, timeout_sec=hcfg.get("hook_timeout_sec", 310),
-            python_bin=hcfg.get("python_bin", "/opt/taka-ma-env/bin/python3"))
+            instance_id=instance_id, timeout_sec=hcfg["hook_timeout_sec"],
+            python_bin=hcfg["python_bin"])
         # settings を MBP 上の workspace に書き込む（_push_task_context と同じ ssh の cat > 方式）。
         # claude -p --settings がこのファイルを読んでフックを有効化する。
         settings_path = f"{workspace}/.taka-hook-settings.json"
@@ -1134,7 +1197,7 @@ class Orchestrator:
         runner = WorkerHeadlessRunner(
             instance_id, command=cli_command, model_flag=model_flag,
             ssh_host=self._mbp_host, cwd=workspace, hook_settings_path=settings_path)
-        result = await runner.run(command, timeout=hcfg.get("run_timeout_sec", 1800))
+        result = await runner.run(command, timeout=hcfg["run_timeout_sec"])
         return result.text
 
     # ── /exam_gw ドライラン結果フォーマット ──
@@ -1214,13 +1277,16 @@ class Orchestrator:
 
     # ── ユーティリティ ──
 
-    async def _update_status(self, path: str, status: str, result: str = None):
+    async def _update_status(self, path: str, status: str, result: str = None) -> str:
         """タスクファイルの status を更新する。completed/failed はアーカイブ。
         in_progress / completed / failed 遷移時に qu-e へタスクコンテキストを push する（§8.13）。
 
         qu-e への push は SSH（同期・接続タイムアウトまで待つ）を含むため、イベントループを
         凍結させないよう to_thread で別スレッド実行する（§10.7）。ファイル I/O は高速なローカル
         操作のためそのまま行う。
+
+        戻り値はタスクファイルの最終所在（アーカイブ後は done/{日付}/ 配下）。完了・失敗
+        通知に「結果の正本ファイルパス」を併記するために使う（§8.9）。
         """
         with open(path) as f:
             task = json.load(f)
@@ -1241,10 +1307,13 @@ class Orchestrator:
             today = datetime.date.today().isoformat()
             done_dir = f"{self.task_dir}/done/{today}"
             os.makedirs(done_dir, exist_ok=True)
-            shutil.move(path, os.path.join(done_dir, os.path.basename(path)))
+            dest = os.path.join(done_dir, os.path.basename(path))
+            shutil.move(path, dest)
+            return dest
+        return path
 
     def _workspace_for(self, task_id: str) -> str:
-        """タスク専用の作業ディレクトリ（MBP 上）。
+        """タスク専用の作業ディレクトリ（MBP 上）の既定値。
 
         各タスクは `{workspace_base}/{task_id}` で実行され、qu-e はこの接頭辞で
         file_audit の変更パスを task_id に帰属させる（§8.13）。
@@ -1252,15 +1321,27 @@ class Orchestrator:
         base = self.config["task_context"].get("workspace_base", "/opt/taka-ma/work")
         return f"{base}/{task_id}"
 
+    def _resolve_workspace(self, task: dict) -> str:
+        """タスクの作業ディレクトリ（MBP 上）を解決する（§8.13 workspace の決定）。
+
+        `repo:` で実開発リポジトリが明示指定されていればその絶対パス（会話側で検証済み・
+        queue_item = {**task, ...} で伝播）、無ければ既定の `{workspace_base}/{task_id}`。
+        """
+        return task.get("workspace") or self._workspace_for(task["task_id"])
+
     def _push_task_context(self, task: dict):
         """タスクコンテキストを qu-e に SSH push する（§8.13）。
 
         in_progress / completed / failed の各遷移で同じ payload 形式で push し、
         受信側（qu-e）が status を見て保持・整理する。
+        in_progress では同一 SSH コマンド内で先に workspace を mkdir し、qu-e が
+        この push を受けて動的監視（§8.12）を登録する時点でのディレクトリ存在を
+        順序として保証する（新規 clone 運用ではこの空ディレクトリへ worker が clone する）。
         SSH push 失敗時はログ記録のみで継続（task 処理は止めない）。
         """
         remote_dir = self.config["task_context"]["remote_dir"]
         task_id = task["task_id"]
+        workspace = self._resolve_workspace(task)
         payload = json.dumps({
             "task_id": task_id,
             "command": task["command"],
@@ -1268,11 +1349,13 @@ class Orchestrator:
             "team_id": task.get("team_id", ""),          # §8.3: file_audit アラートの応答先WS特定用
             "thread_ts": task.get("thread_ts"),          # §8.12: 実行中タスクへの file_audit アラートを同一スレッドへ Thread 返信させる
             "status": task["status"],
-            "workspace": self._workspace_for(task_id),   # §8.13: パス→task_id 帰属用
+            "workspace": workspace,                      # §8.13: パス→task_id 帰属・動的監視の登録先
         }, ensure_ascii=False)
+        mkdir_ws = (f"mkdir -p {shlex.quote(workspace)} && "
+                    if task["status"] == "in_progress" else "")
         try:
             self.process_mgr.run_ssh_command(
-                f"mkdir -p {remote_dir} && cat > {remote_dir}/{task_id}.json",
+                f"{mkdir_ws}mkdir -p {remote_dir} && cat > {remote_dir}/{task_id}.json",
                 stdin_text=payload)
         except Exception:
             logger.exception("task_context push 失敗: task_id=%s", task_id)

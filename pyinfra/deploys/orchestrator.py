@@ -21,10 +21,22 @@ HOME = os.path.expanduser("~")
 # モデルは component="models" で記録（ollama rm は host グローバルで
 # コンポーネント属性は撤去に無関係。複数 deploy が同一モデルを宣言しても
 # upsert で 1 レコードに集約され、重複撤去を避ける）。
-_model = yaml.safe_load(Path("src/orchestrator/config/sa-ru.yaml").read_text())["sa-ru"]["model"]
+_sa_ru_conf = yaml.safe_load(Path("src/orchestrator/config/sa-ru.yaml").read_text())["sa-ru"]
+_model = _sa_ru_conf["model"]
 server.shell(commands=[f"ollama pull {_model}"])
 record("models", f"ollama pull {_model}", _model,
        {"op": "ollama.rm", "model": _model})
+
+# Step 1b: num_ctx を焼き込む（ai_gateway deploy と同機構・冪等）
+# WHY: 焼込が無いと ollama はモデル上限（256K）で常駐し KV キャッシュが膨張する
+#      （gemma4:12b 実測: CONTEXT 262144 で常駐 9.6GB）。会話は直近 20 ターンに丸めるため
+#      32K で十分。値は sa-ru.yaml の num_ctx を単一ソースとして参照する。
+_num_ctx = _sa_ru_conf["num_ctx"]
+server.shell(commands=[
+    f"M=$(mktemp -d)/Modelfile; "
+    f"printf 'FROM {_model}\\nPARAMETER num_ctx {_num_ctx}\\n' > \"$M\"; "
+    f"ollama create {_model} -f \"$M\"; rm -f \"$M\"",
+])
 
 # Step 2: ソースコードの配置
 files.directory(path="/opt/taka-ma/sa-ru", present=True)

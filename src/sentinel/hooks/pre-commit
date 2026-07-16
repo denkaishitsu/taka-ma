@@ -1,0 +1,23 @@
+#!/bin/sh
+# taka-ma qu-e コミット前監査ゲート（設計書 §8.12 コミット前ゲート）。
+# qu-e（DynamicWatchManager）が動的監視対象の git リポジトリへ自動配置する。
+# staged diff を qu-e LLM が審査し、approve のみコミット続行（exit 0）。
+# deny / escalate / 判定不能は中断（exit 1、fail-closed）。
+
+QUE_HOME="/opt/taka-ma/qu-e"
+PYTHON="/opt/taka-ma-env/bin/python"
+CLI="$QUE_HOME/sentinel/commit_audit_cli.py"
+
+# 監査基盤が無い（taka-ma アンインストール後等）場合は警告して素通しする。
+# ユーザーのリポジトリのコミットを恒久ブロックしない（§8.12「基盤不在時」）。
+# 基盤が存在する環境での判定不能（ollama 不達等）は CLI 側が fail-closed で中断する。
+if [ ! -x "$PYTHON" ] || [ ! -f "$CLI" ]; then
+    echo "[qu-e] 監査基盤が見つかりません。コミット監査をスキップして続行します" >&2
+    exit 0
+fi
+
+repo_root="$(git rev-parse --show-toplevel)" || exit 1
+
+# config/qu-e.yaml を相対参照するため QUE_HOME を cwd にして実行（review_cli と同じ規約）
+cd "$QUE_HOME" || exit 1
+PYTHONPATH="$QUE_HOME" exec "$PYTHON" "$CLI" --repo "$repo_root"

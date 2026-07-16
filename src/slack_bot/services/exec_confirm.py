@@ -21,7 +21,7 @@ def resolve_exec_confirm(exec_request_id: str, decision: str, *, decided_by: str
 
     decision: "confirmed"（着手）/ "rejected"（やり直す）。
     Returns: 更新できれば True。レコード不在・status が pending でない場合は False
-      （二重押下や期限切れの取りこぼしを安全側に倒す）。
+      （二重押下の取りこぼしを安全側に倒す。pending に期限はない — §8.10b）。
     """
     path = os.path.join(EXEC_CONFIRM_DIR, f"{exec_request_id}.json")
     if not os.path.exists(path):

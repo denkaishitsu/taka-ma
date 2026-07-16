@@ -32,8 +32,9 @@ logger = logging.getLogger("sa-ru.tier3")
 # 同一ディレクトリを共有する（共有 FS、§8.3 と同経路）。デプロイ間で 1 つの環境変数
 # `TAKA_MA_APPROVAL_DIR` を両プロセスに与えれば供給元を 1 つにできる（パス直書きの SSOT 化）。
 APPROVAL_DIR = os.environ.get("TAKA_MA_APPROVAL_DIR", "/opt/taka-ma/data/approvals")
-POLL_INTERVAL = 1        # 秒（§8.10: 承認待ち中のみ 1 秒ポーリング）
-TIMEOUT_SECONDS = 300    # 5 分（§8.10 タイムアウト）
+# タイムアウト（§8.10: 5 分）とポーリング間隔（§8.10: 承認待ち中のみ 1 秒）は
+# sa-ru.yaml の approval.tier3_timeout_sec / approval.poll_interval_sec を唯一の源にする
+# （ApprovalPipeline が構築時に注入。コード側に既定値を置かない＝供給元の二重化を防ぐ）。
 
 # 承認ファイル status の契約値（§8.10）。u-zu(approval_store.py) は別ツリーに配備され
 # import 共有できないため、両側が**同じ文字列**を使う規約。定数化で各プロセス内のタイプミスを
@@ -50,16 +51,23 @@ TERMINAL_DECISIONS = (STATUS_APPROVED, STATUS_REJECTED)
 class Tier3Handler:
     """High Risk: 人間承認（Slack 経由・ファイルベース cross-process）。"""
 
-    def __init__(self, slack_notifier, approval_dir: str = APPROVAL_DIR):
+    def __init__(self, slack_notifier, approval_dir: str = APPROVAL_DIR, *,
+                 timeout_sec: float, poll_interval_sec: float):
         """Tier 3 ハンドラを構築する。
 
         Args:
             slack_notifier: 人間へ承認リクエストを提示する通知手段。
             approval_dir: u-zu のボタン結果が書き込まれる承認ファイルの監視ディレクトリ
                 （cross-process 連携の受け渡し場所、§8.10）。
+            timeout_sec: pending のまま自動 deny へ倒すまでの上限秒（§8.10。
+                sa-ru.yaml approval.tier3_timeout_sec が唯一の源）。
+            poll_interval_sec: 承認待ち中の status ポーリング間隔秒（§8.10。
+                sa-ru.yaml approval.poll_interval_sec が唯一の源）。
         """
         self.slack_notifier = slack_notifier
         self.approval_dir = approval_dir
+        self.timeout_sec = timeout_sec
+        self.poll_interval_sec = poll_interval_sec
 
     def _generate_request_id(self) -> str:
         """承認リクエストの一意 ID（Slack ボタン value／承認ファイル名で特定）。"""
@@ -127,14 +135,15 @@ class Tier3Handler:
             self._finalize(approval_path)
             return Decision(allow=False, handler="tier3_human", reason="slack_error")
 
-        # status 変化を 1 秒間隔でポーリング（最大 5 分）。u-zu が approved / rejected に更新する。
+        # status 変化を poll_interval_sec 間隔でポーリング（最大 timeout_sec。いずれも
+        # sa-ru.yaml approval が唯一の源）。u-zu が approved / rejected に更新する。
         # decide_deadline（デーモンの外側タイムアウト締切）があるときは、その内側に収める。
-        # 前段（リスク分類・qu-e 審査）の消費時間で残余が 300 秒を割っても、Tier3 が外側より
-        # 先に timeout を確定させ、監査記録・done/ 退避・timeout 理由を必ず残す（V11 の包含）。
-        budget = TIMEOUT_SECONDS
+        # 前段（リスク分類・qu-e 審査）の消費時間で残余が timeout_sec を割っても、Tier3 が
+        # 外側より先に timeout を確定させ、監査記録・done/ 退避・timeout 理由を必ず残す（V11 の包含）。
+        budget = self.timeout_sec
         dl = ctx.get("decide_deadline")
         if dl is not None:
-            budget = max(0, min(TIMEOUT_SECONDS, int(dl - time.monotonic())))
+            budget = max(0, min(self.timeout_sec, int(dl - time.monotonic())))
         decision = await self._poll_decision(approval_path, budget)
         if decision is None:
             # ポーリングが時間切れ。ただし最後の読取と本処理の間に u-zu が決定を書く競合があるため、
@@ -161,19 +170,18 @@ class Tier3Handler:
             # 決定済みの承認ファイルは done/ へ退避（履歴保持＋ディレクトリ肥大防止）。
             self._finalize(approval_path)
 
-    async def _poll_decision(self, approval_path: str,
-                             budget: int = TIMEOUT_SECONDS) -> str | None:
-        """承認ファイルの status を 1 秒間隔で読み、approved / rejected を検知して返す。
+    async def _poll_decision(self, approval_path: str, budget: float) -> str | None:
+        """承認ファイルの status を poll_interval_sec 間隔で読み、approved / rejected を検知して返す。
 
-        budget 秒（既定 5 分・decide_deadline があれば残余に切詰め）以内に決まらなければ
+        budget 秒（tier3_timeout_sec・decide_deadline があれば残余に切詰め）以内に決まらなければ
         None（タイムアウト）。ファイル読取は同期 I/O のため、event loop を塞がないよう
         to_thread でワーカスレッドに逃がす（共有 FS で遅延しても他のコルーチン＝
         dispatcher/worker を止めない）。
         """
         elapsed = 0
         while elapsed < budget:
-            await asyncio.sleep(POLL_INTERVAL)
-            elapsed += POLL_INTERVAL
+            await asyncio.sleep(self.poll_interval_sec)
+            elapsed += self.poll_interval_sec
             status = await asyncio.to_thread(self._read_status, approval_path)
             if status in TERMINAL_DECISIONS:
                 return status

@@ -20,12 +20,20 @@ import datetime
 import json
 import logging
 import os
+import re
+import threading
 import time
 import uuid
 from pathlib import Path
 
 from ai_gateway.classifier import InvalidModelError
-from ai_gateway.llm import extract_json, run_ollama
+from ai_gateway.llm import (
+    GenerationProgress,
+    OllamaConnectionError,
+    OllamaTimeoutError,
+    extract_json,
+    run_ollama,
+)
 from orchestrator.file_queue import atomic_write_json
 
 logger = logging.getLogger("sa-ru.conversation")
@@ -35,12 +43,29 @@ PROMPTS_DIR = Path(__file__).parent / "prompts"
 # 脳 LLM へ渡す会話履歴の最大ターン数（プロンプト肥大と KV キャッシュ膨張を防ぐ）。
 MAX_HISTORY_TURNS = 20
 
+# 会話へ還流するタスク結果の最大文字数。会話文脈用の要約であり、全文は結果ファイル
+# （併記パス）が正本のため切っても情報は失われない（設計書 §8.9「会話への還流」）。
+RESULT_REFLOW_MAX_CHARS = 2000
+
+# `repo:` 明示指定（§8.13 実開発リポジトリ）。`:モデル名` と同じく脳 LLM の要約では
+# 消えるため、要約対象の生文から抽出する。直前が非空白（URL の `/repo:tag` 等の埋め込み）
+# のものはトークンとして扱わない（誤マッチで無関係な発話を差し戻さないため）。
+_REPO_TOKEN_RE = re.compile(r"(?<!\S)repo:(\S+)")
+# 受け付ける workspace パス。SSH コマンド文字列・worker の cwd に乗るため、
+# 絶対パス・安全文字（英数 . _ - /）のみに制限する（§8.13 repo: パスの検証、fail-closed）。
+_SAFE_WORKSPACE_RE = re.compile(r"\A/[A-Za-z0-9._/\-]+\Z")
+
+
+class InvalidWorkspaceError(ValueError):
+    """`repo:` 指定が検証を通らない（相対パス・危険文字・`..` 等）ときのエラー。"""
+
 
 class ConversationManager:
     """会話セッションの保持・脳 LLM 呼び出し・要約提示・確定タスク生成を担う。
 
-    セッション履歴は in-memory（conversation_id → ターン列）。sa-ru 再起動で会話文脈は失われるが、
-    確定済みタスク・確認レコードはファイルとして残るため実行の取りこぼしは起きない。
+    セッション履歴はターン追記のたびにディスクへ原子書込で永続化する（設計書 §8.3
+    「会話セッション履歴の永続化」）。sa-ru 再起動・TTL 経過後も次の発話時にファイルから
+    文脈を回復するため、会話の記憶を失わない。
     """
 
     def __init__(self, config, slack_notifier, task_dir: str, classifier=None):
@@ -57,8 +82,13 @@ class ConversationManager:
                 `:opus` 指定が効かないことを確認・是正）。
         """
         self.config = config
-        self.model = config["sa-ru"]["model"]              # 脳（現 qwen3:8b、将来 Gemma 4 12B）
-        self.timeout = config["sa-ru"].get("converse_timeout_sec", 120)
+        self.model = config["sa-ru"]["model"]              # 脳モデル（sa-ru.yaml が正本）
+        # 接続先・会話タイムアウトは config を唯一の源にする（設計書 §8.4。コード既定値なし）
+        self.ollama_host = config["sa-ru"]["ollama_host"]
+        self.timeout = config["sa-ru"]["converse_timeout_sec"]
+        # 会話は応答速度優先で思考を無効化できる（None=モデル既定・設計書 §8.4）。
+        # 実測: qwen3.6 の思考 1400 トークン/30 秒 → think=false で 26 トークン/0.9 秒
+        self.think = config["sa-ru"].get("llm_think")
         self.slack = slack_notifier
         self.task_dir = task_dir                            # 確定タスクの書き出し先（dispatcher が走査）
         self.classifier = classifier
@@ -66,71 +96,204 @@ class ConversationManager:
         os.makedirs(self.confirm_dir, exist_ok=True)
         # 会話プロンプトは静的なので起動時に 1 度だけ読む（毎ターンの disk I/O を避ける）
         self._prompt_template = (PROMPTS_DIR / "converse.md").read_text()
-        # 一定時間使われない会話を捨てる TTL（常駐プロセスでの session 無制限増加を防ぐ）
-        self.session_ttl_sec = config.get("conversation", {}).get("session_ttl_sec", 3600)
+        # TTL はセッションの「メモリからのアンロード」期限。永続化ファイルは残るため
+        # TTL 経過・再起動後も次の発話時に文脈を回復できる（設計書 §8.3 永続化）。
+        # sa-ru.yaml を唯一の供給元とする（コード既定値なし。sessions_dir と流儀を揃える）
+        self.session_ttl_sec = config["conversation"]["session_ttl_sec"]
+        # セッション永続化の保存先（conversation_id 単位の JSON・原子書込）。
+        # sa-ru.yaml を唯一の供給元とする（コード側に既定値を置くと供給元が二重になる）
+        self.sessions_dir = config["conversation"]["sessions_dir"]
+        os.makedirs(self.sessions_dir, exist_ok=True)
         # conversation_id → [{"role": "user"|"assistant", "text": str}, ...]
         self.sessions: dict[str, list[dict]] = {}
         # conversation_id → 最終アクセス時刻（monotonic 秒）。エビクション判定に使う
         self._last_seen: dict[str, float] = {}
+        # セッション辞書の排他。会話処理は to_thread（別スレッド）、タスク結果の還流
+        # （append_task_result）はイベントループ側スレッドから呼ばれ、同一セッションを
+        # 同時に触り得るため（設計書 §8.9「会話への還流」）
+        self._sessions_lock = threading.Lock()
+
+    # ── セッション永続化（設計書 §8.3「会話セッション履歴の永続化」） ──
+
+    def _session_path(self, cid: str) -> str:
+        """conversation_id をファイル名安全な形にして永続化パスを返す。"""
+        return os.path.join(self.sessions_dir, re.sub(r"[^0-9A-Za-z._-]", "_", cid) + ".json")
+
+    def _load_or_create_session(self, cid: str) -> list[dict]:
+        """メモリ上のセッションを返す。無ければ永続化ファイルから回復し、それも無ければ新規。
+
+        呼び出し側で _sessions_lock を保持していること。
+        """
+        history = self.sessions.get(cid)
+        if history is not None:
+            return history
+        path = self._session_path(cid)
+        history = []
+        if os.path.exists(path):
+            try:
+                with open(path) as f:
+                    history = json.load(f).get("turns", [])
+            except (OSError, json.JSONDecodeError, AttributeError):
+                # 壊れた永続化ファイルで会話全体を止めない。新規セッションとして進める
+                logger.exception("会話セッションの読込失敗（新規で継続）: %s", path)
+                history = []
+        self.sessions[cid] = history
+        return history
+
+    def _persist_session(self, cid: str, history: list[dict]):
+        """セッションを原子書込で永続化する。失敗しても会話処理本体は止めない。"""
+        try:
+            atomic_write_json(self._session_path(cid), {
+                "conversation_id": cid,
+                "turns": history,
+                "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            })
+        except OSError:
+            logger.exception("会話セッションの永続化失敗（メモリ上は継続）: %s", cid)
 
     # ── 会話処理（会話ループから to_thread で呼ばれる：脳 LLM は同期ブロック） ──
 
+    @staticmethod
+    def parse_workspace(text: str) -> tuple[str, str | None]:
+        """生文から `repo:<絶対パス>` を抽出し、(除去後テキスト, workspace|None) を返す。
+
+        `:モデル名` 指定（classifier.parse_model）より先に呼ぶこと。`repo:/path` の
+        `:/path` 部分が parse_model の `:(\\S+)` に誤マッチして未登録モデル扱いになるため、
+        先に取り除く必要がある。検証（§8.13 repo: パスの検証）に通らない指定は
+        InvalidWorkspaceError で着手前に差し戻す（fail-closed）。
+        """
+        matches = _REPO_TOKEN_RE.findall(text)
+        if not matches:
+            return text, None
+        if len(set(matches)) > 1:
+            raise InvalidWorkspaceError("repo: 指定が複数あります。1 つにしてください")
+        workspace = matches[0].rstrip("/")
+        if workspace.startswith("~"):
+            raise InvalidWorkspaceError(
+                "repo: は絶対パスで指定してください（~ は使えません。"
+                "例: repo:/Users/<user>/DevDev/xxx）")
+        if not _SAFE_WORKSPACE_RE.match(workspace) or ".." in workspace.split("/"):
+            raise InvalidWorkspaceError(
+                "repo: のパスが不正です（絶対パス・英数と . _ - / のみ・.. 不可）")
+        clean = _REPO_TOKEN_RE.sub("", text).strip()
+        return clean, workspace
+
     def _evict_idle_sessions(self, now: float):
-        """TTL を超えて使われていない会話セッションを破棄する（メモリ無制限増加の防止）。"""
+        """TTL を超えて使われていないセッションをメモリからアンロードする。
+
+        永続化ファイルは削除しない（時間経過で記憶を失わない・設計書 §8.3）。
+        """
         stale = [c for c, seen in self._last_seen.items() if now - seen > self.session_ttl_sec]
         for c in stale:
             self.sessions.pop(c, None)
             self._last_seen.pop(c, None)
 
-    def handle_message(self, msg: dict):
-        """1 件の発話を処理する。会話継続なら返信、意図が固まれば着手確認を提示する。"""
+    def handle_message(self, msg: dict, progress: GenerationProgress | None = None):
+        """1 件の発話を処理する。会話継続なら返信、意図が固まれば着手確認を提示する。
+
+        progress はハートビート進捗通知（§10.8）へ生成トークン数を届ける共有ホルダー
+        （呼び出し元 _run_with_heartbeat が渡す）。
+        """
         cid = msg["conversation_id"]
-        # 脳 LLM 呼び出し開始のタイミングを可視化する（投稿受信〜着手確認提示の所要時間を
+        # 脳 LLM 呼び出し開始のタイミングを可視化する(投稿受信〜着手確認提示の所要時間を
         # 計測できるようにする。実運用フィードバックを受けて追加）。
         logger.info("会話メッセージ処理開始: conversation_id=%s", cid)
         now = time.monotonic()
-        self._evict_idle_sessions(now)
-        self._last_seen[cid] = now
-        history = self.sessions.setdefault(cid, [])
-        history.append({"role": "user", "text": msg["text"]})
-        # 履歴は直近 MAX_HISTORY_TURNS に丸める（プロンプト肥大・KV キャッシュ膨張防止）
-        if len(history) > MAX_HISTORY_TURNS:
-            del history[:-MAX_HISTORY_TURNS]
+        with self._sessions_lock:
+            self._evict_idle_sessions(now)
+            self._last_seen[cid] = now
+            history = self._load_or_create_session(cid)
+            history.append({"role": "user", "text": msg["text"]})
+            # 履歴は直近 MAX_HISTORY_TURNS に丸める（プロンプト肥大・KV キャッシュ膨張防止）
+            if len(history) > MAX_HISTORY_TURNS:
+                del history[:-MAX_HISTORY_TURNS]
+            self._persist_session(cid, history)
+            # 脳 LLM 呼び出し（数十秒）中はロックを持たない。以降 history はこのターンの
+            # スナップショットとして扱い、追記時に再ロックする
+            history_snapshot = list(history)
 
         if msg.get("force_ready"):
             # /taka-ma-go: LLM 判定を待たず要約させて強制的に締める
-            result = self._invoke_llm(history, force=True)
+            result = self._invoke_llm(history_snapshot, force=True, progress=progress)
             result["ready"] = True
         else:
-            result = self._invoke_llm(history, force=False)
+            result = self._invoke_llm(history_snapshot, force=False, progress=progress)
 
         if result.get("ready") and result.get("summary"):
             summary = result["summary"]
-            history.append({"role": "assistant", "text": summary})
-            # `:opus` 等の明示モデル指定は要約（脳 LLM の言い換え）には残らないため、
-            # 要約対象の生文から直接抽出する（設計書「ユーザーモデル指定」）。
+            self._append_turn(cid, "assistant", summary)
+            # `repo:` 実開発リポジトリ指定と `:opus` 等の明示モデル指定は要約（脳 LLM の
+            # 言い換え）には残らないため、要約対象の生文から直接抽出する（§8.13 /
+            # 設計書「ユーザーモデル指定」）。repo: を先に除去しないと `:/path` が
+            # parse_model に未登録モデルとして誤検出される。
+            try:
+                text_wo_repo, workspace = self.parse_workspace(msg["text"])
+            except InvalidWorkspaceError as e:
+                self.slack.notify(
+                    str(e), msg.get("channel_id"),
+                    team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
+                return
             models: list[str] = []
             if self.classifier is not None:
                 try:
-                    _, models = self.classifier.parse_model(msg["text"])
+                    _, models = self.classifier.parse_model(text_wo_repo)
                 except InvalidModelError as e:
                     self.slack.notify(
                         str(e), msg.get("channel_id"),
                         team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
                     return
-            self._present_summary(msg, summary, models)
+            self._present_summary(msg, summary, models, workspace)
         else:
             reply = result.get("reply") or "（応答を生成できませんでした。もう一度お願いします）"
-            history.append({"role": "assistant", "text": reply})
+            # エラー由来の返信（タイムアウト・接続失敗等）はシステムメッセージであり会話では
+            # ないため履歴に残さない。残すと後続ターンで脳がエラー文言を会話文脈として
+            # オウム返しする（実機で再現・2026-07-14）。
+            if not result.get("error"):
+                self._append_turn(cid, "assistant", reply)
             self.slack.notify(
                 reply, msg.get("channel_id"),
                 team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
 
-    def _invoke_llm(self, history: list[dict], force: bool) -> dict:
+    def _append_turn(self, cid: str, role: str, text: str):
+        """セッションへ 1 ターン追記し、丸め・永続化まで行う（排他付き）。"""
+        with self._sessions_lock:
+            history = self._load_or_create_session(cid)
+            history.append({"role": role, "text": text})
+            if len(history) > MAX_HISTORY_TURNS:
+                del history[:-MAX_HISTORY_TURNS]
+            self._persist_session(cid, history)
+
+    def append_task_result(self, task: dict, result_text: str, result_path: str):
+        """タスク完了結果を発生元の会話セッションへ assistant ターンとして還流する。
+
+        設計書 §8.9「会話への還流」。これにより完了後の後続質問（「さっきの回答はどこ」等)
+        に会話脳が文脈として答えられる。conversation_id はタスクの team/channel/thread から
+        復元する（u-zu の採番規則 §8.3: thread_ts が無い DM 等は user_id）。
+        """
+        tail = task.get("thread_ts") or task.get("user_id") or ""
+        if not tail:
+            return  # 会話由来でないタスク（file_audit 等）は還流先セッションを持たない
+        # u-zu の derive_conversation_id と同一規則で復元する（別パッケージ・別配備のため
+        # import 共有はできず、空要素の '-' 置換まで含めて式を一致させる。ズレると還流が
+        # 実セッションに届かず新規セッションへ落ちる）
+        cid = f"{task.get('team_id') or '-'}:{task.get('channel_id') or '-'}:{tail}"
+        summary = result_text[:RESULT_REFLOW_MAX_CHARS]
+        if len(result_text) > RESULT_REFLOW_MAX_CHARS:
+            summary += "\n…（以降略）"
+        self._append_turn(
+            cid, "assistant",
+            f"（タスク実行完了。結果の要約は以下、全文は結果ファイル {result_path} にあります）\n{summary}")
+
+    def _invoke_llm(self, history: list[dict], force: bool,
+                    progress: GenerationProgress | None = None) -> dict:
         """脳 LLM（sa-ru.model）を呼び、{reply, ready, summary} を返す。
 
         パース失敗時は会話継続（ready=false）にフォールバックし、素の stdout を返信に回す
         （安全側: 解釈できない出力で勝手に実行へ進めない）。force=True は要約を促す指示を足す。
+
+        失敗は原因別に扱う（設計書 §8.3 エラーハンドリング）: タイムアウト・接続失敗は
+        1 回リトライし、それでも失敗したら原因を明示した文言を返信に回す。原因不明の
+        包括表現（「内部エラー」）は使わない。
         """
         history_text = "\n".join(
             f"{'ユーザー' if t['role'] == 'user' else 'sa-ru'}: {t['text']}" for t in history
@@ -146,10 +309,19 @@ class ConversationManager:
 
         stdout = None
         try:
-            stdout = run_ollama(self.model, prompt, timeout=self.timeout)
-            # gemma4:12b は json.loads が失敗する ```json フェンス付きで出力することがある
-            # （実機検証で再現・2026-07-04）。ai_gateway 側 classifier/decomposer と同じ
-            # extract_json でフェンス除去してからパースする（同根の欠陥・§9.2 と同一パターン）。
+            try:
+                stdout = run_ollama(self.model, prompt, timeout=self.timeout,
+                                    host=self.ollama_host, think=self.think,
+                                    progress=progress)
+            except (OllamaTimeoutError, OllamaConnectionError) as first_err:
+                # 一過性（モデルロード直後の混雑・ollama 再起動中等）を 1 回だけ吸収する
+                logger.warning("会話 LLM 呼び出し失敗（リトライ 1 回目）: %s", first_err)
+                stdout = run_ollama(self.model, prompt, timeout=self.timeout,
+                                    host=self.ollama_host, think=self.think,
+                                    progress=progress)
+            # 脳モデルは json.loads が失敗する ```json フェンス付きで出力することがある
+            # （gemma4:12b の実機検証で再現・2026-07-04）。ai_gateway 側 classifier/decomposer
+            # と同じ extract_json でフェンス除去してからパースする（同根の欠陥・§9.2 と同一パターン）。
             parsed = json.loads(extract_json(stdout))
             return {
                 "reply": parsed.get("reply", ""),
@@ -159,15 +331,35 @@ class ConversationManager:
         except json.JSONDecodeError:
             # JSON 化できない出力は会話継続に回す（解釈できない出力で実行へ進めない）
             return {"reply": (stdout or "").strip(), "ready": False, "summary": None}
-        except Exception:
-            logger.exception("会話 LLM 呼び出し失敗")
-            return {"reply": "（内部エラーが発生しました）", "ready": False, "summary": None}
+        except OllamaTimeoutError:
+            logger.exception("会話 LLM がタイムアウト（リトライ含め 2 回失敗）")
+            return {
+                "reply": (
+                    f"応答の生成が {self.timeout} 秒の上限を超えました（会話モデル {self.model}）。"
+                    "少し時間を置いて再度お送りください。"),
+                "ready": False, "summary": None, "error": True,
+            }
+        except OllamaConnectionError as e:
+            logger.exception("会話 LLM へ接続失敗（リトライ含め 2 回失敗）")
+            return {
+                "reply": f"ローカル LLM（ollama）へ接続できませんでした: {e}",
+                "ready": False, "summary": None, "error": True,
+            }
+        except Exception as e:
+            # 想定外も原因を明示する（原因不明の包括表現は使わない・設計書 §8.3）
+            logger.exception("会話 LLM 呼び出しで想定外の失敗")
+            return {
+                "reply": f"応答を生成できませんでした（{type(e).__name__}: {e}）",
+                "ready": False, "summary": None, "error": True,
+            }
 
-    def _present_summary(self, msg: dict, summary: str, models: list[str] | None = None):
+    def _present_summary(self, msg: dict, summary: str, models: list[str] | None = None,
+                         workspace: str | None = None):
         """着手確認レコード（status=pending）を作り、要約 + ボタンを Slack に提示する。
 
         models: `:opus` 等で明示指定されたモデル名（handle_message が生文から抽出済み）。
-        確定タスク生成（create_exec_task）まで運ぶため record に保持する。
+        workspace: `repo:` で明示指定された実開発リポジトリの絶対パス（§8.13。検証済み）。
+        いずれも確定タスク生成（create_exec_task）まで運ぶため record に保持する。
         """
         exec_request_id = str(uuid.uuid4())
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -181,6 +373,7 @@ class ConversationManager:
             "channel_id": msg.get("channel_id", ""),
             "thread_ts": msg.get("thread_ts"),
             "model_override": models or [],
+            "workspace": workspace,
             "created_at": now,
             "decided_at": None,
             "decided_by": None,
@@ -223,6 +416,10 @@ class ConversationManager:
             "created_at": now,
             "updated_at": now,
         }
+        # `repo:` 実開発リポジトリ指定（§8.13）。指定時のみキーを持たせ、dispatcher の
+        # queue_item = {**task, ...} 伝播と _resolve_workspace が workspace を解決する
+        if record.get("workspace"):
+            task["workspace"] = record["workspace"]
         os.makedirs(self.task_dir, exist_ok=True)
         ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S%f")
         path = os.path.join(self.task_dir, f"{ts}_{task_id}.json")
@@ -238,12 +435,5 @@ class ConversationManager:
         """やり直し選択時。実行はせず会話継続を促す（履歴は維持される）。"""
         self.slack.notify(
             "やり直します。続けて指示してください。",
-            record.get("channel_id"), team_id=record.get("team_id"),
-            thread_ts=record.get("thread_ts"))
-
-    def notify_timeout(self, record: dict):
-        """着手確認が期限切れ。実行はせず、必要なら締め直しを促す。"""
-        self.slack.notify(
-            "着手確認がタイムアウトしました。続ける場合はもう一度指示してください。",
             record.get("channel_id"), team_id=record.get("team_id"),
             thread_ts=record.get("thread_ts"))

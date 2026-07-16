@@ -1,39 +1,169 @@
 """ローカル ollama 呼び出しの共通口。
 
 sa-ru プロセス内の複数箇所（ya-ta の分解・分類・リスク判定・会話フロントエンド等）が
-`ollama run <model>` を同じ形で叩くため、呼び出しを 1 箇所に集約する
-（timeout・フラグの調整漏れ・実装ぶれを防ぐ）。
+同じ形でローカル LLM を叩くため、呼び出しを 1 箇所に集約する
+（timeout・パラメータの調整漏れ・実装ぶれを防ぐ）。
 
-DeepSeek-R1 等の推論モデルは既定で思考過程（Thinking...）と端末制御コード（word-wrap
-の再描画 ANSI）を stdout に混ぜるため、--hidethinking（思考は内部で行い出力には出さない＝
-判定品質は維持）と --nowordwrap（ANSI 混入の抑止）を常時付与する。これで残るのは
-本文（多くは json フェンス付き）だけになる。JSON 抽出は extract_json を使う。
+呼び出しは `ollama run` の subprocess 起動ではなく **HTTP API（/api/generate）** を使う
+（設計書 §8.4「ollama 呼び出し方式」）。subprocess 方式は呼び出しごとに CLI が起動し、
+keep_alive を制御できずモデルのロード・プロンプト全量評価を毎回払うため、会話履歴が
+伸びるほど毎ターン遅くなる欠陥があった（実運用実測: 会話 1 ターン中央値 44 秒）。
+HTTP API では keep_alive でモデルを常駐させ、同一プレフィックスの KV キャッシュ再利用が
+効き、接続失敗と生成タイムアウトを例外として区別できる。
+
+応答は stream=true（NDJSON 逐次受信）で受ける（設計書 §8.4「ollama 実行失敗の検知」）。
+逐次受信するのは、生成中のトークン数を GenerationProgress へ記録し、ハートビート進捗通知
+（§10.8）から読めるようにするため。timeout は deadline 方式で接続〜生成完了の全体に適用する
+（チャンクが届き続けていても全体の壁時計で打ち切る）。
+
+思考系モデルの思考過程は API では `response`（本文）と分離して返るため、CLI 時代の
+--hidethinking / --nowordwrap 相当の抑止は不要（ANSI 混入も TTY 非経由のため起きない）。
+JSON 抽出は従来どおり extract_json を使う。
 """
 
+import http.client
 import json
+import logging
 import re
-import subprocess
+import time
+import urllib.parse
+
+logger = logging.getLogger("sa-ru.llm")
+
+# モデルを常駐させ続ける（Mac mini は sa-ru/ya-ta 専用機であり、アンロードして
+# 空けたメモリの使い道がない。ロード往復の排除を優先する。設計書 §8.4）。
+# 数値で渡すこと: ollama API の keep_alive は数値（秒・負=無期限）か単位付き文字列
+# （"-1m" 等）のみ受理し、単位なし文字列 "-1" はパース不能でリクエストごと拒否される
+KEEP_ALIVE = -1
 
 
-def run_ollama(model: str, prompt: str, timeout: int) -> str:
-    """`ollama run <model>` に prompt を stdin で渡し、stdout（生テキスト）を返す。
+class OllamaError(RuntimeError):
+    """ollama 呼び出しの失敗（基底）。従来 RuntimeError を捕捉していた呼び出し側の
+    安全側フォールバック（設計書 §8.4）がそのまま機能するよう RuntimeError を継承する。"""
 
-    思考表示・word-wrap ANSI を抑止する。例外（TimeoutExpired 等）は握りつぶさず送出する。
-    ollama が非ゼロ終了した場合（未起動・モデル未 pull 等）は、空・部分的な stdout を
-    正常な生成結果として返さず、stderr を添えて RuntimeError を送出する。呼び出し側は
-    これをパースエラーと同列に扱い、用途別の安全側フォールバックへ落とす（設計書 §8.4）。
+
+class OllamaTimeoutError(OllamaError):
+    """生成がタイムアウトした（モデルは応答中だったが制限秒数を超えた）。"""
+
+
+class OllamaConnectionError(OllamaError):
+    """ollama へ接続できない・応答が異常（未起動・モデル未 pull・HTTP エラー・ストリーム不正）。"""
+
+
+class GenerationProgress:
+    """生成進捗の共有ホルダー（設計書 §10.8）。
+
+    生成スレッド（run_ollama）が受信チャンクごとに tokens を進め、ハートビート側の
+    別スレッドが読む。int 属性の更新・参照のみ（CPython の GIL 下で不可分）のためロックは
+    持たない。1 回の生成につき 1 個を作り使い捨てる。
     """
-    result = subprocess.run(
-        ["ollama", "run", "--hidethinking", "--nowordwrap", model],
-        input=prompt,
-        capture_output=True, text=True, timeout=timeout,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"ollama run '{model}' が失敗しました (exit {result.returncode}): "
-            f"{result.stderr.strip() or '(stderr 無し)'}"
-        )
-    return result.stdout
+
+    def __init__(self):
+        self.tokens = 0  # 生成済みトークン数（受信チャンク数≒トークン数。完了時は eval_count で確定）
+
+
+def run_ollama(model: str, prompt: str, timeout: int, host: str,
+               think: bool | None = None,
+               progress: GenerationProgress | None = None) -> str:
+    """ollama HTTP API `/api/generate`（stream=true）で prompt を生成し、本文テキストを返す。
+
+    host は `sa-ru.yaml` の `sa-ru.ollama_host`（例 "http://localhost:11434"）を呼び出し元
+    から渡す（供給元を 1 つに保つ）。
+
+    think: 思考型モデルの思考の有効/無効。None は payload に含めない（think 非対応
+    モデルとの互換・モデル既定に従う）。False は思考自体をスキップする——会話脳の
+    実測で思考が 1 ターン約 1400 トークン・所要 30 秒の支配項だったため、判定品質より
+    応答速度を優先する用途（会話）で False を渡す（設計書 §8.4。分解・分類・リスク判定は
+    ya-ta.yaml の llm_think に従う）。
+
+    timeout は deadline 方式で接続〜生成完了の全体に適用し、超過時は OllamaTimeoutError を
+    送出する（逐次受信が続いていても打ち切る。設計書 §8.4）。接続失敗・HTTP エラー応答・
+    ストリーム中のエラーチャンク／不正行は、空・部分的な出力を正常な生成結果として返さない
+    よう OllamaConnectionError を送出する。いずれも RuntimeError 派生のため、呼び出し側は
+    区別してリトライ・通知文言に反映するか、従来どおり RuntimeError として一括で安全側
+    フォールバックに落とすかを選べる。
+
+    progress を渡すと受信チャンクごとに生成トークン数を記録する（§10.8 ハートビートが読む）。
+    """
+    deadline = time.monotonic() + timeout
+    url = urllib.parse.urlsplit(host)
+    conn = http.client.HTTPConnection(url.hostname, url.port or 80, timeout=timeout)
+    try:
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "stream": True,
+            "keep_alive": KEEP_ALIVE,
+        }
+        if think is not None:
+            payload["think"] = think
+        try:
+            conn.request(
+                "POST", "/api/generate",
+                body=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            # 接続クローズ型応答では getresponse() 後に conn.sock が None になるため、
+            # deadline 適用（settimeout）用のソケット参照をここで確保する
+            sock = conn.sock
+            resp = conn.getresponse()
+        except TimeoutError as e:
+            # 接続・応答ヘッダ待ちの超過。deadline 超過と同じ契約（timeout）として送出する
+            raise OllamaTimeoutError(
+                f"ollama '{model}' への接続/応答が {timeout} 秒を超えました ({host})") from e
+        except OSError as e:
+            raise OllamaConnectionError(
+                f"ollama へ接続できません（未起動の可能性・{host}）: {e}") from e
+        if resp.status != 200:
+            detail = resp.read(2048).decode("utf-8", errors="replace")[:300]
+            raise OllamaConnectionError(
+                f"ollama '{model}' が HTTP {resp.status} を返しました: {detail.strip()}")
+
+        parts: list[str] = []
+        done_chunk: dict = {}
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise OllamaTimeoutError(
+                    f"ollama '{model}' の生成が {timeout} 秒を超えました")
+            # 各読み取りの待ちを残り時間で頭打ちにする＝生成全体への deadline 適用。
+            # 読み取り超過は socket.timeout（= TimeoutError）として送出される。
+            sock.settimeout(remaining)
+            try:
+                line = resp.readline()
+            except TimeoutError as e:
+                raise OllamaTimeoutError(
+                    f"ollama '{model}' の生成が {timeout} 秒を超えました") from e
+            if not line:
+                break  # done チャンク無しの切断。取得済み本文を返し、下流のパースに委ねる
+            try:
+                chunk = json.loads(line)
+            except json.JSONDecodeError as e:
+                # NDJSON 契約違反（プロキシ・サーバ異常等）。部分出力を正常結果として返さない
+                raise OllamaConnectionError(
+                    f"ollama ストリーム応答を解釈できません: {line[:200]!r}") from e
+            if chunk.get("error"):
+                raise OllamaConnectionError(f"ollama がエラーを返しました: {chunk['error']}")
+            piece = chunk.get("response", "")
+            parts.append(piece)
+            # 1 チャンク≒1 トークン。思考（thinking）チャンクも生成の進捗として数える
+            if progress is not None and (piece or chunk.get("thinking")):
+                progress.tokens += 1
+            if chunk.get("done"):
+                done_chunk = chunk
+                if progress is not None and chunk.get("eval_count"):
+                    progress.tokens = chunk["eval_count"]  # 実測トークン数で確定
+                break
+
+        # 所要時間の実測をログに残す（タイムアウト値・モデル入替の判断材料。設計書 §8.4
+        # 「タイムアウト値は実測の p95 に余裕を載せて config で管理する」の入力データ）
+        total_sec = done_chunk.get("total_duration", 0) / 1e9
+        logger.info(
+            "ollama 生成完了: model=%s total=%.1fs prompt_tokens=%s eval_tokens=%s",
+            model, total_sec, done_chunk.get("prompt_eval_count"), done_chunk.get("eval_count"))
+        return "".join(parts)
+    finally:
+        conn.close()
 
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)

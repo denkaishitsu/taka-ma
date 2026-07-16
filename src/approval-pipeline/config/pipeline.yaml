@@ -1,11 +1,12 @@
 # 承認パイプライン設定
 # 構築手順書: docs/procedures/08-approval-pipeline.md Step 2
 
-pipeline:
-  tier3_timeout_sec: 300
-  # コンポーネント間の通信方式
-  #   Tier 分類 → ya-ta は in-process 呼出（ya-ta はライブラリ方式）
-  #   Tier 2 → qu-e は SSH（review_cli.py を MBP で 1 ショット実行、§8.8 / NF-01）
+# Tier2/Tier3 の運用値（tier2_timeout_sec / tier3_timeout_sec / poll_interval_sec）は
+# sa-ru.yaml の approval ブロックが唯一の源（旧 pipeline.tier3_timeout_sec は未参照の
+# 二重定義だったため撤去）。
+# コンポーネント間の通信方式
+#   Tier 分類 → ya-ta は in-process 呼出（ya-ta はライブラリ方式）
+#   Tier 2 → qu-e は SSH（review_cli.py を MBP で 1 ショット実行、§8.8 / NF-01）
 
 audit:
   log_path: "/opt/taka-ma/logs/approval-audit.jsonl"

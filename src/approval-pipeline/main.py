@@ -123,10 +123,17 @@ class ApprovalPipeline:
         """
         # RiskClassifier は ya-ta を in-process 呼出（config から ya-ta モデルを参照）
         self.classifier = RiskClassifier(config)
+        # Tier2/Tier3 の運用値（審査タイムアウト・人間承認タイムアウト・ポーリング間隔）は
+        # sa-ru.yaml の approval ブロックを唯一の源にする（マージ済み config で受領。
+        # コード側に既定値を置かず、欠落は構築時に即 KeyError で落として診断位置を揃える）。
+        approval_conf = config["approval"]
         self.handlers = {
             1: Tier1Handler(),
-            2: Tier2Handler(ssh_host=ssh_host),   # qu-e は SSH（§8.8）
-            3: Tier3Handler(slack_notifier),
+            2: Tier2Handler(ssh_host=ssh_host,    # qu-e は SSH（§8.8）
+                            timeout_sec=approval_conf["tier2_timeout_sec"]),
+            3: Tier3Handler(slack_notifier,
+                            timeout_sec=approval_conf["tier3_timeout_sec"],
+                            poll_interval_sec=approval_conf["poll_interval_sec"]),
         }
 
         # pipeline.yaml（SSOT）をロードし、監査ログ出力先と安全性チェックリストを取得する（設計 §3.3 (0)/§3.4）。

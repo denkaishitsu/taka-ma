@@ -1,9 +1,19 @@
 # ya-ta 設定
 ya-ta:
-  model: "deepseek-r1:32b"    # タスク分解・分類・リスク判定に使うモデル（ollama CLI 経由）
-  num_ctx: 32768              # コンテキスト長。Mac mini 64GB の OOM 回避のため 128K→32K に縮小
-                              # （実測: 128K=常駐47GB → 32K=常駐26GB）。
-                              # ※ コードは `ollama run` 経由で num_ctx を渡さないため、実効値は
+  model: "qwen3.6:27b-q4_K_M" # タスク分解・分類・リスク判定に使うモデル（ollama HTTP API 経由）。
+                              # deepseek-r1:32b から入替（設計書 §2.2: GPQA 62.1→87.8 ほか全項目優位・
+                              # 4bit 19GB→17GB）
+  llm_timeout_sec: 300        # 分解・分類・リスク判定 1 回のタイムアウト。旧値 60 秒は正常分解の
+                              # 実測 58 秒と同水準で、正常動作でも受付失敗する際どい設定だった。
+                              # 思考型モデルは思考が長引き得るため余裕を大きく取る。実測ログ
+                              # （llm.py の total_duration INFO）が溜まったら p95 基準で見直す（§8.4）
+  llm_think: false            # 分解・分類・リスク判定の思考無効化。qwen3.6:27b は思考ありで分解
+                              # 281 秒/3352 トークン（timeout 300 秒とニアミス・旧 deepseek 58 秒
+                              # より大幅悪化）を実測。think=false の品質は分解構造の実機確認で判断
+  num_ctx: 32768              # コンテキスト長。Mac mini 64GB での sa-ru 同居のため上限（256K）で
+                              # 常駐させず 32K に制限（旧 deepseek 実測: 128K=常駐47GB → 32K=26GB。
+                              # qwen3.6:27b の実常駐は deploy 後に §7.4 ランブックで実測・記録）。
+                              # ※ コードは HTTP API で num_ctx を渡さないため、実効値は
                               #   モデル側 Modelfile の PARAMETER num_ctx 32768 に焼き込んで担保する
                               #   （構築手順書 04 §1-2 参照。初期投入時に PyInfra が自動焼込）。
 

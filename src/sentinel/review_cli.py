@@ -15,7 +15,7 @@ import json
 
 import yaml
 
-from sentinel.reviewer import DEFAULT_INFERENCE_LOCK, QueReviewer
+from sentinel.reviewer import QueReviewer
 
 
 def _load_config() -> dict:
@@ -30,8 +30,10 @@ def _build_reviewer(config: dict) -> QueReviewer:
         model=config["qu-e"]["model"],
         ollama_host=config["qu-e"]["ollama_url"],
         prompts_dir=config["qu-e"]["prompts_dir"],
-        # file_audit（常駐）と同一パスを指すことで推論を跨プロセス直列化する（§4.2）
-        inference_lock=config["qu-e"].get("inference_lock", DEFAULT_INFERENCE_LOCK),
+        # file_audit（常駐）と同一パスを指すことで推論を跨プロセス直列化する（§4.2）。
+        # ロックパス・審査タイムアウトとも qu-e.yaml が唯一の源（コード既定値なし）
+        inference_lock=config["qu-e"]["inference_lock"],
+        review_timeout_sec=config["qu-e"]["review_timeout_sec"],
     )
 
 

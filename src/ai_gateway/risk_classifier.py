@@ -20,8 +20,15 @@ class RiskClassifier:
     """
 
     def __init__(self, config):
-        """ya-ta.yaml の ya-ta.model（判定に使うローカルモデル）を取り出す。"""
+        """ya-ta.yaml の ya-ta.model（判定に使うローカルモデル）と接続先 ollama を取り出す。"""
         self.model = config["ya-ta"]["model"]
+        # 接続先はマージ済み config の sa-ru.ollama_host を唯一の源にする（設計書 §8.4）
+        self.ollama_host = config["sa-ru"]["ollama_host"]
+        # タイムアウトは ya-ta.yaml を唯一の供給元とする（設計書 §8.4。コード側に既定値を
+        # 置くと供給元が二重になるため必須アクセス。欠落時は KeyError で即落とす）
+        self.llm_timeout = config["ya-ta"]["llm_timeout_sec"]
+        # 思考の有効/無効（None=モデル既定・§8.4）
+        self.llm_think = config["ya-ta"].get("llm_think")
 
     def classify(self, operation: str) -> dict:
         """操作のリスクレベルを判定する。
@@ -33,12 +40,14 @@ class RiskClassifier:
 
         try:
             # プロンプト＋対象操作を ya-ta モデルに渡し、JSON 形式の判定を得る。
-            # ollama 非ゼロ終了は run_ollama が RuntimeError を送出し、下の except で
+            # ollama 実行失敗は run_ollama が RuntimeError を送出し、下の except で
             # 安全側フォールバック（Tier 3）へ落ちる（設計書 §8.4「ollama 実行失敗の検知」）。
             stdout = run_ollama(
                 self.model,
                 f"{system_prompt}\n\n操作: {operation}",
-                timeout=60,
+                timeout=self.llm_timeout,
+                host=self.ollama_host,
+                think=self.llm_think,
             )
             # tier 欠落は判定不成立とみなし、フォールバックへ落とす
             parsed = json.loads(extract_json(stdout))

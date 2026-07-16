@@ -23,6 +23,9 @@ def _hook_command(settings: dict) -> str:
 
 
 def _build(**kwargs) -> str:
+    # timeout_sec / python_bin は #103 で yaml SSOT 化され必須引数になった（実効値と同値を渡す）
+    kwargs.setdefault("timeout_sec", 310)
+    kwargs.setdefault("python_bin", "/opt/taka-ma-env/bin/python3")
     settings = build_hook_settings(
         "mac-mini", _CLIENT, _SOCKET,
         task_id="t1", instance_id="t1-step1-opus", **kwargs)
@@ -51,7 +54,8 @@ def test_hook_command_aggregates_all_failures_to_exit2():
 
 
 def test_hook_command_uses_venv_python_by_default():
-    # 素の "python3" ではなく、存在が deploy で保証される venv バイナリを既定にする。
+    # 素の "python3" ではなく、存在が deploy で保証される venv バイナリ
+    # （sa-ru.yaml headless.python_bin の実効値）を使う。
     assert "/opt/taka-ma-env/bin/python3" in _build()
 
 
@@ -68,15 +72,17 @@ def test_hook_command_bakes_task_context_for_tier3():
 
 
 def test_hook_timeout_stays_outside_client_wait():
-    # フック timeout（既定 310 秒）はクライアント応答待ち 308 秒・Tier3 300 秒の外側。
-    settings = build_hook_settings("mac-mini", _CLIENT, _SOCKET)
+    # フック timeout（sa-ru.yaml 実効値 310 秒）はクライアント応答待ち 308 秒・Tier3 300 秒の外側。
+    settings = build_hook_settings("mac-mini", _CLIENT, _SOCKET, timeout_sec=310,
+                                   python_bin="/opt/taka-ma-env/bin/python3")
     assert settings["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"] == 310
 
 
 def test_hook_matcher_is_empty_string_for_all_tools():
     # 全ツール一致は空文字（仕様保証）。"*" が無マッチのバージョンだとフック不発＝
     # 承認ゲート無効（default 許可の read 系が素通り）になるため空文字に固定する。
-    settings = build_hook_settings("mac-mini", _CLIENT, _SOCKET)
+    settings = build_hook_settings("mac-mini", _CLIENT, _SOCKET, timeout_sec=310,
+                                   python_bin="/opt/taka-ma-env/bin/python3")
     assert settings["hooks"]["PreToolUse"][0]["matcher"] == ""
 
 

@@ -24,9 +24,15 @@ from approval_types import Decision, PendingApproval
 from interceptor import InterceptedPrompt, PromptType
 from main import ApprovalPipeline, DEFAULT_ALWAYS_DENY, DEFAULT_ALWAYS_ESCALATE, _normalize_command, _union
 
-# RiskClassifier.__init__ は config["ya-ta"]["model"] を読むだけ（ollama 実行は classify 時のみ）。
-# 本テストは classifier を FakeClassifier に差し替えるため、モデル名はダミーで足りる。
-CONFIG = {"ya-ta": {"model": "dummy-model"}}
+# RiskClassifier.__init__ は config["ya-ta"]（model / llm_timeout_sec / llm_think）と
+# config["sa-ru"]["ollama_host"] を読むだけ（ollama 実行は classify 時のみ）。本テストは
+# classifier を FakeClassifier に差し替えるため、モデル名・接続先・timeout はダミーで足りる。
+CONFIG = {"ya-ta": {"model": "dummy-model", "llm_timeout_sec": 300},
+          "sa-ru": {"ollama_host": "http://localhost:11434"},
+          # #103 yaml SSOT 化: Tier2/Tier3 運用値は sa-ru.yaml approval が唯一の源になり
+          # ApprovalPipeline 構築時の必須キーになった（実効値と同値を与える）
+          "approval": {"tier2_timeout_sec": 120, "tier3_timeout_sec": 300,
+                       "poll_interval_sec": 1}}
 
 
 class FakePTY:
@@ -110,7 +116,10 @@ def _pipeline(tier, notifier, approval_dir=None, tier2=None):
         pipeline.handlers[2] = tier2
     if approval_dir is not None:
         # Tier 3 は /opt 配下の既定ディレクトリではなく、テスト用 tmp へ承認ファイルを書かせる。
-        pipeline.handlers[3] = t3.Tier3Handler(slack_notifier=notifier, approval_dir=approval_dir)
+        # timeout/poll は構築時注入（#103）のため、旧モジュール定数の差し替えではなく
+        # ここで短縮値を渡して高速化する（実効値は 300 秒 / 1 秒）。
+        pipeline.handlers[3] = t3.Tier3Handler(slack_notifier=notifier, approval_dir=approval_dir,
+                                               timeout_sec=2.0, poll_interval_sec=0.05)
     return pipeline
 
 
@@ -185,7 +194,8 @@ def test_interactive_undeterminable_escalates_to_human():
             await asyncio.sleep(0.1)
             request_id = notifier.sent["request_id"]
             path = os.path.join(approval_dir, f"{request_id}.json")
-            t3.Tier3Handler(slack_notifier=notifier, approval_dir=approval_dir)._mark_status(
+            t3.Tier3Handler(slack_notifier=notifier, approval_dir=approval_dir,
+                            timeout_sec=2.0, poll_interval_sec=0.05)._mark_status(
                 path, t3.STATUS_APPROVED)
         res, _ = await asyncio.gather(
             pipeline.process(prompt, pty, "test-undet", team_id="T1", channel="C1"),
@@ -193,12 +203,7 @@ def test_interactive_undeterminable_escalates_to_human():
         )
         return res
 
-    orig_poll, orig_to = t3.POLL_INTERVAL, t3.TIMEOUT_SECONDS
-    t3.POLL_INTERVAL, t3.TIMEOUT_SECONDS = 0.05, 2.0
-    try:
-        result = asyncio.run(scenario())
-    finally:
-        t3.POLL_INTERVAL, t3.TIMEOUT_SECONDS = orig_poll, orig_to
+    result = asyncio.run(scenario())
 
     assert result.handler == "tier3_human"              # 判定不能 → 人間承認へ直行
     assert notifier.sent is not None                    # Slack 承認リクエストが飛ぶ
@@ -232,7 +237,8 @@ def test_tier3_dangerous_command_escalates_to_human():
             await asyncio.sleep(0.1)
             request_id = notifier.sent["request_id"]
             path = os.path.join(approval_dir, f"{request_id}.json")
-            t3.Tier3Handler(slack_notifier=notifier, approval_dir=approval_dir)._mark_status(
+            t3.Tier3Handler(slack_notifier=notifier, approval_dir=approval_dir,
+                            timeout_sec=2.0, poll_interval_sec=0.05)._mark_status(
                 path, t3.STATUS_APPROVED)
         res, _ = await asyncio.gather(
             pipeline.process(prompt, pty, "test-3", team_id="T1", channel="C1"),
@@ -240,13 +246,8 @@ def test_tier3_dangerous_command_escalates_to_human():
         )
         return res
 
-    # ポーリング間隔とタイムアウトを縮めて高速化（既定は 1 秒 / 5 分）。
-    orig_poll, orig_to = t3.POLL_INTERVAL, t3.TIMEOUT_SECONDS
-    t3.POLL_INTERVAL, t3.TIMEOUT_SECONDS = 0.05, 2.0
-    try:
-        result = asyncio.run(scenario())
-    finally:
-        t3.POLL_INTERVAL, t3.TIMEOUT_SECONDS = orig_poll, orig_to
+    # ポーリング間隔とタイムアウトは _pipeline が構築時に短縮値を注入済み（#103 で注入式に変更）。
+    result = asyncio.run(scenario())
 
     assert result.handler == "tier3_human"              # Tier 3（人間承認）へ振り分けられた
     assert notifier.sent is not None                    # Slack 承認リクエストが送信された
@@ -303,7 +304,8 @@ def test_safety_always_escalate_routes_to_human():
             await asyncio.sleep(0.1)
             request_id = notifier.sent["request_id"]
             path = os.path.join(approval_dir, f"{request_id}.json")
-            t3.Tier3Handler(slack_notifier=notifier, approval_dir=approval_dir)._mark_status(
+            t3.Tier3Handler(slack_notifier=notifier, approval_dir=approval_dir,
+                            timeout_sec=2.0, poll_interval_sec=0.05)._mark_status(
                 path, t3.STATUS_APPROVED)
         res, _ = await asyncio.gather(
             pipeline.process(prompt, pty, "test-esc", team_id="T1", channel="C1"),
@@ -311,12 +313,7 @@ def test_safety_always_escalate_routes_to_human():
         )
         return res
 
-    orig_poll, orig_to = t3.POLL_INTERVAL, t3.TIMEOUT_SECONDS
-    t3.POLL_INTERVAL, t3.TIMEOUT_SECONDS = 0.05, 2.0
-    try:
-        result = asyncio.run(scenario())
-    finally:
-        t3.POLL_INTERVAL, t3.TIMEOUT_SECONDS = orig_poll, orig_to
+    result = asyncio.run(scenario())
 
     assert result.handler == "tier3_human"              # 安全性チェック → Tier 3 へ直行
     assert notifier.sent is not None                    # 人間へ承認リクエスト送信

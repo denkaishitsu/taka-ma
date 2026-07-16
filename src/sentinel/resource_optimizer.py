@@ -22,12 +22,14 @@ class ResourceOptimizer:
             config: resource_optimization セクション。max_heavy_instances（上限）と
                 scale_down / scale_up のメモリ使用率しきい値（パーセント）を持つ。
         """
+        # 3 値とも qu-e.yaml の resource_optimization ブロックを唯一の源にする
+        # （コード既定値なし。欠落は起動時に KeyError で即落とし診断位置を揃える）。
         # heavy worker 並行数の上限（権威値。sa-ru はこの範囲内で推奨値を受け取る）
-        self.max_instances = config.get("max_heavy_instances", 3)
+        self.max_instances = config["max_heavy_instances"]
         # この使用率以上なら並行数を 2 段下げる（逼迫時の積極的な縮退）
-        self.scale_down_threshold = config.get("scale_down_memory_threshold", 85)
+        self.scale_down_threshold = config["scale_down_memory_threshold"]
         # この使用率以上なら並行数を 1 段下げる（余裕が減ってきた段階の控えめな縮退）
-        self.scale_up_threshold = config.get("scale_up_memory_threshold", 60)
+        self.scale_up_threshold = config["scale_up_memory_threshold"]
 
     def recommended_heavy_instances(self) -> int:
         """現在のメモリ使用率に基づき推奨 heavy worker 並行数を返す。

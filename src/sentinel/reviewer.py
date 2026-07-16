@@ -12,11 +12,11 @@ import re
 
 import httpx
 
-# qu-e 単一モデルへの推論を直列化するためのプロセス間ロック（§4.2 推論の直列化）。
-# file_audit（常駐プロセス）と Tier2 審査（review_cli の 1 ショット・別プロセス）が同一
-# ollama モデルを同時に叩くと相互に遅延し双方が timeout→escalate に倒れるため、両プロセスが
-# 同一パスを flock して 1 件ずつに直列化する。config 未指定時の既定。
-DEFAULT_INFERENCE_LOCK = "/opt/taka-ma/data/qu-e-inference.lock"
+# qu-e 単一モデルへの推論の直列化（§4.2）: file_audit（常駐プロセス）と Tier2 審査
+# （review_cli の 1 ショット・別プロセス）が同一 ollama モデルを同時に叩くと相互に遅延し
+# 双方が timeout→escalate に倒れるため、両プロセスが同一パスを flock して 1 件ずつに
+# 直列化する。ロックパスは qu-e.yaml の qu-e.inference_lock が唯一の源
+# （旧 DEFAULT_INFERENCE_LOCK 定数は yaml と二重定義だったため撤去）。
 
 # qu-e のローカル LLM（Qwen3.6-35B-A3B、thinking モデル）は応答本文を ```json フェンスで
 # 包むことがある（実機検証で "rm -rf /" 審査時に再現・是正、非決定的＝プロンプトにより
@@ -93,7 +93,7 @@ class QueReviewer:
     """
 
     def __init__(self, model: str, ollama_host: str, prompts_dir: str,
-                 inference_lock: str = DEFAULT_INFERENCE_LOCK):
+                 inference_lock: str, *, review_timeout_sec: float):
         """レビューアを構築する。
 
         Args:
@@ -104,10 +104,13 @@ class QueReviewer:
             inference_lock: 推論直列化のプロセス間ロックファイルパス（§4.2）。file_audit と
                 Tier2 の両プロセスで同一パスを指すことで、同一 ollama モデルへの同時推論を
                 1 件ずつに直列化する。
+            review_timeout_sec: 審査 LLM（ollama HTTP）1 回の応答待ち上限秒
+                （qu-e.yaml の qu-e.review_timeout_sec が唯一の源。コード側に既定値なし）。
         """
         self.model = model
         self.ollama_url = ollama_host
         self._inference_lock = inference_lock
+        self._review_timeout_sec = review_timeout_sec
         # ロックファイルの親ディレクトリを用意（初回 open で失敗しないように）。
         # ベア名（ディレクトリ成分なし）だと dirname="" で makedirs が FileNotFoundError に
         # なるため、その場合はカレント（"."）に倒す。
@@ -202,8 +205,9 @@ Respond in JSON:
         §4.2 推論の直列化: 同一 ollama モデルへの推論を、file_audit（常駐）と Tier2
         （review_cli の別プロセス）の間で 1 件ずつに直列化する。プロセス間 flock を
         取得してから HTTP を投げる。flock 取得（＝キュー待ち）はブロッキングのため
-        `to_thread` で別スレッドに逃がし、イベントループを止めない。タイムアウト（60s）は
-        ロック取得後に投げる HTTP に付くため、待ち時間を含まない実行開始起点で計測される。
+        `to_thread` で別スレッドに逃がし、イベントループを止めない。タイムアウト
+        （review_timeout_sec）はロック取得後に投げる HTTP に付くため、待ち時間を含まない
+        実行開始起点で計測される。
         """
         lock_fd = await asyncio.to_thread(self._acquire_inference_lock)
         try:
@@ -211,7 +215,7 @@ Respond in JSON:
                 resp = await client.post(
                     f"{self.ollama_url}/api/generate",
                     json={"model": self.model, "prompt": prompt, "stream": False},
-                    timeout=60,
+                    timeout=self._review_timeout_sec,
                 )
                 # HTTP エラー応答（5xx 等）は "response" キーを欠くことがあり、そのまま
                 # ["response"] すると KeyError で判定不能を握り潰す経路に落ちる。ここで

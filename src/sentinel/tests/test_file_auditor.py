@@ -14,19 +14,24 @@ from file_auditor import FileAuditHandler
 
 
 def _handler(tmp, *, ignore_patterns=None, control_plane_files=None, task_context_dir=None):
-    """最小 config で FileAuditHandler を組む（reviewer は使わないメソッドのみ検証）。"""
+    """最小 config で FileAuditHandler を組む（reviewer は使わないメソッドのみ検証）。
+
+    #103 yaml SSOT 化で control_plane_files / task_context.dir も必須キーになったため、
+    未指定時は qu-e.yaml の実効値と同値（制御ファイル名）／どのテストパスとも交差しない
+    dir を与える（旧コード既定値と同じ振る舞いを保つ）。
+    """
     fa = {
         "ignore_patterns": ignore_patterns if ignore_patterns is not None else [],
         "log_dir": os.path.join(tmp, "logs"),
         "o_moi_alert_dir": os.path.join(tmp, "alerts"),
         "mac_mini_host": "mac-mini",
         "debounce_sec": 1,
+        "control_plane_files": (control_plane_files if control_plane_files is not None
+                                else [".taka-hook-settings.json"]),
     }
-    if control_plane_files is not None:
-        fa["control_plane_files"] = control_plane_files
-    config = {"file_audit": fa}
-    if task_context_dir is not None:
-        config["task_context"] = {"dir": task_context_dir}
+    config = {"file_audit": fa,
+              "task_context": {"dir": (task_context_dir if task_context_dir is not None
+                                       else os.path.join(tmp, "task-context"))}}
     loop = asyncio.new_event_loop()
     try:
         return FileAuditHandler(config, reviewer=None, task_context_store={}, loop=loop)

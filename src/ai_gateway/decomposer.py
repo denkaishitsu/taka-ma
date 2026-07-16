@@ -7,7 +7,7 @@
 import json
 from pathlib import Path
 
-from ai_gateway.llm import extract_json, run_ollama
+from ai_gateway.llm import GenerationProgress, extract_json, run_ollama
 from ai_gateway.logger import YaTaLogger
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
@@ -22,17 +22,26 @@ class TaskDecomposer:
     """
 
     def __init__(self, config):
-        """分解に使うモデル・登録済みモデル一覧・判定ロガーを用意する。"""
-        # ya-ta.yaml の ya-ta.model を使用（現在: deepseek-r1:32b）
+        """分解に使うモデル・接続先 ollama・登録済みモデル一覧・判定ロガーを用意する。"""
+        # ya-ta.yaml の ya-ta.model を使用（モデル名の SSOT は ya-ta.yaml）
         self.model = config["ya-ta"]["model"]
+        # 接続先はマージ済み config の sa-ru.ollama_host を唯一の源にする（設計書 §8.4）
+        self.ollama_host = config["sa-ru"]["ollama_host"]
+        # タイムアウトは ya-ta.yaml を唯一の供給元とする（設計書 §8.4。コード側に既定値を
+        # 置くと供給元が二重になるため必須アクセス。欠落時は KeyError で即落とす）
+        self.llm_timeout = config["ya-ta"]["llm_timeout_sec"]
+        # 思考の有効/無効（None=モデル既定。qwen3.6 は思考が分解 281 秒の支配項・§8.4）
+        self.llm_think = config["ya-ta"].get("llm_think")
         self.valid_models = set(config.get("models", {}).keys())
         # 判定ログ。decompose は live の正規分類経路であり、ここで記録しないと
         # 判定ログは production に 1 件も残らない（設計書 §8.4.1 / Phase 2 の基盤）。
         self.logger = YaTaLogger()
 
-    def decompose(self, command: str) -> list[dict]:
+    def decompose(self, command: str,
+                  progress: GenerationProgress | None = None) -> list[dict]:
         """ユーザー指示をサブタスクに分解する。
         フォールバック: JSONパースエラー時は元の指示を1件の heavy として返す。
+        progress はハートビート進捗通知（§10.8）へ生成トークン数を届ける共有ホルダー。
         """
         # 分解プロンプトを組み立てる: 分解規則のテンプレートにカテゴリ定義を差し込む
         with open(PROMPTS_DIR / "categories.md") as f:
@@ -42,12 +51,15 @@ class TaskDecomposer:
 
         try:
             # プロンプト＋ユーザー指示をローカル ollama（ya-ta モデル）に渡しサブタスク JSON を得る。
-            # ollama 非ゼロ終了は run_ollama が RuntimeError を送出し、下の except で
+            # ollama 実行失敗は run_ollama が RuntimeError を送出し、下の except で
             # 安全側フォールバックへ落ちる（設計書 §8.4「ollama 実行失敗の検知」）。
             stdout = run_ollama(
                 self.model,
                 f"{system_prompt}\n\nユーザー指示: {command}",
-                timeout=60,
+                timeout=self.llm_timeout,
+                host=self.ollama_host,
+                think=self.llm_think,
+                progress=progress,
             )
             subtasks = json.loads(extract_json(stdout))
             # 構造検証: 「サブタスクの配列」でなければフォールバックへ（設計書 §8.4）

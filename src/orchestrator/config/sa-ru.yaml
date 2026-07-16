@@ -1,20 +1,35 @@
 # sa-ru 本体 — TaskClassifier / RiskClassifier / ConversationManager が参照
 sa-ru:
-  model: "gemma4:12b"                  # 脳モデル（stdout文脈抽出 + 人間とのマルチモーダル会話フロントエンド）
+  model: "qwen3.6:35b-a3b-q4_K_M"      # 脳モデル（会話フロントエンド＋stdout文脈抽出。テキスト＋画像 vision）。
+                                       # gemma4:12b から入替（設計書 §2.1: 隠れ思考＋23tok/s が会話遅延の
+                                       # 支配項と実測特定。MoE アクティブ3B で生成高速化）
+  num_ctx: 32768                       # コンテキスト長。既定だとモデル上限 256K で常駐し KV が膨張するため
+                                       # 32K に制限（gemma4 実測: 262144 常駐で 9.6GB。会話は直近20ターン
+                                       # 丸めのため 32K で十分）。deploy が Modelfile へ焼込（ya-ta と同機構）
+  llm_think: false                     # 会話は応答速度優先で思考を無効化（実測: 思考ありは 1400 トークン/
+                                       # 30 秒、think=false で 26 トークン/0.9 秒。判定品質が要る分解・
+                                       # リスク判定側は思考維持＝ya-ta.yaml には置かない）
   ollama_host: "http://localhost:11434" # ollama API エンドポイント（Mac mini localhost）
-  converse_timeout_sec: 120            # 会話 LLM（ollama run）1 ターンのタイムアウト
+  converse_timeout_sec: 120            # 会話 LLM（ollama HTTP API）1 ターンのタイムアウト。実測 p95 に余裕を
+                                       # 載せて調整する（設計書 §8.4。HTTP API 化・モデル入替後に実測で見直す）
+
+# LLM 処理待ちのハートビート進捗通知（§10.8）— Orchestrator._run_with_heartbeat が参照
+heartbeat:
+  interval_sec: 30  # 進捗通知（経過秒＋生成トークン数）を同スレッドへ返す間隔。コード側に既定値なし（SSOT）
 
 # 会話フロントエンド — ConversationManager / _conversation_loop が参照
 conversation:
   dir: "/opt/taka-ma/data/conversations"  # u-zu が発話を書き込む会話キュー（sa-ru が走査）
   poll_interval_sec: 2                    # 未処理発話がないときのポーリング間隔
-  session_ttl_sec: 3600                   # 会話セッションを保持する上限秒。超過した未使用会話は破棄（メモリ増加防止）
+  session_ttl_sec: 3600                   # セッションをメモリに保持する上限秒。超過した未使用会話はメモリから
+                                          # アンロード（永続化ファイルは残り、次の発話で回復。設計書 §8.3）
+  sessions_dir: "/opt/taka-ma/data/conversations/sessions"  # セッション永続化の保存先（原子書込）
 
 # 着手確認ゲート（§8.3 (B)）— _exec_confirmation_loop が参照
+# pending に期限は設けない（§8.10b。人間がボタンで決着させるまで待つ）
 exec_confirm:
   dir: "/opt/taka-ma/data/exec-confirmations"  # 着手確認レコードの読み書き先（u-zu がボタンで status 更新）
   poll_interval_sec: 2                          # 確認決着のポーリング間隔
-  timeout_sec: 300                              # pending のまま放置された確認の自動 timeout（§8.10 と同方針）
 
 # 制御コマンド受信（§8.10c）— _control_loop が参照
 control:
@@ -46,9 +61,11 @@ task_queue:
   dir: "/opt/taka-ma/data/tasks"  # Slack Bot がタスクファイルを作成するディレクトリ
   poll_interval_sec: 5            # 未処理タスクがないときのポーリング間隔
 
-# 承認パイプライン — Tier 3 ハンドラが参照
+# 承認パイプライン — ApprovalPipeline が構築時に Tier2/Tier3 ハンドラへ注入（コード側に既定値なし）
 approval:
-  dir: "/opt/taka-ma/data/approvals"  # 承認ファイルの読み書き先
+  dir: "/opt/taka-ma/data/approvals"  # 承認ファイルの読み書き先（u-zu と共有。実配線は環境変数
+                                      # TAKA_MA_APPROVAL_DIR — 別ツリー配備の u-zu と供給元を揃えるため）
+  tier2_timeout_sec: 120              # qu-e 審査（SSH + review_cli 1 ショット）の応答待ち上限（秒）
   tier3_timeout_sec: 300              # Slack 承認リクエストのタイムアウト（秒）
   poll_interval_sec: 1                # 承認待ち中のポーリング間隔
 

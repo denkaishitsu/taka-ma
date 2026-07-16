@@ -34,18 +34,18 @@ hosts:
 roles:
   ya-ta:                       # タスク分解・分類・リスク判定（ya-ta 分解脳）
     host: mac-mini
-    model: deepseek-r1:32b
-    context: 32768             # num_ctx を 32K に縮小（Modelfile PARAMETER で焼込・OOM 回避）
-    weights_gb: 19             # Q4_K_M 重み（ollama 実測）
-    kv_gb: 7                   # KV 実測（常駐 26 − 重み 19）
-    size_gb: 26                # 実常駐（重み+KV、容量判定に使用）
-  sa-ru:                       # オーケストレーション（stdout 文脈抽出）+ 人間とのマルチモーダル会話
+    model: qwen3.6:27b-q4_K_M
+    context: 32768             # num_ctx 32K（Modelfile PARAMETER で焼込・OOM 回避。ollama ps CONTEXT で確認）
+    weights_gb: 17             # Q4_K_M 重み（mac-mini ollama list 実測 2026-07-14）
+    kv_gb: 0                   # KV 実測（常駐 17 − 重み 17。ollama ps 表示粒度では KV 増分検出されず）
+    size_gb: 17                # 実常駐 実測（重み+KV、容量判定に使用。mac-mini `ollama ps` 2026-07-14）
+  sa-ru:                       # オーケストレーション（stdout 文脈抽出）+ 人間とのテキスト/画像会話
     host: mac-mini
-    model: gemma4:12b
-    context: 40960             # 既定 num_ctx
-    weights_gb: 7.6            # Q4_K_M 重み（mac-mini ollama 0.30.10 pull blob 実測 2026-06-20）
-    kv_gb: 1.1                 # KV 実測（常駐 8.7 − 重み 7.6。num_ctx=40960・q8_0・flash-attn）
-    size_gb: 8.7              # 実常駐 実測（重み+KV、容量判定に使用。mac-mini `ollama ps` 2026-06-20）
+    model: qwen3.6:35b-a3b-q4_K_M
+    context: 32768             # num_ctx 32K（Modelfile PARAMETER で焼込。既定 262K だと KV 膨張のため制限）
+    weights_gb: 23             # Q4_K_M 重み（mac-mini ollama list 実測 2026-07-14。MoE 35B総 / active 3B）
+    kv_gb: 0                   # KV 実測（常駐 23 − 重み 23。ollama ps 表示粒度では KV 増分検出されず）
+    size_gb: 23                # 実常駐 実測（重み+KV、容量判定に使用。mac-mini `ollama ps` 2026-07-14）
   light:                       # 軽量タスク処理
     host: mbp
     model: gemma4:31b
