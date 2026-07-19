@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 import uuid
 from fnmatch import fnmatch
 from pathlib import Path
@@ -129,8 +130,37 @@ class FileAuditHandler(FileSystemEventHandler):
         # atomic write（tmp→本体 rename／本体削除→再作成）で delete と create/moved が対で
         # 来たとき、本体パスの「削除」アラート化を防ぐため modify に集約する。
         self._agg_event: dict[str, str] = {}
+        # workspace rotation（§8.13）が削除する subtree の抑制リスト（realpath prefix →
+        # monotonic 期限）。qu-e 自身の retention 削除は外部改変ではない自己操作であり、
+        # 監査すると終了済みタスクの大量削除イベントで escalate を量産するため、削除の
+        # 直前に登録し TTL で自然消滅させる（削除完了後も FSEvents の遅延イベントが
+        # 届き得るため即時解除にしない）。書き込みはローテーション（asyncio ループ）、
+        # 参照は watchdog ワーカースレッドだが、dict の単一キー代入/削除は GIL 下で
+        # 安全なためロックは持たない
+        self._suppressed_subtrees: dict[str, float] = {}
         # ログ出力先は起動時に作っておく（初回書き込みで失敗しないように）
         os.makedirs(self.log_dir, exist_ok=True)
+
+    def suppress_subtree(self, path: str, ttl_sec: float):
+        """path 配下のイベントを ttl_sec の間、監査対象から除外する（§8.13 workspace rotation）。
+
+        qu-e 自身が rmtree する終了済み workspace の削除イベントを外部改変と誤認して
+        escalate しないための自己操作宣言。削除の「直前」に呼ぶ（後から呼ぶと rmtree 中の
+        イベントが先に監査へ流れる）。
+        """
+        self._suppressed_subtrees[os.path.realpath(path)] = time.monotonic() + ttl_sec
+
+    def _is_suppressed(self, path: str) -> bool:
+        """path が抑制中 subtree（qu-e 自身の削除操作）配下かを判定し、期限切れは掃除する。"""
+        now = time.monotonic()
+        for prefix in list(self._suppressed_subtrees):
+            if self._suppressed_subtrees.get(prefix, 0) < now:
+                self._suppressed_subtrees.pop(prefix, None)
+                continue
+            real = os.path.realpath(path)
+            if real == prefix or real.startswith(prefix.rstrip(os.sep) + os.sep):
+                return True
+        return False
 
     def _should_ignore(self, path: str) -> bool:
         """このパスを監査対象から除外すべきか判定する。
@@ -140,6 +170,9 @@ class FileAuditHandler(FileSystemEventHandler):
         ファイル名）のいずれかがいずれかのパターンに合致したら除外する。
         `!` 否定（再包含）は「一致したパスは除外しない＝監査する」と安全側で近似する（§8.12）。
         """
+        # qu-e 自身の workspace rotation が削除中の subtree は自己操作のため監査しない
+        if self._suppressed_subtrees and self._is_suppressed(path):
+            return True
         # qu-e/sa-ru 間の内部通信ディレクトリは既知の絶対パスなので、パス prefix で厳密に
         # 除外する（ベアネーム fnmatch だと同名のユーザー成果物まで巻き込むため対象外）。
         if self.task_context_dir and (

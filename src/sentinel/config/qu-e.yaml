@@ -58,6 +58,17 @@ file_audit:
 task_context:
   dir: "/opt/taka-ma/data/task-context"             # sa-ru が SSH push する受信先（MBP）
 
+# タスク作業ディレクトリのローテーション（§8.13）— 終了済みタスクの既定 workspace
+# （{workspace_base}/{task_id}）と task_context レコードを retention 超過で削除する。
+# 判定根拠は task_context レコードの終了 status（completed/failed）＋レコード mtime。
+# repo: 明示指定の実開発リポジトリ（workspace_base 外）は実体を削除しない。
+# 起動時 + 日次に main.py が実行（file_audit の retention rotation と同じ周期）
+workspace_rotation:
+  workspace_base: "/opt/taka-ma/work"  # sa-ru.yaml task_context.workspace_base と同値（削除対象の基底）
+  retention_days: 30                   # 終了 push からの保持日数（コード側に既定値なし・SSOT）
+  suppress_ttl_sec: 120                # 削除中 subtree の file_audit 抑制時間（rmtree 中＋FSEvents
+                                       # 遅延イベントを自己操作として無視する窓。§8.12 との干渉回避）
+
 # リソース最適化（§4.2 / §8.14）— 推奨 heavy 並行数を sa-ru へ SSH push
 resource_optimization:
   max_heavy_instances: 7           # heavy worker 並行数の上限（権威値。Phase 6 実機検証で確定）

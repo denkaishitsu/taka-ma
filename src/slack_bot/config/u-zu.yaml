@@ -1,0 +1,9 @@
+# u-zu 本体 — main.py の Socket Mode 死活監視（services/socket_watchdog.py）が参照
+#
+# 運用値はこの yaml が唯一の源（SSOT）。コード側に既定値は置かない（キー欠落は起動時に失敗させ、
+# 監視なしのまま常駐する偽正常を防ぐ）。
+watchdog:
+  check_interval_sec: 60     # 死活確認の周期。pong 受信時刻を読むだけの軽い処理のため分単位で十分
+  stale_threshold_sec: 180   # pong 途絶をこの秒数超過で half-open と判定。Slack の ping は数十秒間隔の
+                             # ため、正常時にこの長さの無受信は起きない。検出遅延は最悪で
+                             # threshold + interval（既定 240 秒）

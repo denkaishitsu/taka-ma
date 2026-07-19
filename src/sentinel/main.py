@@ -6,6 +6,7 @@
 - リソース最適化通知（src/sentinel/resource_optimizer.py、設計書 §8.14）
 - task_context 受信（A1 §5 / 設計書 §8.13）
 - jsonl retention rotation（A1 §4）
+- workspace rotation（設計書 §8.13、src/sentinel/workspace_rotator.py）
 """
 
 import asyncio
@@ -26,6 +27,7 @@ from sentinel.reviewer import QueReviewer
 from sentinel.health_checker import HealthChecker
 from sentinel.resource_optimizer import ResourceOptimizer
 from sentinel.file_auditor import DynamicWatchManager, start_audit, rotate_jsonl
+from sentinel.workspace_rotator import rotate_workspaces
 
 logging.basicConfig(
     level=logging.INFO,
@@ -176,8 +178,12 @@ async def resource_notify_loop(optimizer: ResourceOptimizer, thresholds: dict,
         await asyncio.sleep(interval)
 
 
-async def daily_rotation_loop(log_dir: str, retention_days: int):
-    """日次で retention 超過の jsonl を削除（A1 §4）。"""
+async def daily_rotation_loop(log_dir: str, retention_days: int, run_workspace_rotation=None):
+    """日次で retention 超過の jsonl と終了済みタスク workspace を削除（A1 §4 / §8.13）。
+
+    workspace rotation は jsonl rotation と同じ日次周期に載せる（新規デーモン・ループを
+    増やさない）。run_workspace_rotation は main() が設定・store を束ねた閉包。
+    """
     while True:
         # 翌日 00:00 までスリープ
         now = datetime.datetime.now()
@@ -187,6 +193,11 @@ async def daily_rotation_loop(log_dir: str, retention_days: int):
             rotate_jsonl(log_dir, retention_days)
         except Exception:
             logger.exception("daily rotation 失敗")
+        if run_workspace_rotation:
+            try:
+                run_workspace_rotation()
+            except Exception:
+                logger.exception("workspace rotation 失敗")
 
 
 async def main():
@@ -269,6 +280,27 @@ async def main():
         if name.endswith(".json"):
             ctx_handler.load_file(os.path.join(ctx_dir, name))
 
+    # workspace rotation（§8.13）: 終了済みタスクの既定 workspace と task_context レコードを
+    # retention 超過で削除する。設定は qu-e.yaml workspace_rotation が唯一の源（コード既定値
+    # なし）。store（実行中 task_id）を安全弁に、削除は file_audit へ自己操作として抑制宣言
+    # してから行う（外部改変と誤認した escalate の量産防止）。
+    ws_cfg = config["workspace_rotation"]
+
+    def run_workspace_rotation():
+        rotate_workspaces(
+            ctx_dir, ws_cfg["workspace_base"], ws_cfg["retention_days"],
+            active_task_ids=set(task_context_store),
+            on_before_delete=lambda ws: audit_handler.suppress_subtree(ws, ws_cfg["suppress_ttl_sec"]),
+        )
+
+    # 起動時にも 1 回実行する（jsonl rotation と同じ流儀。日次 00:00 まで qu-e が生きて
+    # いない運用でも retention が進むようにする）。初期スキャン後に呼ぶことで store の
+    # 実行中 task_id を安全弁として使える
+    try:
+        run_workspace_rotation()
+    except Exception:
+        logger.exception("起動時 workspace rotation 失敗")
+
     stop_event = asyncio.Event()
 
     def shutdown():
@@ -284,7 +316,8 @@ async def main():
     logger.info("qu-e 起動")
 
     health_task = asyncio.create_task(health_check_loop(checker, interval))
-    rotation_task = asyncio.create_task(daily_rotation_loop(log_dir, retention_days))
+    rotation_task = asyncio.create_task(
+        daily_rotation_loop(log_dir, retention_days, run_workspace_rotation))
     resource_task = asyncio.create_task(
         resource_notify_loop(optimizer, thresholds, res_notify_dir, mac_mini_host, res_notify_interval)
     )
