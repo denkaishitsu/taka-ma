@@ -45,8 +45,10 @@ class _FakeNotifier:
     def notify(self, text, channel=None, team_id=None, thread_ts=None):
         self.notes.append({"text": text, "channel": channel, "team_id": team_id, "thread_ts": thread_ts})
 
-    def send_exec_confirm_request(self, exec_request_id, summary, channel=None, team_id=None, thread_ts=None):
-        self.notes.append({"exec_confirm": exec_request_id, "summary": summary})
+    def send_exec_confirm_request(self, exec_request_id, summary, channel=None, team_id=None,
+                                  thread_ts=None, plan_text=None):
+        self.notes.append({"exec_confirm": exec_request_id, "summary": summary,
+                           "plan_text": plan_text})
 
 
 CONFIG = {
@@ -95,7 +97,7 @@ def test_present_summary_carries_explicit_model_into_task():
 
 
 def test_present_summary_without_model_marker_leaves_model_none():
-    """`:モデル名` 指定が無ければ _model は None（既存の category_defaults フォールバックに任せる）。"""
+    """`:モデル名` 指定が無ければ _model は None（写像テーブル routing.matrix の解決に任せる）。"""
     tmp = tempfile.mkdtemp()
     mgr = _manager(tmp)
     msg = {"conversation_id": "c2", "text": "READMEを直して", "user_id": "U1",

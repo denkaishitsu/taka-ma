@@ -1,7 +1,7 @@
-"""タスク分類 — light/heavy 2値判定 + :モデル名 抽出。
+"""タスク分類 — execution × depth 2軸判定 + :モデル名 抽出。
 
 構築手順書: docs/procedures/04-ai-gateway.md Step 5（タスク分類プロンプト + TaskClassifier 実装）
-関連: 設計書 §2.2 / §8.4（meta 廃止、light/heavy 2 値）
+関連: 設計書 §2.2 / §8.4（meta 廃止、execution × depth 直交2軸）
 """
 
 import json
@@ -24,10 +24,11 @@ class InvalidModelError(Exception):
 
 
 class TaskClassifier:
-    """タスク指示を light/heavy の 2 値に分類し、明示指定モデルを抽出する（設計書 §2.2 / §8.4）。
+    """タスク指示を execution × depth の 2 軸に分類し、明示指定モデルを抽出する（設計書 §2.2 / §8.4）。
 
-    meta は廃止され分類は light/heavy の 2 値のみ。ya-ta モデルに判定させた上で、
-    信頼度の低い light は heavy に格上げして取りこぼしを防ぐ。
+    light/heavy の 1 次元 2 値を廃止。ya-ta は execution（inline/agent）と
+    depth（shallow/deep/省略）の生判定のみ返し、モデルへの写像・迷い（confidence 低）の
+    落下・昇格は orchestrator が写像テーブルで行う（関心の分離）。
     """
 
     def __init__(self, config):
@@ -83,8 +84,9 @@ class TaskClassifier:
         return clean_command, validated
 
     def classify(self, command: str) -> dict:
-        """タスクの難易度を判定する。
-        フォールバック: パースエラー時は heavy を返す（設計書 §8.4）。
+        """タスクを execution × depth の 2 軸で判定する。
+        フォールバック: パースエラー時は {execution: agent, depth: None, confidence: 0.0}
+        を返す（写像テーブル上 sonnet へ落ちる安全側。設計書 §8.4）。
         """
         # 分類プロンプトを組み立てる: カテゴリ定義と、登録モデルから生成した能力一覧を差し込む
         with open(PROMPTS_DIR / "categories.md") as f:
@@ -110,34 +112,38 @@ class TaskClassifier:
                 host=self.ollama_host,
                 think=self.llm_think,
             )
-            # category 欠落は判定不成立とみなしフォールバックへ落とす
+            # execution 欠落は判定不成立とみなしフォールバックへ落とす（写像の必須軸）
             parsed = json.loads(extract_json(stdout))
-            if "category" not in parsed:
-                raise KeyError("category missing")
+            if "execution" not in parsed:
+                raise KeyError("execution missing")
+            # depth 欠落/null は「省略」(None) に正規化する（写像テーブルの unspecified へ）
+            if parsed.get("depth") is None:
+                parsed["depth"] = None
             # confidence 欠損/null は既定 1.0 に正規化する。null のまま閾値比較すると
             # TypeError で分類が落ちるため（設計書 §8.4「confidence 欠損値の正規化」）。
             confidence = parsed.get("confidence")
             if confidence is None:
                 confidence = 1.0
-            # 判定ログ: モデルの生判定（light→heavy 強制の前）を記録。
-            # 判定ログは Phase 2（誤判定パターン抽出→分類プロンプト改善）の基盤。
+                parsed["confidence"] = confidence
+            # 判定ログ: モデルの生判定（orchestrator の写像・昇格の前）を記録。
+            # 判定ログは Phase 2（誤判定パターン抽出→分類プロンプト改善）と閾値較正の基盤。
             # ログ書き込み失敗は分類本体を壊さない。
             try:
                 self.logger.log_decision(
                     task=command,
-                    category=parsed.get("category", ""),
+                    execution=parsed.get("execution", ""),
+                    depth=parsed.get("depth"),
                     model=parsed.get("model") or "",
                     reason=parsed.get("reason", ""),
                     confidence=confidence,
                 )
             except Exception:
                 pass
-            # confidence < 0.8 の light → heavy 強制
-            if parsed.get("category") == "light" and confidence < 0.8:
-                parsed["category"] = "heavy"
+            # 生の 2 軸をそのまま返す。迷い（confidence 低）の sonnet 落下・昇格は
+            # orchestrator が写像テーブルで行う（旧 light→heavy 強制を廃止）。
             return parsed
         except (json.JSONDecodeError, KeyError, TypeError, RuntimeError):
-            # 判定不能・ollama 実行失敗なら安全側に倒して heavy 扱い
-            # （軽く見て取りこぼすより重く回す）（設計書 §8.4）
-            return {"category": "heavy", "model": None,
-                    "reason": "parse error - default to heavy", "confidence": 0.0}
+            # 判定不能・ollama 実行失敗なら安全側に倒す。execution=agent / depth 省略 /
+            # confidence 0.0 ＝ 写像テーブル上 sonnet（中位・万能）へ落ちる（設計書 §8.4）。
+            return {"execution": "agent", "depth": None, "model": None,
+                    "reason": "parse error - default to agent (sonnet)", "confidence": 0.0}

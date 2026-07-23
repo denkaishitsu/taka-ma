@@ -68,7 +68,8 @@ class ConversationManager:
     文脈を回復するため、会話の記憶を失わない。
     """
 
-    def __init__(self, config, slack_notifier, task_dir: str, classifier=None):
+    def __init__(self, config, slack_notifier, task_dir: str, classifier=None,
+                 plan_service=None):
         """会話マネージャを構築する。
 
         Args:
@@ -80,8 +81,12 @@ class ConversationManager:
                 要約対象の生文（`msg["text"]`）から先に抽出し、要約とは別経路でタスクへ伝える
                 （parse_model 自体は既存だったが呼び出し元が無く未配線だった。実機検証で
                 `:opus` 指定が効かないことを確認・是正）。
+            plan_service: 計画プレビューの生成・整形・訂正（orchestrator.plan.PlanService）。
+                意図が固まった時点でここで分解まで済ませ、計画を提示して承認を取る
+                （設計書 §8.10b 計画確認ゲート / §10.2.1 計画プレビュー契約）。
         """
         self.config = config
+        self.plan_service = plan_service
         self.model = config["sa-ru"]["model"]              # 脳モデル（sa-ru.yaml が正本）
         # 接続先・会話タイムアウトは config を唯一の源にする（設計書 §8.4。コード既定値なし）
         self.ollama_host = config["sa-ru"]["ollama_host"]
@@ -198,6 +203,13 @@ class ConversationManager:
         # 脳 LLM 呼び出し開始のタイミングを可視化する(投稿受信〜着手確認提示の所要時間を
         # 計測できるようにする。実運用フィードバックを受けて追加）。
         logger.info("会話メッセージ処理開始: conversation_id=%s", cid)
+
+        # 計画確認中（pending の確認レコードがある）なら、発話をまず「提示済みプランへの訂正」
+        # として解釈する（設計書 §8.3 訂正経路 / §10.2.1）。訂正と解釈できなければ通常の会話へ
+        # 落とす（人間がプランを捨てて話を続ける経路を塞がない）。/taka-ma-go は締め直しの
+        # 明示エスケープなので訂正解釈に回さない。
+        if not msg.get("force_ready") and self._handle_correction(msg, progress=progress):
+            return
         now = time.monotonic()
         with self._sessions_lock:
             self._evict_idle_sessions(now)
@@ -242,7 +254,7 @@ class ConversationManager:
                         str(e), msg.get("channel_id"),
                         team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
                     return
-            self._present_summary(msg, summary, models, workspace)
+            self._present_summary(msg, summary, models, workspace, progress=progress)
         else:
             reply = result.get("reply") or "（応答を生成できませんでした。もう一度お願いします）"
             # エラー由来の返信（タイムアウト・接続失敗等）はシステムメッセージであり会話では
@@ -353,20 +365,149 @@ class ConversationManager:
                 "ready": False, "summary": None, "error": True,
             }
 
+    # ── 計画プレビューの訂正（設計書 §8.10b / §10.2.1） ──
+
+    def _pending_confirm(self, msg: dict) -> tuple[str, dict] | None:
+        """提示中（pending）の確認レコードを 1 件返す。無ければ None。
+
+        照合は 2 段階（設計書 §8.10b「訂正の受け口」）:
+          1. conversation_id 完全一致 — 同じスレッド内での返信
+          2. 同一の (team_id, channel_id, user_id) — 同じ相手との同じ会話面での発話
+
+        2 を持つのは、u-zu が DM・メンションの `thread_ts` に「スレッド起点、無ければ
+        その投稿自身の ts」を入れるため、**新規投稿は毎回別の conversation_id になる**
+        ことによる（実機で確認）。1 だけだと、計画プレビューに対してユーザーがスレッド
+        ではなく普通に投稿した訂正が届かず、無言で新しい会話として扱われる。
+        誤爆（新しい依頼を訂正と誤読する）は起きにくい: 簡易記法は決定的で、自然言語は
+        ya-ta が訂正でなければ空パッチを返し通常会話へ落ちる（§10.2.1）。
+
+        done/ 等のサブディレクトリは走査しない（決着済みは訂正対象にならない）。
+        """
+        if not os.path.isdir(self.confirm_dir):
+            return None
+        cid = msg.get("conversation_id")
+        same_cid, same_channel = [], []
+        for name in os.listdir(self.confirm_dir):
+            if not name.endswith(".json"):
+                continue
+            path = os.path.join(self.confirm_dir, name)
+            try:
+                with open(path) as f:
+                    record = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue  # 壊れたレコードは確認ループ側が failed/ へ隔離する
+            if record.get("status") != "pending":
+                continue
+            entry = (record.get("created_at") or "", path, record)
+            if record.get("conversation_id") == cid:
+                same_cid.append(entry)
+            elif (record.get("team_id") == msg.get("team_id")
+                    and record.get("channel_id") == msg.get("channel_id")
+                    and record.get("user_id") == msg.get("user_id")):
+                same_channel.append(entry)
+        # 同一会話の pending が複数並存し得る（決着させず会話を続けた場合）。最新を対象にする。
+        # スレッド一致を優先し、無いときだけ同一会話面の最新へ落とす
+        found = same_cid or same_channel
+        if not found:
+            return None
+        _, path, record = max(found)
+        return path, record
+
+    def _handle_correction(self, msg: dict, progress=None) -> bool:
+        """提示済みプランへの訂正として処理できたら True を返す（会話処理はスキップ）。
+
+        簡易記法は即適用して更新後プラン全体を再提示、自然言語（音声の主経路）は適用後に
+        差分だけ返して再確認する（設計書 §10.2.1「差分エコー再確認」）。訂正の適用前に
+        レコードを読み直し、既に着手済みなら適用しない（承認されたプランと実行される
+        プランの食い違いを作らない・§8.10b）。
+        """
+        if self.plan_service is None:
+            return False
+        pending = self._pending_confirm(msg)
+        if not pending:
+            return False
+        path, record = pending
+        plan = record.get("plan")
+        if not plan:
+            return False  # プレビュー無しで提示された確認（分解失敗時の縮退）は訂正対象外
+        updated, echo, route = self.plan_service.correct(plan, msg["text"], progress=progress)
+        if route is None:
+            return False  # 訂正ではない → 通常の会話処理へ
+
+        # 適用直前に読み直す（訂正の解釈中に「着手」が押されている可能性がある）
+        try:
+            with open(path) as f:
+                latest = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            latest = None
+        if not latest or latest.get("status") != "pending":
+            self.slack.notify(
+                "この計画は既に決着済みです（訂正は反映していません）。",
+                msg.get("channel_id"), team_id=msg.get("team_id"),
+                thread_ts=msg.get("thread_ts"))
+            return True
+
+        latest["plan"] = updated
+        # 返信先を「最後に人が話しかけてきた場所」へ更新する。訂正は提示スレッド外
+        # （新規 DM 投稿）からも受けるため（上の _pending_confirm）、元の場所に固定したままだと
+        # 着手後の実行通知だけが人の居ないスレッドへ流れる。channel が取れる時のみ更新する
+        if msg.get("channel_id"):
+            latest["team_id"] = msg.get("team_id", latest.get("team_id", ""))
+            latest["channel_id"] = msg["channel_id"]
+            latest["thread_ts"] = msg.get("thread_ts")
+        atomic_write_json(path, latest)
+        logger.info("計画訂正を適用: id=%s route=%s changes=%d",
+                    latest.get("exec_request_id"), route, len(echo))
+
+        if route == "simple":
+            body = self.plan_service.render(updated)
+            if echo:
+                body += "\n\n【変更】\n" + "\n".join(echo)
+            else:
+                body += "\n\n（変更はありませんでした）"
+        else:
+            # 自然言語・音声は取り違え（sonnet ↔ opus 等）を 1 往復で捕捉するため差分のみ返す
+            body = "【変更】\n" + "\n".join(echo)
+        # 更新後の計画は着手ボタン付きで再提示する。訂正を重ねると最初の提示メッセージが
+        # 上へ流れ、押すべきボタンを探させることになるため（§8.10b）。exec_request_id は
+        # 変えないので、どのメッセージのボタンを押しても同じ確認レコードを決着させる
+        self.slack.send_plan_update(
+            latest["exec_request_id"], body,
+            channel=msg.get("channel_id"), team_id=msg.get("team_id"),
+            thread_ts=msg.get("thread_ts"))
+        return True
+
+    def _build_plan(self, summary: str, progress=None) -> list[dict] | None:
+        """確定要約を分解して計画プレビュー用のサブタスク列を返す（失敗時は None）。
+
+        分解失敗（想定外の例外）でゲート自体を落とさない。None のときはプレビュー無しで
+        従来どおり要約のみを提示し、分解は dispatcher 側で行われる（縮退動作）。
+        """
+        if self.plan_service is None:
+            return None
+        try:
+            return self.plan_service.build(summary, progress=progress)
+        except Exception:
+            logger.exception("計画プレビューの分解に失敗（要約のみで提示）")
+            return None
+
     def _present_summary(self, msg: dict, summary: str, models: list[str] | None = None,
-                         workspace: str | None = None):
-        """着手確認レコード（status=pending）を作り、要約 + ボタンを Slack に提示する。
+                         workspace: str | None = None, progress=None):
+        """計画確認レコード（status=pending）を作り、要約 + 計画 + ボタンを Slack に提示する。
 
         models: `:opus` 等で明示指定されたモデル名（handle_message が生文から抽出済み）。
         workspace: `repo:` で明示指定された実開発リポジトリの絶対パス（§8.13。検証済み）。
         いずれも確定タスク生成（create_exec_task）まで運ぶため record に保持する。
+        分解はここで済ませ、承認されたプランを凍結して実行へ渡す（§8.10b。dispatcher は再分解しない）。
         """
         exec_request_id = str(uuid.uuid4())
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        plan = self._build_plan(summary, progress=progress)
         record = {
             "exec_request_id": exec_request_id,
             "conversation_id": msg["conversation_id"],
             "summary": summary,
+            "plan": plan,
             "status": "pending",
             "user_id": msg.get("user_id", ""),
             "team_id": msg.get("team_id", ""),
@@ -384,11 +525,14 @@ class ConversationManager:
 
         # 着手確認提示のタイミングを可視化する（従来はログが無く、発話受信〜要約提示の
         # 所要時間が計測不能だった。実運用フィードバックを受けて追加）。
-        logger.info("着手確認提示: id=%s conversation_id=%s", exec_request_id, msg["conversation_id"])
+        logger.info("計画確認提示: id=%s conversation_id=%s subtasks=%s",
+                    exec_request_id, msg["conversation_id"],
+                    len(plan) if plan else 0)
+        plan_text = self.plan_service.render(plan) if (plan and self.plan_service) else None
         self.slack.send_exec_confirm_request(
             exec_request_id, summary,
             channel=msg.get("channel_id"), team_id=msg.get("team_id"),
-            thread_ts=msg.get("thread_ts"))
+            thread_ts=msg.get("thread_ts"), plan_text=plan_text)
 
     # ── 着手確認の決着（確認ループから呼ばれる） ──
 
@@ -420,6 +564,10 @@ class ConversationManager:
         # queue_item = {**task, ...} 伝播と _resolve_workspace が workspace を解決する
         if record.get("workspace"):
             task["workspace"] = record["workspace"]
+        # 承認された計画（訂正の上書き反映済み）を凍結して渡す。dispatcher は _plan があれば
+        # 再分解しない（提示した計画と実際に走る計画を一致させる・設計書 §10.2「凍結プランの実行」）
+        if record.get("plan"):
+            task["_plan"] = record["plan"]
         os.makedirs(self.task_dir, exist_ok=True)
         ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S%f")
         path = os.path.join(self.task_dir, f"{ts}_{task_id}.json")

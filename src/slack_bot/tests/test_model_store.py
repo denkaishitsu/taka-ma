@@ -116,9 +116,10 @@ def test_comments_and_other_sections_preserved(yata_file):
     assert "OOM" in text or "num_ctx" in text
     # 外部サービス追加例（suno）のコメントブロック
     assert "suno" in text
-    # 他トップレベルセクションが値ごと保持されている
+    # 他トップレベルセクションが値ごと保持されている（Task #126: routing.matrix 構造）
     data = yaml.safe_load(text)
-    assert data["routing"]["category_defaults"]["heavy"][0] == "opus"
+    assert data["routing"]["matrix"]["agent"]["deep"]["high"] == "opus"
+    assert data["routing"]["confidence_threshold"] == 0.8
     assert data["concurrency"]["max_heavy_instances"] == 3
     assert data["ya-ta"]["num_ctx"] == 32768
 

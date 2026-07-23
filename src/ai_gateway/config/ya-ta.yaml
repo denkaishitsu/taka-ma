@@ -7,6 +7,11 @@ ya-ta:
                               # 実測 58 秒と同水準で、正常動作でも受付失敗する際どい設定だった。
                               # 思考型モデルは思考が長引き得るため余裕を大きく取る。実測ログ
                               # （llm.py の total_duration INFO）が溜まったら p95 基準で見直す（§8.4）
+  correction_timeout_sec: 60  # 計画プレビューの自然言語訂正（PlanCorrector）1 回のタイムアウト。
+                              # 分解より短くするのは、訂正解釈が会話の応答を塞ぐ位置に在るため
+                              # （計画確認中の発話は訂正解釈 → 通常会話の順に流れる。設計書 §10.2.1）。
+                              # ya-ta が詰まったときに llm_timeout_sec（300 秒）まで会話が無応答に
+                              # なるのを避け、打ち切って通常会話へ落とす
   llm_think: false            # 分解・分類・リスク判定の思考無効化。qwen3.6:27b は思考ありで分解
                               # 281 秒/3352 トークン（timeout 300 秒とニアミス・旧 deepseek 58 秒
                               # より大幅悪化）を実測。think=false の品質は分解構造の実機確認で判断
@@ -17,15 +22,37 @@ ya-ta:
                               #   モデル側 Modelfile の PARAMETER num_ctx 32768 に焼き込んで担保する
                               #   （構築手順書 04 §1-2 参照。初期投入時に PyInfra が自動焼込）。
 
-# カテゴリ別デフォルトモデル — category 判定後、model 指定がない場合に使用
-# 配列は優先度順（[0] がデフォルト、[1] 以降は障害時のフォールバック先）
+# ルーティング写像（light/heavy 2値 → execution × depth 直交2軸）
+# ya-ta は execution/depth/confidence の生判定のみ返し、モデルへの写像は orchestrator が
+# 本テーブルを唯一の源として行う（ya-ta はモデル名を決めない＝関心の分離）。
 routing:
-  category_defaults:
-    light:
-      - gemma         # 優先度 1（デフォルト）
-    heavy:
-      - opus          # 優先度 1（デフォルト）
-      - gemini        # 優先度 2（フォールバック先）
+  # confidence がこの値未満なら「迷い」とみなし matrix の low 側（sonnet）へ落とす。
+  # 暫定値。判定ログ（YaTaLogger）の実データで較正する（設計書 §2.2「閾値・rubric は実データで較正」）
+  confidence_threshold: 0.8
+
+  # execution × depth × confidence → モデル（設計書 §2.2 写像テーブル）
+  #   high = confidence >= confidence_threshold, low = confidence < threshold
+  #   depth 省略時は unspecified を用いる（agent のみ）。inline は depth 不問
+  matrix:
+    inline:
+      high: gemma       # ローカル純生成で完結
+      low: haiku        # 生成だが迷い → 安価な API で確実に
+    agent:
+      shallow:
+        high: haiku     # 浅いエージェント作業
+        low: sonnet     # 迷いの落下先
+      deep:
+        high: opus      # 深い設計・難所
+        low: sonnet     # 迷いの落下先
+      unspecified:      # depth 省略（判断がつかない）
+        high: sonnet    # 中位・万能
+        low: sonnet
+
+  # 昇格ラダー — 実行時に worker が難所に当たった / ESCALATE 申告 / 例外・タイムアウト時に
+  # 段階的にモデルを上げて再実行する。現モデルがラダー上にあれば次段、ラダー外(gemma)なら先頭から。
+  # 暫定の段構成。判定ログの過昇格/過小昇格の実データで較正する（設計書 §2.2）
+  escalation:
+    ladder: [haiku, sonnet, opus]
 
 # モデル登録 — ルーティング先の定義
 # キー名 = ユーザーが :モデル名 で指定する名前（完全一致）
@@ -138,8 +165,10 @@ models:
     methods: [subprocess]
     command: ollama              # ollama run gemma4:31b の形で呼び出す
     model_id: "gemma4:31b"
-    capabilities: [light-task, format, qa]
-    description: "ローカル軽量。外部通信不要"
+    capabilities: [inline-generation, qa]   # inline 純生成専用へ降格。
+                                             # ファイル読み取り・フォーマット変換は capability から外した
+                                             # （ツール文脈が要る作業は agent レーンが担う）
+    description: "ローカル軽量。inline 純生成専用（外部通信不要）"
 
   # 外部サービスの追加例:
   # suno:
@@ -160,12 +189,13 @@ concurrency:
   # Phase 6 の実機検証で MBP のリソース消費を計測して確定する（qu-e.yaml の上限値と揃える）。
   max_heavy_instances: 3
 
-# フォールバック設定
-# `category_defaults[category]` 配列を先頭から試行
-# 値の意味: fallback の試行回数（先頭は含まない）
-#   0 = fallback なし（先頭のみ）、1 = 先頭 + 1 fallback、N = 先頭 + N fallback
-# 未指定（コメントアウト）の場合: 配列内のすべてのモデルを試行（無制限）
-# ユーザーが `:モデル名` を明示指定した場合はフォールバックしない（指定モデル尊重）
+# フォールバック設定（昇格ラダー routing.escalation.ladder による段階昇格）
+# primary モデル（matrix で解決）が失敗 / ESCALATE 申告 / 例外・タイムアウト時、ladder の
+# 次段へ昇格して再実行する。max_fallback_attempts は「primary を起点とした最大昇格段数」を制限。
+# 値の意味: 昇格回数（primary は含まない）
+#   0 = 昇格なし（primary のみ）、1 = primary + 1 段、N = primary + N 段
+# 未指定（コメントアウト）の場合: ladder の末尾（opus）まで昇格（無制限）
+# ユーザーが `:モデル名` を明示指定した場合は昇格しない（指定モデル尊重）
 fallback:
   # max_fallback_attempts: 1     # 値を指定して制限する場合のみ有効化
 

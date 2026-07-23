@@ -189,6 +189,7 @@ ssh mbp "tail -50 /opt/taka-ma/logs/qu-e.log | grep ヘルスチェック"
 | 8 | file_audit: ファイル変更が即時検知され jsonl に追記される | 動作確認 5 |
 | 9 | file_audit: deny / escalate と判定された変更が sa-ru に SSH push される（§8.12 / A1 §2） | 動作確認 5 |
 | 10 | file_audit: jsonl が `retention_days` 超過後、起動時および日次でローテーション削除される（A1 §4） | コードレビュー（実装に存在） |
+| 10b | workspace rotation: 終了済みタスクの既定 workspace（`{workspace_base}/{task_id}`）と task_context レコードが `workspace_rotation.retention_days` 超過後、起動時および日次で削除される。実行中・`repo:` 指定リポジトリ（workspace_base 外）・symlink 脱出・レコード無し orphan は削除されない（§8.13） | 分離実行テスト（`tests/test_workspace_rotator.py`）／起動ログ |
 | 11 | task_context: sa-ru から SSH push された json を即時受信し、メモリ store に反映される（§8.13 / A1 §5） | 動作確認 6 |
 | 11b | file_audit: 並行実行中の複数タスクで、変更パスが属する `workspace` から正しい task_id に帰属する（一致なし・複数 in_progress 時は非帰属、§8.13） | コードレビュー（`_pick_task_context`） |
 | 11c | task_context: 受信した `thread_ts` が store に保持され、実行中タスクの file_audit アラートが同一 Slack スレッドへ Thread 返信される（§8.12） | 動作確認 6 |
@@ -211,6 +212,7 @@ ssh mbp "tail -50 /opt/taka-ma/logs/qu-e.log | grep ヘルスチェック"
 | `FileAuditHandler` / `start_audit()` | [`file_auditor.py`](../../src/sentinel/file_auditor.py) | watchdog 即時検知 → debounce_sec 集約 → `review_file_audit()` → jsonl 追記 → deny / escalate を sa-ru へ SSH push |
 | `GitignoreCache` | [`file_auditor.py`](../../src/sentinel/file_auditor.py) | .gitignore mtime キャッシュ（A1 §1） |
 | `rotate_jsonl()` | [`file_auditor.py`](../../src/sentinel/file_auditor.py) | retention_days 超過の jsonl 削除（A1 §4） |
+| `rotate_workspaces()` | [`workspace_rotator.py`](../../src/sentinel/workspace_rotator.py) | 終了済みタスクの既定 workspace と task_context レコードを `workspace_rotation.retention_days` 超過で削除。判定根拠はレコードの終了 status（completed/failed）＋mtime。削除直前に `FileAuditHandler.suppress_subtree` で自己操作を宣言し escalate 量産を防ぐ（§8.13） |
 | `TaskContextHandler` | [`main.py`](../../src/sentinel/main.py) | watchdog で `/opt/taka-ma/data/task-context/` を監視、json 読み込み → store 反映（`workspace` 含む、§8.13） |
 | `FileAuditHandler._pick_task_context(path)` | [`file_auditor.py`](../../src/sentinel/file_auditor.py) | 変更パスを各タスクの `workspace` 接頭辞で照合し、並行実行中の正しい task_id を特定（最長一致、曖昧時は非帰属、§8.13） |
 | `DynamicWatchManager` | [`file_auditor.py`](../../src/sentinel/file_auditor.py) | 実開発リポジトリの動的監視。task_context の `workspace` をタスク期間中だけ observer に登録・終了で解除（参照カウント）。git リポジトリへ pre-commit フックを自動導入（§8.12 動的監視／コミット前ゲート） |
@@ -218,7 +220,7 @@ ssh mbp "tail -50 /opt/taka-ma/logs/qu-e.log | grep ヘルスチェック"
 | `hooks/pre-commit` | [`hooks/pre-commit`](../../src/sentinel/hooks/pre-commit) | 自動導入される git pre-commit フック本体（sh）。監査基盤不在時は警告して素通し、基盤ありでの判定不能は fail-closed で中断 |
 | `ResourceOptimizer.recommended_heavy_instances()` / `notify_payload()` | [`resource_optimizer.py`](../../src/sentinel/resource_optimizer.py) | メモリ使用率から推奨 heavy 並行数を算出し、§8.14 通知 payload（recommended_heavy_instances / memory_usage / level）を生成 |
 | `resource_notify_loop()` | [`main.py`](../../src/sentinel/main.py) | `notify_interval_sec` 間隔で推奨並行数を算出し、前回値から変化時に sa-ru へ SSH push（§8.14、フロー図 [Appendix_resource-optimization-flow.md](../design/Appendix_resource-optimization-flow.md)） |
-| `health_check_loop()` / `main()` | [`main.py`](../../src/sentinel/main.py) | 起動シーケンス（Observer 起動 + 起動時 retention rotation + 日次 rotation / リソース通知 asyncio task） |
+| `health_check_loop()` / `daily_rotation_loop()` / `main()` | [`main.py`](../../src/sentinel/main.py) | 起動シーケンス（Observer 起動 + 起動時 retention rotation・workspace rotation + 日次 rotation（jsonl・workspace 両方）/ リソース通知 asyncio task） |
 
 ### プロンプト
 

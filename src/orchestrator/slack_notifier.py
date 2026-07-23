@@ -71,11 +71,72 @@ class SlackNotifier:
             # （実機検証で診断が阻害される欠陥を確認・是正）。
             logger.exception("Slack通知送信失敗 (ws=%s to %s): %s", team_id or "default", target, text[:200])
 
+    # 計画プレビュー 1 ブロックの本文上限（Slack の section text 上限 3000 字より余裕を持つ）
+    PLAN_CHUNK_CHARS = 2800
+    # 計画プレビューに使う section ブロックの最大数（Slack の 1 メッセージ 50 ブロック制限内）
+    PLAN_MAX_BLOCKS = 8
+
+    def _plan_blocks(self, plan_text: str | None, exec_request_id: str) -> list:
+        """計画本文を section ブロック列にする（初回提示・訂正後の再提示で共用）。
+
+        Slack の section text 上限（3000 字）を超えるとメッセージ全体が送信エラーになるため
+        分割して積む。1 ブロックに切り詰めると「見えないサブタスクを承認させる」ことになり、
+        計画確認ゲートの意味が失われる（承認対象は見えていなければならない・§10.2.1）。
+        """
+        if not plan_text:
+            return []
+        chunks = [plan_text[i:i + self.PLAN_CHUNK_CHARS]
+                  for i in range(0, len(plan_text), self.PLAN_CHUNK_CHARS)]
+        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": f"```{chunk}```"}}
+                  for chunk in chunks[:self.PLAN_MAX_BLOCKS]]
+        if len(chunks) > self.PLAN_MAX_BLOCKS:
+            # 極端に長い計画は全量を載せられない。省略を黙らせず明示し、承認前に
+            # 全文へ到達できる経路（確認レコード）を必ず示す
+            blocks.append({"type": "section", "text": {
+                "type": "mrkdwn",
+                "text": (f":warning: 計画が長いため以降の表示を省略しました"
+                         f"（全文は確認レコード {exec_request_id}.json）。"
+                         "全体を確認してから着手してください")}})
+        return blocks
+
+    def _confirm_buttons(self, exec_request_id: str) -> dict:
+        """着手 / やり直すボタン（u-zu の exec_confirm / exec_reject が受ける）。"""
+        return {"type": "actions", "elements": [
+            {"type": "button", "text": {"type": "plain_text", "text": "着手"},
+             "style": "primary", "action_id": "exec_confirm", "value": exec_request_id},
+            {"type": "button", "text": {"type": "plain_text", "text": "やり直す"},
+             "action_id": "exec_reject", "value": exec_request_id},
+        ]}
+
+    def send_plan_update(self, exec_request_id: str, body: str,
+                         channel: str | None = None,
+                         team_id: str | None = None,
+                         thread_ts: str | None = None):
+        """訂正を反映した計画（または差分）を、着手ボタン付きで再提示する（§8.10b）。
+
+        ボタンを毎回添えるのは、訂正を重ねると最初の提示メッセージが上へ流れ、押すべき
+        ボタンを探させることになるため。`exec_request_id` は変えないので、古いメッセージの
+        ボタンを押しても同じ確認レコードを指す（決着は 1 回だけ通り、後続は「処理済み」）。
+        """
+        target = self._channel_for(team_id, channel)
+        blocks = [{"type": "header", "text": {"type": "plain_text", "text": "🔄 計画を更新しました"}}]
+        blocks += self._plan_blocks(body, exec_request_id)
+        blocks.append({"type": "section", "text": {
+            "type": "mrkdwn", "text": "この内容でよければ「着手」を押してください。"}})
+        blocks.append(self._confirm_buttons(exec_request_id))
+        self._client_for(team_id).chat_postMessage(
+            channel=target, thread_ts=thread_ts,
+            text="計画を更新しました（着手 / やり直す）", blocks=blocks)
+
     def send_exec_confirm_request(self, exec_request_id: str, summary: str,
                                   channel: str | None = None,
                                   team_id: str | None = None,
-                                  thread_ts: str | None = None):
-        """会話から固まった意図の要約 + 着手/やり直すボタンを送信する（§8.3 (B)）。
+                                  thread_ts: str | None = None,
+                                  plan_text: str | None = None):
+        """会話から固まった意図の要約 + 計画プレビュー + 着手/やり直すボタンを送信する（§8.3 (B)）。
+
+        plan_text は分解結果のプレビュー本文（§10.2.1。wave 段組み・重さ・モデル）。分解に
+        失敗した縮退時のみ None で、その場合は従来どおり要約のみを提示する。
 
         ボタンは u-zu の `exec_confirm` / `exec_reject` ハンドラで受信し、確認レコードの
         status を更新する。sa-ru 側ループが confirmed を検知して確定タスクを生成する。
@@ -86,13 +147,9 @@ class SlackNotifier:
         blocks = [
             {"type": "header", "text": {"type": "plain_text", "text": "📝 この内容で着手します"}},
             {"type": "section", "text": {"type": "mrkdwn", "text": f"*要約:*\n{summary}"}},
-            {"type": "actions", "elements": [
-                {"type": "button", "text": {"type": "plain_text", "text": "着手"},
-                 "style": "primary", "action_id": "exec_confirm", "value": exec_request_id},
-                {"type": "button", "text": {"type": "plain_text", "text": "やり直す"},
-                 "action_id": "exec_reject", "value": exec_request_id},
-            ]},
         ]
+        blocks += self._plan_blocks(plan_text, exec_request_id)
+        blocks.append(self._confirm_buttons(exec_request_id))
         self._client_for(team_id).chat_postMessage(
             channel=target, thread_ts=thread_ts,
             text="この内容で着手します（着手 / やり直す）", blocks=blocks)

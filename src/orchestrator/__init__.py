@@ -26,6 +26,7 @@ from watchdog.events import FileSystemEventHandler
 from ai_gateway.decomposer import TaskDecomposer
 from ai_gateway.classifier import TaskClassifier
 from ai_gateway.llm import GenerationProgress, run_ollama
+from ai_gateway.plan_corrector import PlanCorrector
 from ai_gateway.risk_classifier import RiskClassifier
 from orchestrator.process_manager import RemoteProcessManager
 from orchestrator.slack_notifier import SlackNotifier
@@ -33,6 +34,7 @@ from orchestrator.pty_wrapper import WorkerPtyWrapper
 from orchestrator.headless_runner import WorkerHeadlessRunner, build_hook_settings
 from orchestrator.concurrency import DynamicConcurrencyLimiter
 from orchestrator.conversation import ConversationManager
+from orchestrator.plan import PlanService, effective_deps
 from orchestrator.resource_monitor import ResourceMonitor
 from orchestrator.file_queue import FileQueue, atomic_write_json
 
@@ -80,6 +82,87 @@ def _select_method(model_conf: dict, use_case: str = "default") -> str:
     if "subprocess" in methods:
         return "subprocess"
     return "pty"
+
+
+# ── execution × depth × confidence → モデル写像 / 昇格ラダー ──
+
+# worker 出力の自己申告昇格マーカー。worker が「このタスクは自分の手に余る」と判断した際に
+# 出力へ埋め込む（設計書 §2.2「昇格の引き金 (a)」）。行頭一致で検出する。
+ESCALATE_MARKER = "ESCALATE:"
+
+
+def _escalate_reason(output: str) -> str | None:
+    """worker 出力に ESCALATE 自己申告があれば理由文字列を返す（無ければ None）。
+
+    いずれかの行が `ESCALATE:` で始まる場合に昇格の引き金とみなす（設計書 §2.2 (a)）。
+    理由はマーカー以降のテキスト。output が文字列でない場合は None。
+    """
+    if not isinstance(output, str):
+        return None
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(ESCALATE_MARKER):
+            return stripped[len(ESCALATE_MARKER):].strip() or "(理由未記載)"
+    return None
+
+
+def _axis_label(subtask: dict) -> str:
+    """サブタスクの execution × depth を人間向け 1 行ラベルにする（通知・ドライラン用）。
+
+    depth 省略（None）は execution だけを示す。旧 category 表示の置換。
+    """
+    execution = subtask.get("execution", "agent")
+    depth = subtask.get("depth")
+    return f"{execution}/{depth}" if depth else execution
+
+
+def _resolve_model(routing: dict, execution: str, depth, confidence) -> str | None:
+    """写像テーブル（ya-ta.yaml routing.matrix）で primary モデル名を解決する（設計書 §2.2）。
+
+    - confidence >= routing.confidence_threshold なら high 側、未満なら low 側を引く
+    - inline は depth 不問（matrix.inline.{high,low}）
+    - agent は depth（shallow/deep）で分岐。省略・未知の depth は unspecified を用いる
+    未解決（matrix 不備）のときは None を返す。呼び出し側が候補なしとして failed に倒す。
+    """
+    matrix = routing.get("matrix", {})
+    threshold = routing.get("confidence_threshold", 0.8)
+    # confidence 欠損は high 扱い（分類側で 1.0 正規化済みだが多重防御）
+    band = "high" if (confidence is None or confidence >= threshold) else "low"
+
+    if execution == "inline":
+        return matrix.get("inline", {}).get(band)
+    # agent: depth で下位表を選ぶ。shallow/deep 以外（None 含む）は unspecified
+    depth_key = depth if depth in ("shallow", "deep") else "unspecified"
+    return matrix.get("agent", {}).get(depth_key, {}).get(band)
+
+
+def _escalation_chain(routing: dict, primary: str | None, max_steps=None) -> list[str]:
+    """primary を起点に、昇格ラダー（routing.escalation.ladder）で試行順の候補列を作る。
+
+    - primary がラダー上にあれば primary 以降を、ラダー外（例: gemma）なら primary + ラダー全体を返す
+    - primary が None（写像未解決）ならラダー全体を返す
+    - max_steps（fallback.max_fallback_attempts）が与えられれば primary を含めて max_steps+1 件に制限
+    先頭が実行対象、以降が段階昇格先（設計書 §2.2「昇格ラダー」）。重複は順序を保って除去する。
+    """
+    ladder = routing.get("escalation", {}).get("ladder", [])
+    if primary is None:
+        chain = list(ladder)
+    elif primary in ladder:
+        chain = ladder[ladder.index(primary):]
+    else:
+        # ラダー外の primary（gemma 等）: まず primary、失敗したらラダー先頭から
+        chain = [primary] + list(ladder)
+    # 順序保持の重複除去（primary がラダー先頭と一致する等の二重を潰す）
+    seen = set()
+    deduped = []
+    for m in chain:
+        if m not in seen:
+            seen.add(m)
+            deduped.append(m)
+    if max_steps is not None:
+        deduped = deduped[:max_steps + 1]
+    return deduped
+
 
 logger = logging.getLogger("sa-ru.orchestrator")
 
@@ -216,8 +299,9 @@ class Orchestrator:
         self._approval_pipeline = None
 
         # カテゴリ別キュー（FIFO、上限付き）
-        self.queue_light = asyncio.Queue(maxsize=100)
-        self.queue_heavy = asyncio.Queue(maxsize=10)
+        # execution 軸でレーン分離。inline=無制限、agent=heavy_limiter 制限
+        self.queue_inline = asyncio.Queue(maxsize=100)
+        self.queue_agent = asyncio.Queue(maxsize=10)
 
         # heavy の同時実行上限（動的リミッタで制御）。
         # 起動時は ya-ta.yaml の max_heavy_instances をブートストラップ値とし、
@@ -232,8 +316,14 @@ class Orchestrator:
         # task_queue.py と同じキー。コードに既定値を置かず、欠落は起動時に即落とす）。
         self.task_dir = config["task_queue"]["dir"]
         self.task_poll = config["task_queue"]["poll_interval_sec"]
+        # 計画確認ゲート（§8.10b）が使う計画サービス。分解と自然言語訂正は ya-ta、モデル写像は
+        # 実行側と同じ _plan_execution を注入する（プレビュー専用の写像を持たない・§10.2.1）
+        self.plan_service = PlanService(
+            self.decomposer, PlanCorrector(config),
+            self._plan_execution, config.get("models", {}).keys())
         self.conversation = ConversationManager(config, self.slack, task_dir=self.task_dir,
-                                                 classifier=self.classifier)
+                                                 classifier=self.classifier,
+                                                 plan_service=self.plan_service)
         # 会話/着手確認の dir・ポーリング間隔は config を唯一の源にする（コード既定値なし・二重定義を避ける）
         self.conversation_dir = config["conversation"]["dir"]
         self.conversation_poll = config["conversation"]["poll_interval_sec"]
@@ -297,8 +387,8 @@ class Orchestrator:
         # resource_monitor は blender_detection 有効時のみ加える（§7.1）。
         coros = [
             self._supervise(self._dispatcher, "dispatcher"),
-            self._supervise(self._worker_light, "worker_light"),
-            self._supervise(self._worker_heavy, "worker_heavy"),
+            self._supervise(self._worker_inline, "worker_inline"),
+            self._supervise(self._worker_agent, "worker_agent"),
             self._supervise(self._conversation_loop, "conversation_loop"),    # 会話受信
             self._supervise(self._exec_confirmation_loop, "exec_confirmation_loop"),  # 着手確認
             self._supervise(self._control_loop, "control_loop"),             # 制御命令
@@ -354,14 +444,21 @@ class Orchestrator:
             try:
                 await self._update_status(task_file, "in_progress")
 
-                # ya-ta モデルでタスクを分解（設計書 §8.4, §10.2）。分解 LLM の無応答区間は
-                # ハートビートで進捗を同スレッドへ返す（§10.8）
-                subtasks = await self._run_with_heartbeat(
-                    "タスク分解", self.decomposer.decompose, task["command"],
-                    channel=task.get("channel_id"),
-                    team_id=task.get("team_id"),
-                    thread_ts=task.get("thread_ts"),
-                )
+                # 会話由来のタスクは計画確認ゲート（§8.10b）で分解済み＝承認された凍結プランを
+                # そのまま実行する。ここで再分解すると人間が承認した計画と実際に走る計画がズレ、
+                # 訂正した depth / model の上書きも失われる（設計書 §10.2「凍結プランの実行」）。
+                frozen_plan = task.get("_plan")
+                if frozen_plan:
+                    subtasks = frozen_plan
+                else:
+                    # ya-ta モデルでタスクを分解（設計書 §8.4, §10.2）。分解 LLM の無応答区間は
+                    # ハートビートで進捗を同スレッドへ返す（§10.8）
+                    subtasks = await self._run_with_heartbeat(
+                        "タスク分解", self.decomposer.decompose, task["command"],
+                        channel=task.get("channel_id"),
+                        team_id=task.get("team_id"),
+                        thread_ts=task.get("thread_ts"),
+                    )
 
                 # /exam_gw ドライラン: 判定結果のみ返却し、実行しない（設計書 §2.2）
                 if task.get("dry_run"):
@@ -373,8 +470,11 @@ class Orchestrator:
                     await self._update_status(task_file, "completed")
                     continue
 
+                accepted_msg = (f"タスク受付: 承認済みの計画 {len(subtasks)} 件で実行します"
+                                if frozen_plan else
+                                f"タスク受付: {len(subtasks)}件のサブタスクに分解")
                 await self._notify(
-                    f"タスク受付: {len(subtasks)}件のサブタスクに分解",
+                    accepted_msg,
                     task.get("channel_id"),
                     team_id=task.get("team_id"),
                     thread_ts=task.get("thread_ts"))
@@ -400,7 +500,8 @@ class Orchestrator:
 
     # NOTE: タスク分解は TaskDecomposer (ai_gateway/decomposer.py) が担う。
     # _dispatcher から self.decomposer.decompose を呼び出す。
-    # 分解結果: [{"step": 1, "command": "...", "category": "heavy", "depends_on": []}, ...]
+    # 分解結果: [{"step": 1, "command": "...", "execution": "agent", "depth": "deep",
+    #             "confidence": 0.9, "depends_on": []}, ...]（execution × depth 2軸）
 
     # ── 会話ループ: u-zu の発話を脳 LLM で会話・要約（§8.3 (A)） ──
 
@@ -570,7 +671,9 @@ class Orchestrator:
           - 自己依存: step が自身に依存すると自分の futures を await して即デッドロック。
           - 循環依存: step 群が相互に依存すると互いの futures を永久 await してデッドロック。
         存在しない step への依存（dangling）は実行時に無視される（_execute_subtask_in_chain の
-        `if dep not in futures: continue`）ため、ここでは循環判定の辺からも除外する。
+        `if dep not in futures: continue`）ため、ここでは循環判定の辺からも除外する。除外の判定は
+        plan.effective_deps に一本化する（検証・プレビューの wave 分割・実行の 3 者で依存グラフの
+        解釈を揃える。ズレると「見せた段構成と実行順が違う」事故になる・設計書 §10.2.1）。
         """
         steps = [s["step"] for s in subtasks]
         seen: set = set()
@@ -590,7 +693,7 @@ class Orchestrator:
             if st in deps:
                 return f"Step {st} が自分自身に依存しています"
             # 存在する step への辺のみ張る（dangling は実行時無視と揃える）
-            graph[st] = [d for d in deps if d in step_set]
+            graph[st] = effective_deps(s, step_set)
 
         # DFS 3色塗りで循環検出（GRAY 到達＝後退辺＝循環）
         WHITE, GRAY, BLACK = 0, 1, 2
@@ -743,12 +846,13 @@ class Orchestrator:
         lines = ["⚠ タスク失敗", "", f"【元の指示】", task["command"], "", "【サブタスク結果】"]
         for s in subtasks:
             step = s["step"]
+            axis = _axis_label(s)  # 旧 category に替わる execution/depth 表示
             if step in results:
-                lines.append(f"  Step {step}: {s['command']} ({s['category']}) → ✅ 成功")
+                lines.append(f"  Step {step}: {s['command']} ({axis}) → ✅ 成功")
             elif step in failed_steps:
-                lines.append(f"  Step {step}: {s['command']} ({s['category']}) → ❌ 失敗")
+                lines.append(f"  Step {step}: {s['command']} ({axis}) → ❌ 失敗")
             else:
-                lines.append(f"  Step {step}: {s['command']} ({s['category']}) → ⏭ スキップ")
+                lines.append(f"  Step {step}: {s['command']} ({axis}) → ⏭ スキップ")
         if result_path:
             lines += ["", f"結果ファイル: {result_path}"]
         await self._notify("\n".join(lines), channel, team_id=team_id, thread_ts=thread_ts)
@@ -766,7 +870,12 @@ class Orchestrator:
         """
         step = subtask["step"]
         command = subtask["command"]
-        category = subtask["category"]  # DeepSeek-R1 が分解時に判定済み
+        # ya-ta が分解時に判定した生の 2 軸。モデル写像・昇格は worker 側で行う
+        execution = subtask.get("execution", "agent")
+        depth = subtask.get("depth")
+        confidence = subtask.get("confidence")
+        # サブタスクに :モデル名 が付いていれば明示指定として尊重（写像・昇格をバイパス）
+        model = subtask.get("model")
         depends_on = subtask.get("depends_on", [])
 
         try:
@@ -788,15 +897,31 @@ class Orchestrator:
                 context = "\n".join(dep_results)
                 command = f"前のステップの結果:\n{context}\n\n上記を踏まえて: {command}"
 
-            await self._notify(f"  サブタスク {step}: {category}", channel,
+            await self._notify(f"  サブタスク {step}: {_axis_label(subtask)}", channel,
                               team_id=task.get("team_id"), thread_ts=task.get("thread_ts"))
 
             # キューに投入し、ワーカーに実行させる
             result_future = asyncio.get_event_loop().create_future()
+            # subtask の :モデル名 を _model に載せる。未指定なら task 側の _model（あれば）を残す
+            user_model = model if model is not None else task.get("_model")
+            # 写像テーブルで実行計画（レーン・候補列・明示指定か）を決める。
+            # model_override は計画確認でユーザーが上書きしたモデル（§10.2.1。昇格は止めない）
+            override_model = subtask.get("model_override")
+            lane, candidates, user_specified = self._plan_execution(
+                execution, depth, confidence, user_model, override_model)
             queue_item = {
                 **task,
                 "_command": command,
-                "_category": category,
+                "_execution": execution,
+                "_depth": depth,
+                "_confidence": confidence,
+                # 上書きがあれば _model も単一モデルへ倒す。_execute_worker_task は _model が
+                # 2 モデル以上のリストなら cross-review へ分岐するため、ここで残すと計画確認の
+                # 上書きが実行時に無視され、提示した計画と違うモデル群が走る（§10.2.1 違反）
+                "_model": override_model or user_model,
+                "_lane": lane,                    # inline / agent（レーン＝解決モデルの method 由来）
+                "_candidates": candidates,        # 実行順のモデル候補列（先頭が primary、以降は昇格先）
+                "_user_specified": user_specified,  # 明示指定なら昇格・レーン跨ぎ再投入をしない
                 "_step": step,
                 "_result_future": result_future,
             }
@@ -817,30 +942,35 @@ class Orchestrator:
                 futures[step].set_exception(e)
 
     async def _enqueue(self, item: dict):
-        """カテゴリに応じたキューにタスクを投入（満杯時は空きを待つ）"""
-        category = item["_category"]
-        if category == "light":
-            await self.queue_light.put(item)
+        """レーンに応じたキューにタスクを投入（満杯時は空きを待つ）。
+
+        レーンは「解決モデルの method」で決まる（`_plan_execution` が算出し `_lane` に格納）。
+        subprocess モデル（gemma）＝inline レーン（無制限）、headless/pty モデル（haiku/sonnet/
+        opus/gemini）＝agent レーン（heavy_limiter 制限）。inline の gemma が失敗して昇格ラダー
+        （headless）へ移る際は `_lane` を agent へ書き換えて再投入し、必ず limiter 配下で走らせる。
+        """
+        if item.get("_lane") == "inline":
+            await self.queue_inline.put(item)
         else:
-            await self.queue_heavy.put(item)
+            await self.queue_agent.put(item)
 
-    # ── ワーカー: カテゴリ別にキューから取り出して実行 ──
+    # ── ワーカー: execution レーン別にキューから取り出して実行 ──
 
-    async def _worker_light(self):
-        """light サブタスクを取り出し次第、上限なしで並行起動する（軽量ゆえ絞らない）。"""
+    async def _worker_inline(self):
+        """inline サブタスクを取り出し次第、上限なしで並行起動する（純生成ゆえ絞らない）。"""
         running = []
         while True:
-            item = await self.queue_light.get()
+            item = await self.queue_inline.get()
             t = asyncio.create_task(self._execute_worker_task(item))
             running.append(t)
             # 完了済みタスク参照を捨てて running リストの無限肥大を防ぐ（保持は GC 抑止のため）
             running = [t for t in running if not t.done()]
 
-    async def _worker_heavy(self):
-        """heavy サブタスクを最大 max_heavy_instances 並行で処理（上限は §8.14 で動的変動）。"""
+    async def _worker_agent(self):
+        """agent サブタスクを最大 max_heavy_instances 並行で処理（上限は §8.14 で動的変動）。"""
         running = []
         while True:
-            item = await self.queue_heavy.get()
+            item = await self.queue_agent.get()
             # キューから取り出した後に枠を確保する。確保できるまでここで待つ＝同時起動数を上限に抑える
             await self.heavy_limiter.acquire()
             t = asyncio.create_task(self._execute_heavy_with_release(item))
@@ -855,24 +985,86 @@ class Orchestrator:
         finally:
             await self.heavy_limiter.release()
 
+    def _plan_execution(self, execution, depth, confidence, user_model, override_model=None):
+        """写像テーブルからレーン・モデル候補列・明示指定フラグを決める（設計書 §2.2）。
+
+        Returns: (lane, candidates, user_specified)
+          - override_model（計画確認での上書き・§10.2.1）→ それを primary に昇格ラダーを張る。
+            `:モデル名` の明示指定と違い昇格を止めない（人間確認は上流フィルタであって
+            昇格の代替ではない）。より新しい意思表示のため user_model より優先する
+          - user_model が 2 モデル以上のリスト → cross-review。lane=agent、candidates=そのリスト
+          - user_model が単一（str / 1 要素リスト）→ 明示指定。candidates=[その 1 件]、昇格しない
+          - 指定なし → primary = matrix 解決、candidates = 昇格ラダー（fallback.max_fallback_attempts で段数制限）
+        レーンは candidates 先頭モデルの method で決める（subprocess＝inline / それ以外＝agent）。
+        """
+        models = self.config["models"]
+        routing = self.config["routing"]
+
+        # cross-review（2 モデル以上の明示指定）。計画確認で上書きされていれば単一モデルへ倒す
+        if isinstance(user_model, list) and len(user_model) >= 2 and not override_model:
+            return "agent", list(user_model), True
+
+        # 1 要素リストは str に揃える
+        if isinstance(user_model, list):
+            user_model = user_model[0] if user_model else None
+
+        if user_model and not override_model:
+            candidates = [user_model]
+            user_specified = True
+        else:
+            # 計画確認の上書きがあればそれを primary に、無ければ写像テーブルで解決する
+            primary = override_model or _resolve_model(routing, execution, depth, confidence)
+            # ya-ta.yaml の fallback: がコメントのみだと YAML 上 None になり得るため or {} で潰す
+            # （実機検証で AttributeError を確認・2026-07-04 と同根）。max は昇格の最大段数。
+            max_steps = (self.config.get("fallback") or {}).get("max_fallback_attempts")
+            candidates = _escalation_chain(routing, primary, max_steps)
+            user_specified = False
+
+        # レーン = 先頭候補モデルの method（subprocess=inline レーン / headless・pty=agent レーン）
+        first = candidates[0] if candidates else None
+        method = _select_method(models.get(first, {})) if first else "headless"
+        lane = "inline" if method == "subprocess" else "agent"
+        return lane, candidates, user_specified
+
+    async def _run_candidate(self, item, model_name, command, step,
+                             channel, team_id, thread_ts):
+        """単一モデル候補を method に応じた実行アダプタで走らせ、出力文字列を返す。
+
+        instance_id に model_name を含めるため、昇格で複数モデルを順に走らせても
+        workspace / tmux セッション名が衝突しない（Layer3 review 由来の是正を踏襲）。
+        """
+        model_conf = self.config["models"].get(model_name, {})
+        method = _select_method(model_conf, use_case="default")
+        if method == "subprocess":
+            # subprocess 単発実行（ollama / 単発 API）
+            return await asyncio.to_thread(
+                self.process_mgr.run_model_subprocess, model_name, model_conf, command)
+        # headless（Claude Code）/ pty（agy 対話等の汎用対話 CLI）
+        model_flag = model_conf.get("model_flag", "")
+        cli_command = model_conf.get("command", "claude")
+        instance_id = f"{item['task_id']}-step{step}-{model_name}"
+        workspace = self._resolve_workspace(item)
+        if method == "headless":
+            return await self._run_worker_headless(
+                instance_id, cli_command, command, model_flag, workspace,
+                channel=channel, team_id=team_id, task_id=item["task_id"], thread_ts=thread_ts)
+        return await self._run_worker_pty(
+            instance_id, cli_command, command, channel, model_flag, workspace,
+            team_id=team_id, task_id=item["task_id"], thread_ts=thread_ts)
+
     async def _execute_worker_task(self, item: dict):
         """ワーカーがキューから受け取ったサブタスクを実行し、結果を Future にセットする。
 
-        分岐:
-          - `_model` が 2 つ以上のリスト → cross-review（_execute_cross_review）
-          - `_model` が単一文字列または 1 要素リスト → 明示指定実行（フォールバックなし）
-          - `_model` 未指定 → `category_defaults[category]` 配列でフォールバック実行
-
-        フォールバック動作（設計書 §2.2）:
-          - ユーザーが `:モデル名` で明示指定した場合: そのモデルのみで実行（障害時もフォールバックしない）
-          - 指定なしの場合: `routing.category_defaults[category]` 配列を先頭から試行。
-            `fallback.max_fallback_attempts` で fallback の試行回数（先頭は含まない）を制限。
-            例: `0` = fallback なし（先頭のみ）、`1` = 先頭 + 1 fallback。
-            未指定なら配列全要素を試行（無制限）。[0] 障害 → [1] へ。全候補失敗で例外。
-          - light 全候補失敗時のみ heavy に昇格して再投入。
+        （写像テーブル + 昇格ラダー）:
+          - cross-review（`_model` が 2 モデル以上）→ _execute_cross_review
+          - inline レーン（`_lane == "inline"`）→ 先頭候補（gemma）のみ実行。失敗 / ESCALATE 申告時は
+            残る昇格ラダー（headless モデル）を agent レーンへ再投入し、必ず heavy_limiter 配下で走らせる
+          - agent レーン → `_candidates`（primary → 昇格先…）を順に試行（heavy_limiter は
+            _execute_heavy_with_release が 1 スロット保持。逐次昇格はその 1 枠で足りる）
+          - 明示指定（`_user_specified`）は昇格・レーン跨ぎ再投入をしない（指定モデル尊重）
+        昇格の引き金は「例外・タイムアウト」と「worker 出力の ESCALATE: 自己申告」の 2 つ（設計書 §2.2）。
         """
         command = item["_command"]
-        category = item["_category"]
         step = item["_step"]
         result_future = item["_result_future"]
         channel = item.get("channel_id")
@@ -880,90 +1072,96 @@ class Orchestrator:
         thread_ts = item.get("thread_ts")
 
         # cross-review 分岐: 2 つ以上のモデル指定で並行投入
-        user_specified = item.get("_model")
-        if isinstance(user_specified, list) and len(user_specified) >= 2:
-            await self._execute_cross_review(item, user_specified)
+        raw_model = item.get("_model")
+        if isinstance(raw_model, list) and len(raw_model) >= 2:
+            await self._execute_cross_review(item, raw_model)
             return
 
-        # list 1 要素は str に揃える
-        if isinstance(user_specified, list):
-            user_specified = user_specified[0] if user_specified else None
+        lane = item.get("_lane", "agent")
+        candidates = item.get("_candidates") or []
+        user_specified = item.get("_user_specified", False)
 
-        # モデル候補リストを構築
-        if user_specified:
-            # ユーザー明示指定 → フォールバックしない（指定モデル尊重）
-            candidates = [user_specified]
-        else:
-            defaults = self.config["routing"]["category_defaults"].get(category, [])
-            # ya-ta.yaml の fallback: はコメントのみの場合 YAML 上 None になり、.get("fallback", {})
-            # は「キー自体は存在する」ため既定 {} が使われず None を返す（dict.get の既定は「キー不在」
-            # 時のみ有効・値が None でも代替されない）。.get("fallback") or {} で None も {} に潰す
-            # （実機検証で AttributeError: 'NoneType' object has no attribute 'get' を確認・2026-07-04）。
-            max_fallback_attempts = (self.config.get("fallback") or {}).get("max_fallback_attempts")
-            # max_fallback_attempts は fallback の試行回数（先頭は含まない）。
-            # 未指定なら配列全要素。N 指定なら先頭 + fallback N 件（合計 N+1 件）
-            candidates = defaults if max_fallback_attempts is None else defaults[:max_fallback_attempts + 1]
+        # 候補皆無（matrix 不備等）は恒久ハング回避のため意味のある例外で即解決する
+        if not candidates:
+            result_future.set_exception(RuntimeError(
+                f"実行可能なモデル候補がありません（execution={item.get('_execution')}, "
+                f"depth={item.get('_depth')}, confidence={item.get('_confidence')}）"))
+            return
 
+        # ── inline レーン: 先頭候補（gemma）のみ。失敗/ESCALATE は agent レーンへ昇格再投入 ──
+        if lane == "inline":
+            model_name = candidates[0]
+            try:
+                output = await self._run_candidate(
+                    item, model_name, command, step, channel, team_id, thread_ts)
+                reason = _escalate_reason(output)
+                if reason and not user_specified and len(candidates) > 1:
+                    await self._notify(
+                        f"  {model_name} が ESCALATE 申告（{reason}）→ agent レーンへ昇格", channel,
+                        team_id=team_id, thread_ts=thread_ts)
+                    await self._escalate_to_agent_lane(item, candidates[1:])
+                    return
+                result_future.set_result(output)
+            except Exception as e:
+                if user_specified or len(candidates) <= 1:
+                    result_future.set_exception(e)
+                    return
+                await self._notify(
+                    f"  {model_name} 障害 → agent レーンへ昇格: {e}", channel,
+                    team_id=team_id, thread_ts=thread_ts)
+                await self._escalate_to_agent_lane(item, candidates[1:])
+            return
+
+        # ── agent レーン: 昇格ラダーをインラインで順に試行（limiter は呼び出し側が保持） ──
         last_error = None
         for idx, model_name in enumerate(candidates):
-            is_fallback = idx > 0
+            is_escalation = idx > 0
             try:
-                model_conf = self.config["models"].get(model_name, {})
-                method = _select_method(model_conf, use_case="default")
-
-                if method == "subprocess":
-                    # subprocess 単発実行（ollama / 単発 API）
-                    output = await asyncio.to_thread(
-                        self.process_mgr.run_model_subprocess, model_name, model_conf, command
-                    )
-                else:  # headless（Claude Code）/ pty（agy 対話等の汎用対話 CLI）
-                    model_flag = model_conf.get("model_flag", "")
-                    cli_command = model_conf.get("command", "claude")
-                    # instance_id に model_name を含める。含めないと通常フォールバックの2候補目
-                    # 以降が1候補目と同じ workspace/セッション名になり、1候補目失敗時に生存し続ける
-                    # 資源と名前衝突する（Layer3 review で検出・是正）。
-                    instance_id = f"{item['task_id']}-step{step}-{model_name}"
-                    workspace = self._resolve_workspace(item)
-                    if method == "headless":
-                        output = await self._run_worker_headless(instance_id, cli_command, command, model_flag, workspace, channel=channel, team_id=team_id, task_id=item["task_id"], thread_ts=thread_ts)
-                    else:
-                        output = await self._run_worker_pty(instance_id, cli_command, command, channel, model_flag, workspace, team_id=team_id, task_id=item["task_id"], thread_ts=thread_ts)
-
-                if is_fallback:
+                if is_escalation:
                     await self._notify(
-                        f"  {candidates[0]} 障害 → {model_name} で実行（fallback）", channel,
-                        team_id=team_id, thread_ts=thread_ts
-                    )
+                        f"  {candidates[idx - 1]} → {model_name} へ昇格実行", channel,
+                        team_id=team_id, thread_ts=thread_ts)
+                output = await self._run_candidate(
+                    item, model_name, command, step, channel, team_id, thread_ts)
+                reason = _escalate_reason(output)
+                if reason and not user_specified and idx < len(candidates) - 1:
+                    # 上位段が残っていれば昇格継続（この出力は採用しない）
+                    await self._notify(
+                        f"  {model_name} が ESCALATE 申告（{reason}）→ 次段へ昇格", channel,
+                        team_id=team_id, thread_ts=thread_ts)
+                    last_error = RuntimeError(f"{model_name} ESCALATE: {reason}")
+                    continue
+                if reason and (user_specified or idx == len(candidates) - 1):
+                    # 明示指定 or 最上位段での ESCALATE は昇格先が無い → failed に倒す
+                    result_future.set_exception(RuntimeError(
+                        f"最上位モデル {model_name} でも解決不可（ESCALATE: {reason}）"))
+                    return
                 result_future.set_result(output)
                 return
-
             except Exception as e:
                 last_error = e
-                await self._notify(f"  {model_name} 障害: {e}", channel, team_id=team_id, thread_ts=thread_ts)
+                await self._notify(
+                    f"  {model_name} 障害/難所: {e}", channel, team_id=team_id, thread_ts=thread_ts)
+                if user_specified:
+                    break  # 明示指定は昇格しない（指定モデル尊重）
                 continue
 
-        # 全候補失敗。ただしユーザーが `:モデル名` で明示指定した場合は「そのモデルのみで
-        # 実行（障害時もフォールバックしない）」契約のため昇格・再投入をしない（本関数冒頭の
-        # docstring参照）。昇格すると同じ instance_id で worker を再起動しようとし、直前の
-        # tmux セッションがまだ生存していて名前衝突する欠陥を実機検証で確認・是正。
-        if category == "light" and not user_specified:
-            # light 全失敗 → heavy に昇格して再投入
-            item["_category"] = "heavy"
-            await self._notify(f"  light 全失敗。heavy に昇格: {last_error}", channel,
-                              team_id=team_id, thread_ts=thread_ts)
-            await self._enqueue(item)
-        else:
-            # heavy 全失敗 / 明示指定モデル失敗 → Future に例外をセット
-            # （_execute_chain で捕捉、User へ failed 通知）。
-            # candidates が空（該当 category の routing.category_defaults が未設定など）だと
-            # ループが 1 度も回らず last_error が None のままになる。set_exception(None) は
-            # TypeError を送出し result_future が未解決のまま worker タスクが死んで恒久ハングに
-            # なるため、意味のある例外へ差し替えてから解決する。
-            if last_error is None:
-                last_error = RuntimeError(
-                    f"実行可能なモデル候補がありません（category={category}, "
-                    f"model={user_specified}）")
-            result_future.set_exception(last_error)
+        # 全段失敗 → Future に例外をセット（_execute_chain で捕捉、User へ failed 通知）
+        if last_error is None:
+            last_error = RuntimeError("実行可能なモデル候補がありません")
+        result_future.set_exception(last_error)
+
+    async def _escalate_to_agent_lane(self, item: dict, remaining: list[str]):
+        """inline レーンの失敗/ESCALATE を受け、残る昇格ラダーを agent レーンへ再投入する。
+
+        `_lane` を agent へ書き換えて heavy_limiter 配下で走らせる（inline レーンで headless を
+        起動すると limiter を素通りして MBP 資源を無制限に消費するのを防ぐ）。同一 item を
+        使い回すが instance_id は model_name 込みのため tmux セッション名は衝突しない。
+        """
+        item["_candidates"] = remaining
+        item["_lane"] = "agent"
+        item["_execution"] = "agent"
+        await self._enqueue(item)
 
     async def _execute_cross_review(self, item: dict, models: list[str]):
         """複数モデルへ並行投入し、結果を ya-ta（DeepSeek-R1 32B）で知的統合する（設計書 §2.2）。
@@ -1203,37 +1401,34 @@ class Orchestrator:
     # ── /exam_gw ドライラン結果フォーマット ──
 
     def _format_exam_result(self, subtasks: list[dict]) -> str:
-        """ドライラン結果を Slack 通知用テキストに整形"""
+        """ドライラン結果を Slack 通知用テキストに整形（execution × depth + 写像表示）"""
         lines = ["ya-ta 検証結果（実行なし）\n"]
         for s in subtasks:
             model = s.get("model")
-            if model:
-                model_display = f"{model}（ユーザー指定。フォールバックなし）"
-                primary = model
-            else:
-                # category_defaults 配列から解決（[0] がデフォルト）
-                defaults = self.config["routing"]["category_defaults"].get(s["category"], [])
-                # fallback: がコメントのみだと YAML 上 None になり .get(...,{}) の既定が効かない
-                # （キー自体は存在するため）。.get("fallback") or {} で None を吸収する（同根の欠陥、
-                # _execute_worker_task 側コメント参照）
-                max_fallback_attempts = (self.config.get("fallback") or {}).get("max_fallback_attempts")
-                candidates = defaults if max_fallback_attempts is None else defaults[:max_fallback_attempts + 1]
-                if candidates:
-                    primary = candidates[0]
-                    if len(candidates) > 1:
-                        fallback_display = " → ".join(candidates[1:])
-                        model_display = f"null → {primary}（デフォルト、fallback: {fallback_display}）"
-                    else:
-                        model_display = f"null → {primary}（デフォルト、fallback なし）"
+            # 実行計画（レーン・候補列・明示指定か）を実行と同じ写像で解決して表示する
+            lane, candidates, user_specified = self._plan_execution(
+                s.get("execution", "agent"), s.get("depth"), s.get("confidence"), model)
+            primary = candidates[0] if candidates else None
+            if user_specified:
+                if len(candidates) >= 2:
+                    model_display = f"{candidates}（ユーザー指定・cross-review）"
                 else:
-                    primary = None
-                    model_display = "null（候補なし）"
+                    model_display = f"{primary}（ユーザー指定。昇格なし）"
+            elif primary is not None:
+                if len(candidates) > 1:
+                    ladder_display = " → ".join(candidates[1:])
+                    model_display = f"{primary}（写像デフォルト、昇格: {ladder_display}）"
+                else:
+                    model_display = f"{primary}（写像デフォルト、昇格なし）"
+            else:
+                model_display = "（候補なし — matrix 不備）"
             model_conf = self.config["models"].get(primary, {}) if primary else {}
             methods = model_conf.get("methods") or ([model_conf.get("method")] if model_conf.get("method") else [])
             selected_method = _select_method(model_conf) if model_conf else "unknown"
             lines.append(
                 f"Step {s['step']}: {s['command']}\n"
-                f"  category: {s['category']}\n"
+                f"  execution: {s.get('execution', 'N/A')} / depth: {s.get('depth')}\n"
+                f"  lane: {lane}\n"
                 f"  model: {model_display}\n"
                 f"  methods: {methods} → selected: {selected_method}\n"
                 f"  depends_on: {s.get('depends_on', [])}\n"

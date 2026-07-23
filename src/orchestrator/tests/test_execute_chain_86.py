@@ -28,8 +28,8 @@ def _bare():
 def test_validate_detects_duplicate_step():
     o = _bare()
     subtasks = [
-        {"step": 1, "command": "a", "category": "light", "depends_on": []},
-        {"step": 1, "command": "b", "category": "light", "depends_on": []},
+        {"step": 1, "command": "a", "execution": "inline", "depends_on": []},
+        {"step": 1, "command": "b", "execution": "inline", "depends_on": []},
     ]
     err = o._validate_subtask_graph(subtasks)
     assert err is not None and "重複" in err
@@ -37,7 +37,7 @@ def test_validate_detects_duplicate_step():
 
 def test_validate_detects_self_dependency():
     o = _bare()
-    subtasks = [{"step": 1, "command": "a", "category": "light", "depends_on": [1]}]
+    subtasks = [{"step": 1, "command": "a", "execution": "inline", "depends_on": [1]}]
     err = o._validate_subtask_graph(subtasks)
     assert err is not None and "自分自身" in err
 
@@ -45,8 +45,8 @@ def test_validate_detects_self_dependency():
 def test_validate_detects_cycle():
     o = _bare()
     subtasks = [
-        {"step": 1, "command": "a", "category": "light", "depends_on": [2]},
-        {"step": 2, "command": "b", "category": "light", "depends_on": [1]},
+        {"step": 1, "command": "a", "execution": "inline", "depends_on": [2]},
+        {"step": 2, "command": "b", "execution": "inline", "depends_on": [1]},
     ]
     err = o._validate_subtask_graph(subtasks)
     assert err is not None and "循環" in err
@@ -55,9 +55,9 @@ def test_validate_detects_cycle():
 def test_validate_accepts_valid_dag():
     o = _bare()
     subtasks = [
-        {"step": 1, "command": "a", "category": "heavy", "depends_on": []},
-        {"step": 2, "command": "b", "category": "heavy", "depends_on": []},
-        {"step": 3, "command": "c", "category": "light", "depends_on": [1, 2]},
+        {"step": 1, "command": "a", "execution": "agent", "depends_on": []},
+        {"step": 2, "command": "b", "execution": "agent", "depends_on": []},
+        {"step": 3, "command": "c", "execution": "inline", "depends_on": [1, 2]},
     ]
     assert o._validate_subtask_graph(subtasks) is None
 
@@ -65,7 +65,7 @@ def test_validate_accepts_valid_dag():
 def test_validate_ignores_dangling_dependency():
     """存在しない step への依存は失敗にしない（実行時無視と揃える・設計書 §10.3）。"""
     o = _bare()
-    subtasks = [{"step": 1, "command": "a", "category": "light", "depends_on": [99]}]
+    subtasks = [{"step": 1, "command": "a", "execution": "inline", "depends_on": [99]}]
     assert o._validate_subtask_graph(subtasks) is None
 
 
@@ -80,7 +80,7 @@ def test_cascading_skip_resolves_future_not_hang():
         futures = {1: dep_future, 2: loop.create_future()}
         results = {}
         task = {"task_id": "t", "channel_id": None, "team_id": None, "thread_ts": None}
-        subtask = {"step": 2, "command": "x", "category": "light", "depends_on": [1]}
+        subtask = {"step": 2, "command": "x", "execution": "inline", "depends_on": [1]}
         # 依存先が失敗しているため enqueue 前に skip され、futures[2] が例外で解決されるはず。
         # 5 秒で終わらなければ「永久 await（ハング）」の退行とみなす。
         await asyncio.wait_for(
