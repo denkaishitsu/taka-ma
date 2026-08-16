@@ -13,6 +13,15 @@ from ai_gateway.logger import YaTaLogger
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
+# 停止指示のキーワード前置ゲート（設計書 §8.10d）。これに当たらない発話は LLM を呼ばずに
+# 「制御ではない」と即決し、通常会話へレイテンシを一切足さない。当たった発話のみ LLM で
+# 「停止命令か、停止語彙を含むだけの開発依頼か」を弁別する（2 段判定の 1 段目）。
+_CONTROL_KEYWORDS_RE = re.compile(
+    r"中止|中断|停止|取り消|取消|取りやめ|やめ|止め|ストップ|キャンセル"
+    r"|\b(?:stop|cancel|abort)\b",
+    re.IGNORECASE,
+)
+
 
 class InvalidModelError(Exception):
     """未登録の :モデル名 が指定された場合に送出する。
@@ -82,6 +91,51 @@ class TaskClassifier:
                 )
             validated.append(m)
         return clean_command, validated
+
+    def classify_control(self, text: str) -> str | None:
+        """発話が制御コマンド（停止命令）なら "cancel" を、そうでなければ None を返す（設計書 §8.10d）。
+
+        2 段判定: (1) キーワード前置ゲート（決定的・LLM なし）に当たらなければ即 None。
+        (2) 当たった発話のみ ya-ta モデルで「既存作業への停止命令」か「停止語彙を含むだけの
+        開発依頼・質問」（例: キャンセル機能を実装して）かを弁別する。
+
+        判定不能（JSON 不正・ollama 障害）は None（制御ではない）へ縮退する（fail-safe）。
+        このとき会話脳も同一 ollama で応答不能のため着手ボタンは提示され得ず、承認ゲート
+        転倒の再発経路にはならない。execution × depth 分類（classify）とは独立の前段判定
+        （制御命令はタスクではないため軸を混ぜない）。
+        """
+        if not _CONTROL_KEYWORDS_RE.search(text):
+            return None
+        with open(PROMPTS_DIR / "classify_control.md") as f:
+            template = f.read()
+        try:
+            stdout = run_ollama(
+                self.ai_gateway_model,
+                f"{template}\n\n発話: {text}",
+                timeout=self.llm_timeout,
+                host=self.ollama_host,
+                think=self.llm_think,
+            )
+            parsed = json.loads(extract_json(stdout))
+            control = parsed.get("control")
+            # 判定ログは分類改善（Phase 2）の基盤。execution 軸へ "control" として刻む。
+            # ログ失敗は判定本体を壊さない（classify と同じ規律）。
+            try:
+                self.logger.log_decision(
+                    task=text,
+                    execution="control",
+                    depth=None,
+                    model="",
+                    reason=parsed.get("reason", ""),
+                    confidence=parsed.get("confidence") or 0.0,
+                )
+            except Exception:
+                pass
+            return "cancel" if control == "cancel" else None
+        except (json.JSONDecodeError, KeyError, TypeError, AttributeError, RuntimeError):
+            # AttributeError は LLM が JSON 配列等の非 dict を返したケース（parsed.get が無い）。
+            # いずれも「制御ではない」へ縮退する（fail-safe・§8.10d）
+            return None
 
     def classify(self, command: str) -> dict:
         """タスクを execution × depth の 2 軸で判定する。

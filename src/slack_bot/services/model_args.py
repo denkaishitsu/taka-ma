@@ -11,6 +11,9 @@ FLAG_TO_FIELD = {
     "--full-name": "full_name", "--vendor": "vendor", "--methods": "methods",
     "--command": "command", "--model-flag": "model_flag", "--model-id": "model_id",
     "--capabilities": "capabilities", "--description": "description", "--type": "type",
+    # ローカルモデル（ollama）の実行に要る接続先と常駐時間。実行は HTTP API 呼び出しで、
+    # 供給元は ya-ta.yaml だけのため登録時に受け取る（設計書 §8.7）
+    "--api-url": "api_url", "--keep-alive-sec": "keep_alive_sec",
 }
 # カンマ区切りで配列にするフィールド。
 LIST_FIELDS = {"methods", "capabilities"}

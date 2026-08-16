@@ -56,6 +56,16 @@ headless:
   hook_timeout_sec: 310                                # PreToolUse フックの上限（Tier3 人間待ち 300 秒を切らない値）
   run_timeout_sec: 1800                                # claude -p 1 回の全体上限（秒）
 
+# worker 起動前の認証プリフライト（SSH / git remote / Anthropic）— AuthPreflight が参照
+# （Orchestrator._run_worker_headless が worker 起動直前に呼ぶ。コード側に既定値なし・SSOT）
+preflight:
+  ssh_timeout_sec: 15         # ssh <mbp> true（到達性・認証検査）の応答上限（秒）
+  git_timeout_sec: 30         # git ls-remote（remote 到達性検査）の応答上限（秒）
+  anthropic_timeout_sec: 120  # worker CLI 最小プローブ（Anthropic 認証検査。実推論 1 回ぶん）の応答上限（秒）
+  pass_ttl_sec: 600           # 検査 PASS の再検査省略期間（秒）。多段 worker 起動でプローブを毎回払わない
+  fail_ttl_sec: 60            # 検査 FAIL の再検査省略期間（秒）。昇格ラダー再突入で同じ検査・通知を重ねず、
+                              # 復旧後の再試行は長く塞がない
+
 # タスクキュー — dispatcher が参照
 task_queue:
   dir: "/opt/taka-ma/data/tasks"  # Slack Bot がタスクファイルを作成するディレクトリ
@@ -66,8 +76,12 @@ approval:
   dir: "/opt/taka-ma/data/approvals"  # 承認ファイルの読み書き先（u-zu と共有。実配線は環境変数
                                       # TAKA_MA_APPROVAL_DIR — 別ツリー配備の u-zu と供給元を揃えるため）
   tier2_timeout_sec: 120              # qu-e 審査（SSH + review_cli 1 ショット）の応答待ち上限（秒）
-  tier3_timeout_sec: 300              # Slack 承認リクエストのタイムアウト（秒）
-  poll_interval_sec: 1                # 承認待ち中のポーリング間隔
+  hold_grace_sec: 60                  # 人間承認を worker に待たせる上限（秒）。これは「承認の期限」ではなく
+                                      # 「worker を待たせる上限」。超過したら承認は pending のまま生かし、
+                                      # worker だけ畳んで枠を返す（§3.3 (4) / §8.10）。自動 deny はしない
+  max_reinject: 3                     # 同一タスクの再投入回数の上限。承認と再投入が循環して収束しない場合に
+                                      # failed へ倒し、収束しなかったことを Slack へ明示する（§8.10）
+  poll_interval_sec: 1                # 承認待ち中のポーリング間隔／保留レコードの決着監視間隔
 
 # モデル関連設定（routing / fallback / concurrency / models）は ya-ta.yaml に集約。
 # Orchestrator 起動時に ya-ta.yaml と当ファイルをマージして単一 config を構築する。
@@ -92,10 +106,13 @@ qu-e:
 file_audit:
   alert_dir: "/opt/taka-ma/data/file-audit-alerts"  # qu-e からの SSH push 受信先（watchdog で監視）
 
-# §8.13 タスクコンテキスト送信 — Orchestrator._push_task_context() が参照
+# §8.13 タスクコンテキスト送信 — Orchestrator._push_task_context() / ConversationManager が参照
 task_context:
   remote_dir: "/opt/taka-ma/data/task-context"  # MBP 上の qu-e 受信先
   workspace_base: "/opt/taka-ma/work"           # タスク専用作業ディレクトリの基底（実体は {base}/{task_id}）
+  worker_home: "/Users/youruser"                # worker ホスト（MBP）の HOME 絶対パス。repo: / 自然文リポジトリ
+                                                # 指定の `~/` 前置きをこの値で展開する（§8.13 / #143。sa-ru は
+                                                # MBP 側ホームを自力解決できない。未設定なら ~ 指定は差し戻し）
 
 # §8.14 リソース最適化通知 受信 — ResourceNotifyHandler（watchdog）が参照
 # qu-e から SSH push される推奨 heavy 並行数で max_heavy_instances を動的更新する

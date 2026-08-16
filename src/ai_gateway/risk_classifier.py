@@ -20,8 +20,13 @@ class RiskClassifier:
     """
 
     def __init__(self, config):
-        """ya-ta.yaml の ya-ta.model（判定に使うローカルモデル）と接続先 ollama を取り出す。"""
-        self.model = config["ya-ta"]["model"]
+        """ya-ta.yaml の ya-ta.risk_model（判定に使うローカルモデル）と接続先 ollama を取り出す。
+
+        分解用の ya-ta.model と別キーにしているのは、リスク判定が worker のツール呼び出しごとに
+        同期で挟まる位置に在り、1 回の所要時間がそのまま worker の実行時間へ積み上がるため
+        （速度優先で分解とは別モデルを選べるようにする。値と実測は ya-ta.yaml 参照）。
+        """
+        self.model = config["ya-ta"]["risk_model"]
         # 接続先はマージ済み config の sa-ru.ollama_host を唯一の源にする（設計書 §8.4）
         self.ollama_host = config["sa-ru"]["ollama_host"]
         # タイムアウトは ya-ta.yaml を唯一の供給元とする（設計書 §8.4。コード側に既定値を

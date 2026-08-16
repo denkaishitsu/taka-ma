@@ -4,16 +4,23 @@
 関連: 設計書 §1.3 / §2.2 / §8.4 / §10
 """
 
+import os
 import sys
 sys.path.insert(0, "/opt/taka-ma/ya-ta")
 # approval-pipeline はハイフン dir でパッケージ import 不可のため sys.path 経由で bare import する
 sys.path.insert(0, "/opt/taka-ma/sa-ru/approval-pipeline")
+# 開発機（未配備）向けフォールバック。配備先の絶対パスは上で先頭に入れてあるため、
+# 本番では常にそちらが先に当たり解決先は変わらない。末尾に足すのはリポジトリ上の実体
+# src/approval-pipeline で、これが無いと開発機の pytest が interceptor を解決できず落ちる。
+sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                             "approval-pipeline"))
 
 import asyncio
 import datetime
+import glob
 import json
 import logging
-import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -32,8 +39,10 @@ from orchestrator.process_manager import RemoteProcessManager
 from orchestrator.slack_notifier import SlackNotifier
 from orchestrator.pty_wrapper import WorkerPtyWrapper
 from orchestrator.headless_runner import WorkerHeadlessRunner, build_hook_settings
+from orchestrator.preflight import AuthPreflight, PreflightFailure
 from orchestrator.concurrency import DynamicConcurrencyLimiter
 from orchestrator.conversation import ConversationManager
+from orchestrator.grounding import GroundingReport, GroundingVerifier
 from orchestrator.plan import PlanService, effective_deps
 from orchestrator.resource_monitor import ResourceMonitor
 from orchestrator.file_queue import FileQueue, atomic_write_json
@@ -53,6 +62,56 @@ from orchestrator.file_queue import FileQueue, atomic_write_json
 # （#80 の構造化プロトコルへの移行で解消予定）。
 _TASK_STARTUP_GRACE_SEC = 20  # タスク送信後、この秒数が経つまでは無音でも完了とみなさない
 _IDLE_QUIET_SEC = 20          # 起動猶予後、この秒数以上新規出力が無ければ完了とみなす
+
+
+# ── 承認保留（§3.3 (4) / §8.10）──
+
+# 承認保留に落ちたタスクの status。completed でも failed でもない第 3 の終端で、人間の決着を
+# 待つ状態を表す。dispatcher の claim("init") にも起動時の予約回収（accepted/in_progress）にも
+# 拾われず、_approval_hold_loop だけが決着を見て init へ戻す。
+STATUS_PENDING_APPROVAL = "pending_approval"
+
+# 承認レコード（{approval_dir}/{request_id}.json）の status 契約値。承認パイプライン
+# （tier3_handler.py）・u-zu（approval_store.py）と**同じ文字列**を使う規約で、3 者は別ツリー
+# 配備のため import 共有できない（`grep STATUS_APPROVAL_` で三者一致を確認する）。
+STATUS_APPROVAL_PENDING = "pending"
+STATUS_APPROVAL_APPROVED = "approved"
+STATUS_APPROVAL_REJECTED = "rejected"
+
+# 承認レコードのファイル名に用いる request_id の受理形式（uuid 相当：英数とハイフンのみ）。
+# タスクファイル由来の値をそのままパス連結するため、パス区切り・親参照を弾いて承認
+# ディレクトリ外への参照を防ぐ（u-zu の `/taka-ma-approve` と同じ規律・§8.10）。
+_APPROVAL_ID_RE = re.compile(r"[A-Za-z0-9-]+")
+
+# 中止命令（§8.10d）で停止したタスクの result に刻む理由。終端 status は failed を再利用する
+# （§8.10 の却下中止と同じ規律。専用 status を新設すると sa-ru/u-zu/qu-e 3 者への契約追加になる）。
+_CANCELLED_BY_CONTROL = "中止命令により停止"
+
+# 中止報告の 1 行に載せる指示文の最大長（一覧性優先。全文はタスクファイルが正本）
+_CANCEL_REPORT_MAX_CHARS = 60
+
+
+def _cancel_display(text: str) -> str:
+    """中止報告（§8.10d）の一覧行向けに指示文/要約を 1 行へ丸める。全文はタスクファイルが正本。"""
+    line = " ".join(text.split())
+    if len(line) > _CANCEL_REPORT_MAX_CHARS:
+        line = line[:_CANCEL_REPORT_MAX_CHARS] + "…"
+    return line or "（指示文なし）"
+
+
+class ApprovalHold(Exception):
+    """サブタスクが承認保留で未了のまま畳まれたことを表す内部シグナル（設計書 §3.3 (4)）。
+
+    保留は worker の障害ではないため、昇格ラダー（`_execute_worker_task` の候補ループ）へは
+    決して流さない。次段モデルへ昇格させると「承認を迂回した実行」になりうるためで、
+    `_run_candidate` は保留を例外ではなく戻り値 `("hold", request_id)` で返し、この例外は
+    昇格判断を終えた後の「サブタスク完了通知 future」の解決にのみ使う（後続の cascading skip を
+    従来経路のまま働かせ、タスク単位で畳むため）。
+    """
+
+    def __init__(self, request_id: str):
+        super().__init__(f"承認保留により中断（承認 ID: {request_id}）")
+        self.request_id = request_id
 
 
 def _select_method(model_conf: dict, use_case: str = "default") -> str:
@@ -168,8 +227,11 @@ logger = logging.getLogger("sa-ru.orchestrator")
 
 # タスクキューの dir / ポーリング間隔は sa-ru.yaml の task_queue ブロックを唯一の源にする
 # （旧 TASK_DIR / POLL_INTERVAL 定数は yaml と二重定義だったため撤去）。
-# 承認ファイルのディレクトリは Tier3Handler（approval-pipeline/tier3_handler.py）が
-# `TAKA_MA_APPROVAL_DIR` で一元管理する。ここでは持たない（旧・未使用定数を撤去）。
+# 承認ファイルのディレクトリは書き手（Tier3Handler・u-zu の approval_store）が環境変数
+# `TAKA_MA_APPROVAL_DIR` で一元管理する。sa-ru は #132 で「保留レコードを読む」読み手に
+# なったため、同じ env を同じ優先順で解決し（未設定なら sa-ru.yaml の approval.dir を既定に
+# 使う）、書き手と読み手が別のディレクトリを見る事故を構造的に防ぐ。ここで yaml だけを見ると、
+# env で配備先を変えた瞬間に保留が永久に検知されなくなる（タスクが pending_approval のまま滞留する）。
 
 
 class FileAuditHandler(FileSystemEventHandler):
@@ -284,6 +346,10 @@ class Orchestrator:
         mbp_host = ssh_conf["mbp_host"]
         ssh_timeout = ssh_conf["timeout_sec"]
         self.process_mgr = RemoteProcessManager(ssh_host=mbp_host, ssh_timeout=ssh_timeout)
+        # worker 起動前の認証プリフライト（SSH / git remote / Anthropic の事前検査と原因切り分け）。
+        # SSH 先は process_mgr と同じ mbp_host（供給元を 1 つに保つ）。運用値は sa-ru.yaml の
+        # preflight ブロックが唯一の源（コード側に既定値なし。欠落は KeyError で即落とす）
+        self.preflight = AuthPreflight(ssh_host=mbp_host, conf=config["preflight"])
         self.slack = SlackNotifier()
 
         # LLM 処理待ちのハートビート通知間隔（§10.8）。sa-ru.yaml の heartbeat.interval_sec を
@@ -297,6 +363,14 @@ class Orchestrator:
         # すると「08 は 05 sa-ru 稼働を前提／05 は 08 配備を前提」の循環になり sa-ru が単体起動できない。
         self._mbp_host = mbp_host
         self._approval_pipeline = None
+
+        # 承認保留の決着監視（§8.10）。承認レコードの置き場・監視間隔・再投入回数の上限は
+        # sa-ru.yaml の approval ブロックを唯一の源にする（Tier3 ハンドラ・u-zu と同じ dir を
+        # 指すことでファイルベース cross-process が成立する。コード側に既定値を置かない）。
+        approval_conf = config["approval"]
+        self.approval_dir = os.environ.get("TAKA_MA_APPROVAL_DIR", approval_conf["dir"])
+        self.approval_poll = approval_conf["poll_interval_sec"]
+        self.max_reinject = approval_conf["max_reinject"]
 
         # カテゴリ別キュー（FIFO、上限付き）
         # execution 軸でレーン分離。inline=無制限、agent=heavy_limiter 制限
@@ -323,7 +397,21 @@ class Orchestrator:
             self._plan_execution, config.get("models", {}).keys())
         self.conversation = ConversationManager(config, self.slack, task_dir=self.task_dir,
                                                  classifier=self.classifier,
-                                                 plan_service=self.plan_service)
+                                                 plan_service=self.plan_service,
+                                                 process_mgr=self.process_mgr,
+                                                 canceller=self.request_cancel)
+
+        # 停止命令の実行台帳（§8.10d）。task_id → {"chain": 連鎖実行の asyncio.Task,
+        # "workers": worker の asyncio.Task 集合}。dispatcher が連鎖起動時に登録し、完了時に
+        # done_callback で自動削除する。中止はこの台帳を引いて cancel する。
+        self._running_tasks: dict[str, dict] = {}
+        # 中止済み task_id の集合。キューに滞留中（worker 未取得）のサブタスクを worker 取得時に
+        # スキップさせ、cancel の隙間からの遅延実行を防ぐ（§8.10d）。プロセス再起動でクリアされる
+        # 揮発情報で、件数はタスク数オーダーのため保持し続けても肥大しない。
+        self._cancelled_tasks: set[str] = set()
+        # request_cancel（会話スレッドからの同期呼び出し）が cancel コルーチンを委譲する先の
+        # イベントループ。run() の起動時に捕捉する。
+        self._loop: asyncio.AbstractEventLoop | None = None
         # 会話/着手確認の dir・ポーリング間隔は config を唯一の源にする（コード既定値なし・二重定義を避ける）
         self.conversation_dir = config["conversation"]["dir"]
         self.conversation_poll = config["conversation"]["poll_interval_sec"]
@@ -358,10 +446,15 @@ class Orchestrator:
 
     async def run(self):
         """dispatcher + 2ワーカーを並行起動。watchdog Observer は別スレッドで起動（§8.12）。"""
+        # 停止命令（§8.10d）の cancel 委譲先ループを捕捉する。request_cancel は会話スレッド
+        # （to_thread）から呼ばれるため、asyncio タスクの cancel はこのループへ委譲する必要がある。
+        self._loop = asyncio.get_running_loop()
         # 起動時の予約回収（reserve-then-crash 回復・§8.3）。前プロセスが accepted/in_progress の
         # まま落ちたタスクは claim('init') に拾われず恒久滞留するため、init へ戻して再処理させる。
         # 真の起動点（run）で 1 回だけ実施する（_dispatcher に置くと _supervise 再起動時に実行中の
         # in_progress タスクまで init へ戻し二重実行を招く）。
+        # pending_approval は回収対象に**含めない**。人間の決着待ちであって落ちた予約ではなく、
+        # init へ戻すと承認前に未了分が走り出す（承認の迂回）。決着は _approval_hold_loop が見る。
         reclaimed = self.task_q.reclaim({"accepted", "in_progress"}, "init")
         if reclaimed:
             logger.warning(
@@ -392,6 +485,7 @@ class Orchestrator:
             self._supervise(self._conversation_loop, "conversation_loop"),    # 会話受信
             self._supervise(self._exec_confirmation_loop, "exec_confirmation_loop"),  # 着手確認
             self._supervise(self._control_loop, "control_loop"),             # 制御命令
+            self._supervise(self._approval_hold_loop, "approval_hold_loop"), # 承認保留の決着（§8.10）
         ]
         if self.resource_monitor is not None:
             coros.append(self._supervise(self.resource_monitor.watch, "resource_monitor"))  # §7.1
@@ -470,6 +564,13 @@ class Orchestrator:
                     await self._update_status(task_file, "completed")
                     continue
 
+                # 分解中に中止命令（§8.10d）が届いたタスクは受付通知も連鎖起動もしない
+                # （タスクファイルは中止側が failed へ終端済み。通知すると「中止しました」の後に
+                # 「タスク受付」が届く転倒になり、起動すると _update_status が移動済みパスを
+                # 開いて落ちるだけの死に連鎖になる）。
+                if task["task_id"] in self._cancelled_tasks:
+                    continue
+
                 accepted_msg = (f"タスク受付: 承認済みの計画 {len(subtasks)} 件で実行します"
                                 if frozen_plan else
                                 f"タスク受付: {len(subtasks)}件のサブタスクに分解")
@@ -479,10 +580,12 @@ class Orchestrator:
                     team_id=task.get("team_id"),
                     thread_ts=task.get("thread_ts"))
 
-                # 連鎖実行を非同期タスクとして起動（dispatcher はブロックしない）
-                asyncio.create_task(
+                # 連鎖実行を非同期タスクとして起動（dispatcher はブロックしない）。
+                # 起動と同時に実行台帳へ登録し、中止命令（§8.10d）が cancel できるようにする。
+                chain = asyncio.create_task(
                     self._execute_chain(task_file, task, subtasks)
                 )
+                self._track_chain(task["task_id"], chain)
             except Exception as e:
                 logger.exception("タスクの分解/受付に失敗: %s", task_file)
                 try:
@@ -595,6 +698,125 @@ class Orchestrator:
         except Exception:
             logger.exception("制御命令の結果通知に失敗: %s", command)
 
+    # ── 停止命令の即時実行（§8.10d）: 実行台帳と cancel 本体 ──
+
+    def _track_chain(self, task_id: str, chain: asyncio.Task):
+        """連鎖実行タスクを実行台帳へ登録する。完了時に台帳から自動削除する（§8.10d）。"""
+        entry = self._running_tasks.setdefault(task_id, {"chain": None, "workers": set()})
+        entry["chain"] = chain
+        chain.add_done_callback(lambda _t: self._running_tasks.pop(task_id, None))
+
+    def _track_worker(self, task_id: str, worker: asyncio.Task):
+        """worker タスクを実行台帳の該当エントリへ登録する（§8.10d）。
+
+        エントリ不在（台帳未登録のタスク・連鎖終端後の遅延投入）は登録しない — その worker は
+        cancel 対象から漏れるが、中止済み task_id 集合のガード（_execute_worker_task 冒頭）が
+        実行自体を止めるため、中止の実効性は失われない。
+        """
+        entry = self._running_tasks.get(task_id)
+        if entry is None:
+            return
+        entry["workers"].add(worker)
+        worker.add_done_callback(lambda _t: entry["workers"].discard(_t))
+
+    def _cancel_running(self, task_id: str):
+        """実行台帳の該当エントリ（worker 群 → 連鎖）を cancel する（台帳に無ければ何もしない）。
+
+        遠隔プロセスの回収は実行アダプタごとの既存資源回収経路に乗る（§8.10d）: headless は
+        CancelledError でローカル ssh を kill し `-tt` の SIGHUP がリモート `claude -p` へ伝播、
+        pty は finally の wrapper.close（tmux kill-session）。subprocess（ollama 単発）は
+        別スレッド同期実行のため途中打ち切りできないが、結果は破棄され後続ステップは走らない。
+        """
+        entry = self._running_tasks.pop(task_id, None)
+        if entry is None:
+            return
+        for worker in list(entry["workers"]):
+            worker.cancel()
+        chain = entry.get("chain")
+        if chain is not None:
+            chain.cancel()
+
+    def request_cancel(self, msg: dict) -> dict:
+        """停止命令の実行本体（ConversationManager へ注入する canceller・§8.10d）。
+
+        会話処理は to_thread の別スレッドで走るため同期関数とし、asyncio タスクの cancel を
+        含む本体（_cancel_conversation_targets）はイベントループへ委譲して結果を待つ。
+        タイムアウト 60 秒は qu-e への SSH push（_update_status 内・接続タイムアウトあり）を
+        含んでも決着に十分な上限で、超過時は例外が会話側へ返り原因明示で報告される。
+        """
+        if self._loop is None:
+            raise RuntimeError("イベントループ未起動のため停止命令を実行できません")
+        future = asyncio.run_coroutine_threadsafe(
+            self._cancel_conversation_targets(msg), self._loop)
+        return future.result(timeout=60)
+
+    async def _cancel_conversation_targets(self, msg: dict) -> dict:
+        """発話と同一会話面（team_id + channel_id 一致）の計画・タスクを全て停止する（§8.10d）。
+
+        戻り値は報告用 {"confirms": [...], "running": [...], "queued": [...], "held": [...]}
+        （各要素は表示用の 1 行文字列）。規則が決定的なため対象の曖昧さは生じず、確認往復は
+        行わない。終端 status は failed を再利用し result に中止命令による停止と刻む
+        （§8.10 の却下中止と同じ規律。アーカイブ・qu-e への終了通知・起動時予約回収の非対象と
+        いう終端の契約を既存経路で満たすため）。
+        """
+        # 会話面の照合は None と ""（レコード側の既定値）を同一視して正規化する。素の比較だと
+        # msg 側の欠落（None）とレコード側の既定 "" が不一致になり、停止対象を取りこぼす
+        team_id = msg.get("team_id") or ""
+        channel_id = msg.get("channel_id") or ""
+        report = {"confirms": [], "running": [], "queued": [], "held": []}
+
+        # (a) 提示中の計画（exec-confirm pending）→ cancelled に書換えて done/ へ退避。
+        # 以後の着手ボタン押下はレコード不在として u-zu 側で安全に無視される
+        # （resolve_exec_confirm は pending 以外・不在で False を返す既存契約）。
+        for path, record in self.exec_confirm_q.iter_records():
+            if record.get("status") != "pending":
+                continue
+            if ((record.get("team_id") or "") != team_id
+                    or (record.get("channel_id") or "") != channel_id):
+                continue
+            record["status"] = "cancelled"
+            record["decided_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            record["decided_by"] = msg.get("user_id", "")
+            atomic_write_json(path, record)
+            self.exec_confirm_q.mark_done(path)
+            report["confirms"].append(_cancel_display(record.get("summary") or ""))
+
+        # (b) 未着手 (c) 実行中 (d) 承認保留のタスクを停止する
+        for path, task in self.task_q.iter_records():
+            status = task.get("status")
+            if status not in ("init", "accepted", "in_progress", STATUS_PENDING_APPROVAL):
+                continue
+            if ((task.get("team_id") or "") != team_id
+                    or (task.get("channel_id") or "") != channel_id):
+                continue
+            task_id = task.get("task_id", "")
+            # 先に中止済み集合へ入れ、dispatcher の連鎖起動・worker のキュー取得を塞いでから
+            # 実行中の asyncio タスク群を cancel する（cancel の隙間からの遅延実行を防ぐ）
+            self._cancelled_tasks.add(task_id)
+            self._cancel_running(task_id)
+            if status == STATUS_PENDING_APPROVAL:
+                # 保留の拠り所（承認レコード）を先に退避する（§8.10 _resolve_hold と同順。
+                # 残すと決着待ちの孤児レコードが承認ディレクトリに滞留する）
+                await asyncio.to_thread(
+                    self._archive_held_records, task_id, task.get("held_approval_id") or "")
+            try:
+                await self._update_status(path, "failed", result=_CANCELLED_BY_CONTROL)
+            except FileNotFoundError:
+                continue  # 走査と停止の間に完了/失敗で終端済み（アーカイブ移動済み）→ 停止対象外
+            label = _cancel_display(task.get("command") or "")
+            if status == "in_progress":
+                report["running"].append(label)
+            elif status == STATUS_PENDING_APPROVAL:
+                report["held"].append(label)
+            else:
+                report["queued"].append(label)
+
+        logger.info(
+            "中止命令を実行: team=%s channel=%s 計画=%d 実行中=%d 未着手=%d 承認待ち=%d",
+            team_id, channel_id, len(report["confirms"]), len(report["running"]),
+            len(report["queued"]), len(report["held"]))
+        return report
+
     # ── 着手確認ループ: 確認の決着を検知して確定タスクを生成（§8.3 (B)） ──
 
     async def _exec_confirmation_loop(self):
@@ -661,6 +883,153 @@ class Orchestrator:
                     thread_ts=record.get("thread_ts"))
             except Exception:
                 logger.exception("着手確認の失敗通知の送信に失敗: %s", path)
+
+    # ── 承認保留ループ: 保留タスクの決着を検知して再投入 / 中止（§8.10） ──
+
+    async def _approval_hold_loop(self):
+        """保留中（status=pending_approval）のタスクを走査し、承認の決着を反映する。
+
+        人間の決着に期限は無いため、ここは「待ち続ける」ことが正常動作である。保留はタスク
+        ファイルと承認レコードだけで自己完結しており（メモリ上に待機状態を持たない）、sa-ru を
+        再起動してもこのループが拾い直す。1 件の決着処理失敗でループを殺さないよう例外は
+        飲み込み、次周回で再試行する（決着はディスク上に残っているため取りこぼさない）。
+        """
+        while True:
+            for path, task in self.task_q.iter_records():
+                if task.get("status") != STATUS_PENDING_APPROVAL:
+                    continue
+                try:
+                    await self._resolve_hold(path, task)
+                except Exception:
+                    logger.exception("承認保留の決着処理に失敗（次周回で再試行）: %s", path)
+            await asyncio.sleep(self.approval_poll)
+
+    async def _resolve_hold(self, path: str, task: dict):
+        """保留タスク 1 件について承認レコードを見て、再投入 / 中止を決める（§8.10）。
+
+        - pending のまま       → 何もしない（人間の決着待ち。期限なし）
+        - approved             → 承認レコードを done/ へ退避し、タスクを init へ戻して再投入
+        - rejected / その他    → タスクを failed で中止
+        - レコード不在         → 追跡不能。failed で中止する（保留の拠り所を失っており、放置
+                                 すると誰にも決着させられないタスクが永久に残る）
+
+        再投入前に承認レコードを退避するのは、保留を解消してからでないと次の worker が
+        「保留中」と判定され（`_held_approval`）、走った途端にまた畳まれるため。
+        """
+        channel = task.get("channel_id")
+        team_id = task.get("team_id")
+        thread_ts = task.get("thread_ts")
+        task_id = task.get("task_id", "")
+        request_id = task.get("held_approval_id") or ""
+        record = await asyncio.to_thread(self._read_approval_record, request_id)
+        status = (record or {}).get("status")
+
+        if record is not None and status == STATUS_APPROVAL_PENDING:
+            return  # 決着待ち（保留の正常状態）
+
+        if status == STATUS_APPROVAL_APPROVED:
+            await asyncio.to_thread(self._archive_held_records, task_id, request_id)
+            # 再投入回数の上限（§8.10）。承認 → 再投入 → 同じ操作で再び保留、が延々繰り返す
+            # 場合に打ち切る。上限は「収束しなかった」ことの表明であり、承認そのものの否定ではない。
+            # 数値として解釈できない値（外部からの破損・手編集）は「収束したか判断できない」ため
+            # 上限超過と同じ扱いにする。0 に倒すと上限を素通りして循環が止まらなくなり、例外を
+            # 上へ投げると保留ループが同じタスクで毎周回失敗し続けてログを埋める。
+            try:
+                reinject_count = int(task.get("_reinject_count") or 0) + 1
+            except (TypeError, ValueError):
+                logger.warning("_reinject_count を解釈できません（上限超過として扱う）: %s", path)
+                reinject_count = self.max_reinject + 1
+            if reinject_count > self.max_reinject:
+                result_path = await self._update_status(
+                    path, "failed",
+                    result=f"再投入が上限（max_reinject={self.max_reinject}）を超えました")
+                await self._notify(
+                    f"承認と再投入が {self.max_reinject} 回を超えても収束しなかったため中止しました。"
+                    f"\n結果ファイル: {result_path}",
+                    channel, team_id=team_id, thread_ts=thread_ts)
+                return
+            # init へ戻すと dispatcher の claim("init") が拾い、凍結プラン（_plan）のうち
+            # completed_steps に無い step だけが実行される。held_approval_id は次の保留で
+            # 上書きされるまで残ると誤検知の元になるため、ここで消す。
+            await self._update_status(path, "init", extra={
+                "_reinject_count": reinject_count,
+                "held_approval_id": "",
+            })
+            await self._notify("承認を確認しました。未了分から再開します。", channel,
+                               team_id=team_id, thread_ts=thread_ts)
+            return
+
+        # rejected / レコード不在 / 想定外 status → 中止
+        if record is None:
+            reason = f"承認レコードが見つかりません (ID: {request_id})"
+            message = f"承認待ちの記録を追跡できないため中止しました（ID: {request_id}）。"
+        elif status == STATUS_APPROVAL_REJECTED:
+            reason = f"人間承認が却下されました (ID: {request_id})"
+            message = "却下により中止しました。"
+        else:
+            reason = f"承認レコードが想定外の status です: {status} (ID: {request_id})"
+            message = f"承認の状態を解釈できないため中止しました（status={status}）。"
+        await asyncio.to_thread(self._archive_held_records, task_id, request_id)
+        result_path = await self._update_status(path, "failed", result=reason)
+        await self._notify(f"{message}\n結果ファイル: {result_path}", channel,
+                           team_id=team_id, thread_ts=thread_ts)
+
+    def _read_approval_record(self, request_id: str) -> dict | None:
+        """承認レコードを読む。不在・破損・不正な request_id は None。
+
+        request_id はタスクファイル由来だが、そのままファイル名に連結するため形式を検証する
+        （u-zu の `/taka-ma-approve` と同じく、パス区切り・親参照による承認ディレクトリ外への
+        参照を防ぐ・§8.10「request_id の検証」）。
+        """
+        if not _APPROVAL_ID_RE.fullmatch(request_id or ""):
+            return None
+        try:
+            with open(os.path.join(self.approval_dir, f"{request_id}.json")) as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def _archive_held_records(self, task_id: str, request_id: str):
+        """当該タスクの保留を全て解消する（決着したレコード＋取り残しの保留レコード）。
+
+        通常は保留レコードは 1 タスクに 1 件（Tier3Handler が冪等化する）だが、同一タスクの
+        複数サブタスクが**同じ猶予ウィンドウ内で並行して** Tier3 に到達すると、どちらもまだ
+        held_at を見つけられず 2 件作られうる。決着した 1 件だけを退避すると、残り 1 件が
+        pending のまま `_held_approval` に拾われ、再投入した途端にまた畳まれる（人間が両方の
+        ボタンを押すまでタスクが進まない）。
+
+        未決着のまま退避するレコードがあっても承認を飛ばすことにはならない。そのツール実行は
+        ブロック済みで、再投入後に同じ操作へ到達すれば Tier3 が改めて立つ（§8.10「同じ操作を
+        人間に二度聞くことはあり得る」）。退避先は Tier3Handler._finalize と同じ done/。
+        """
+        for rid in [request_id] + self._held_request_ids(task_id):
+            if not _APPROVAL_ID_RE.fullmatch(rid or ""):
+                continue
+            src = os.path.join(self.approval_dir, f"{rid}.json")
+            done_dir = os.path.join(self.approval_dir, "done")
+            try:
+                os.makedirs(done_dir, exist_ok=True)
+                os.replace(src, os.path.join(done_dir, f"{rid}.json"))
+            except FileNotFoundError:
+                pass  # 既に退避済み／不在
+
+    def _held_request_ids(self, task_id: str) -> list[str]:
+        """当該タスクの保留レコード（status=pending かつ held_at 有り）の request_id を全て返す。"""
+        if not task_id:
+            return []
+        found = []
+        for path in sorted(glob.glob(os.path.join(self.approval_dir, "*.json"))):
+            try:
+                with open(path) as f:
+                    record = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if (record.get("task_id") == task_id
+                    and record.get("status") == STATUS_APPROVAL_PENDING
+                    and record.get("held_at")):
+                found.append(record.get("request_id")
+                             or os.path.basename(path)[:-len(".json")])
+        return found
 
     def _validate_subtask_graph(self, subtasks: list[dict]) -> str | None:
         """サブタスク分解の依存グラフを検証し、不正なら理由文字列を、健全なら None を返す（設計書 §10.3）。
@@ -737,6 +1106,10 @@ class Orchestrator:
         futures = {}       # step番号 → asyncio.Future（完了通知用）
         subtask_map = {s["step"]: s for s in subtasks}
 
+        # 保留からの再投入分（§8.10）。前回までに終わった step の出力はタスクファイルに
+        # 永続化されており、再実行せずそのまま結果として引き継ぐ（キーは JSON 都合で文字列）。
+        completed_steps = task.get("completed_steps") or {}
+
         # 各サブタスクの完了を通知する Future を準備
         for s in subtasks:
             futures[s["step"]] = asyncio.get_event_loop().create_future()
@@ -746,26 +1119,57 @@ class Orchestrator:
             for subtask in subtasks:
                 t = asyncio.create_task(
                     self._execute_subtask_in_chain(
-                        task, subtask, results, futures, channel)
+                        task, subtask, results, futures, channel, completed_steps)
                 )
                 pending_tasks.append(t)
 
             # 全サブタスクの完了を待つ（独立ブランチは失敗ブランチの影響を受けない）
             await asyncio.gather(*pending_tasks, return_exceptions=True)
 
+            # 承認保留は失敗より先に判定する（§3.3 (4)「保留を成功としても失敗としても記録しない」）。
+            # 保留された step は results に入らないため、順序を誤ると「未了＝失敗」と読み替えられ、
+            # 人間が承認する前にタスクが failed で捨てられる。
+            held = self._first_hold(futures)
+            if held:
+                await self._hold_task(task_file, task, subtasks, results, held,
+                                      channel, team_id, thread_ts)
+                return
+
             # 全サブタスク成功か判定
             failed_steps = [s["step"] for s in subtasks if s["step"] not in results]
             if not failed_steps:
                 final_result = results[subtasks[-1]["step"]]
-                result_path = await self._update_status(task_file, "completed", result=final_result)
-                # 結果は切り詰めず分割送信し、正本（結果ファイル）のパスを必ず併記する（§8.9）
-                await self._notify_chunked(
-                    f"タスク完了（結果ファイル: {result_path}）:", final_result,
-                    channel, team_id=team_id, thread_ts=thread_ts)
+                # 完了報告の実出力グラウンディング（§8.9）。worker の自己申告（push/コミット
+                # 主張）を workspace の実状態と突き合わせ、判定・証跡を実出力から機械導出する。
+                # 主張の検出は最終出力だけでなく全 step の出力を対象にする（push が途中 step の
+                # こともある）。SSH の同期実行を含むため to_thread でループから切り離す（§10.7）。
+                all_outputs = "\n".join(str(v) for v in results.values())
+                grounding = await asyncio.to_thread(
+                    self._ground_result, task, all_outputs)
+                # 証跡は正本（結果ファイル）にも残す（§8.9。Slack 表示と独立に全文へ到達できる）
+                result_record = f"{final_result}\n\n{grounding.text}"
+                result_path = await self._update_status(task_file, "completed",
+                                                        result=result_record)
+                # 完了/未完了の文言は検証結果から機械導出する（worker 出力は「worker の報告」
+                # として区別して送る）。結果は切り詰めず分割送信し、正本パスを必ず併記する（§8.9）
+                if grounding.ok:
+                    header = f"タスク完了（結果ファイル: {result_path}）:"
+                else:
+                    header = (f"⚠ タスク未完了: {grounding.note}"
+                              f"（結果ファイル: {result_path}）。worker の報告:")
+                await self._notify_chunked(header, final_result,
+                                           channel, team_id=team_id, thread_ts=thread_ts)
+                await self._notify_chunked("実測確認（sa-ru がコマンド実行で裏取り）:",
+                                           grounding.text,
+                                           channel, team_id=team_id, thread_ts=thread_ts)
                 # 完了結果を発生元の会話セッションへ還流する（§8.9「会話への還流」）。
-                # ファイル I/O とロック取得を含むため to_thread でループから切り離す（§10.7）
+                # グラウンディング判定を先頭に併記し、worker の自己申告を会話脳が事実として
+                # 引き継がないようにする。ファイル I/O とロック取得を含むため to_thread で
+                # ループから切り離す（§10.7）
                 await asyncio.to_thread(
-                    self.conversation.append_task_result, task, final_result, result_path)
+                    self.conversation.append_task_result, task,
+                    f"{grounding.summary}\n{final_result}", result_path,
+                    grounding.workspace)
             else:
                 result_path = await self._update_status(task_file, "failed")
                 await self._notify_failure(task, subtasks, results, failed_steps, channel,
@@ -775,6 +1179,68 @@ class Orchestrator:
             result_path = await self._update_status(task_file, "failed", result=str(e))
             await self._notify(f"タスク失敗: {e}\n結果ファイル: {result_path}",
                                channel, team_id=team_id, thread_ts=thread_ts)
+
+    def _ground_result(self, task: dict, worker_outputs: str) -> GroundingReport:
+        """完了報告のグラウンディング検証を実行する（同期・to_thread で呼ぶこと。§8.9）。
+
+        検証自体の想定外の失敗で完了通知を止めない（チェーンを failed に落とさない）。
+        ただし fail-open にはせず、「検証を実行できなかった」ことを ok=False の実測結果と
+        して返す（push 主張が未検証のまま「完了」と報告される事故＝虚偽完了そのものを防ぐ）。
+        """
+        workspace = None
+        try:
+            workspace = self._resolve_workspace(task)
+            verifier = GroundingVerifier(self.process_mgr.run_ssh_probe)
+            report = verifier.verify(workspace, worker_outputs)
+            report.workspace = workspace
+            return report
+        except Exception as e:
+            logger.exception("グラウンディング検証で想定外の失敗: task_id=%s", task.get("task_id"))
+            note = f"実測確認を実行できませんでした（{type(e).__name__}: {e}）"
+            return GroundingReport(
+                ok=False, note=note,
+                text=f"【実測確認】workspace: {workspace or '（未解決）'}\n{note}",
+                summary=f"（実測確認の結果、未完了: {note}）",
+                workspace=workspace)
+
+    @staticmethod
+    def _first_hold(futures: dict) -> str | None:
+        """いずれかのサブタスクが承認保留で畳まれていれば、その承認 ID を返す（無ければ None）。
+
+        保留は「タスク単位で畳む」（§10.4）ため、1 件でも保留があればタスク全体が保留になる。
+        exception() の取得は future の「例外が未回収」警告の解消も兼ねる。
+        """
+        for fut in futures.values():
+            if not fut.done() or fut.cancelled():
+                continue
+            exc = fut.exception()
+            if isinstance(exc, ApprovalHold):
+                return exc.request_id
+        return None
+
+    async def _hold_task(self, task_file: str, task: dict, subtasks: list[dict],
+                         results: dict, request_id: str, channel, team_id, thread_ts):
+        """承認保留でタスクを畳み、決着後に未了分から再投入できる状態をディスクに残す（§8.10）。
+
+        永続化するのは (a) 済んだサブタスクの出力 `completed_steps`、(b) 待っている承認の
+        `held_approval_id`、(c) 凍結プラン `_plan` の 3 つ。従来 (a) は `_execute_chain` の
+        メモリ上にしか無く、sa-ru を再起動すると失われた。(c) を書くのは、再投入時に再分解が
+        走ると step 番号が変わり `completed_steps` との対応が崩れる（済んだはずの作業が
+        やり直しになる、あるいは別の作業として実行される）ため。
+
+        Slack への保留通知は承認パイプライン（Tier3Handler）が既に送っているため、ここでは
+        重ねて送らない（同じ事象を 2 通で知らせない）。
+        """
+        completed_steps = dict(task.get("completed_steps") or {})
+        # 今回終わった分を積み増す（再投入をまたいで累積する。キーは JSON 都合で文字列）
+        completed_steps.update({str(step): output for step, output in results.items()})
+        await self._update_status(task_file, STATUS_PENDING_APPROVAL, extra={
+            "completed_steps": completed_steps,
+            "held_approval_id": request_id,
+            "_plan": subtasks,
+        })
+        logger.info("承認保留でタスクを畳みました: task_id=%s 承認ID=%s 済み step=%s",
+                    task.get("task_id"), request_id, sorted(completed_steps))
 
     async def _notify(self, text, channel=None, *, team_id=None, thread_ts=None):
         """Slack 送信をイベントループから切り離す薄いラッパー（§10.7）。
@@ -859,7 +1325,7 @@ class Orchestrator:
 
     async def _execute_subtask_in_chain(self, task: dict, subtask: dict,
                                          results: dict, futures: dict,
-                                         channel: str):
+                                         channel: str, completed_steps: dict | None = None):
         """単一サブタスクを実行する。依存がある場合は先に完了を待つ。
 
         このサブタスクの完了通知 futures[step] は、成功・依存先失敗・ワーカー例外・投入失敗の
@@ -867,6 +1333,9 @@ class Orchestrator:
         抜けると、この step に依存する後続サブタスクの `await futures[dep]` が永久ブロックし、
         _execute_chain の gather も戻らず（タスクは in_progress のまま恒久ハング）になるため、
         全経路を try で囲い、例外時は futures[step] へ伝播させて cascading skip を機能させる。
+
+        completed_steps（保留からの再投入時のみ非空）にこの step があれば、worker を起動せず
+        その出力を結果として即座に引き渡す（§8.10「既に済んだサブタスクを再実行しない」）。
         """
         step = subtask["step"]
         command = subtask["command"]
@@ -879,6 +1348,18 @@ class Orchestrator:
         depends_on = subtask.get("depends_on", [])
 
         try:
+            # 保留前に完了済みの step は再実行しない（§8.10）。依存待ちより先に置くのは、
+            # 済んだ step の依存先もまた済んでいるはずで、待つ意味が無いため（依存先が保留で
+            # 未了なら、この step も未了のはずで completed_steps には入らない）。
+            done_output = (completed_steps or {}).get(str(step))
+            if done_output is not None:
+                results[step] = done_output
+                futures[step].set_result(done_output)
+                await self._notify(
+                    f"  サブタスク {step}: 承認前に完了済みのためスキップ", channel,
+                    team_id=task.get("team_id"), thread_ts=task.get("thread_ts"))
+                return
+
             # 依存するサブタスクの完了を待つ（複数依存対応）
             dep_results = []
             for dep in depends_on:
@@ -962,6 +1443,7 @@ class Orchestrator:
         while True:
             item = await self.queue_inline.get()
             t = asyncio.create_task(self._execute_worker_task(item))
+            self._track_worker(item.get("task_id", ""), t)  # 中止命令の cancel 対象へ登録（§8.10d）
             running.append(t)
             # 完了済みタスク参照を捨てて running リストの無限肥大を防ぐ（保持は GC 抑止のため）
             running = [t for t in running if not t.done()]
@@ -974,6 +1456,7 @@ class Orchestrator:
             # キューから取り出した後に枠を確保する。確保できるまでここで待つ＝同時起動数を上限に抑える
             await self.heavy_limiter.acquire()
             t = asyncio.create_task(self._execute_heavy_with_release(item))
+            self._track_worker(item.get("task_id", ""), t)  # 中止命令の cancel 対象へ登録（§8.10d）
             running.append(t)
             # 完了済みタスク参照を捨てて running リストの無限肥大を防ぐ
             running = [t for t in running if not t.done()]
@@ -1027,30 +1510,71 @@ class Orchestrator:
         return lane, candidates, user_specified
 
     async def _run_candidate(self, item, model_name, command, step,
-                             channel, team_id, thread_ts):
-        """単一モデル候補を method に応じた実行アダプタで走らせ、出力文字列を返す。
+                             channel, team_id, thread_ts) -> tuple[str, str]:
+        """単一モデル候補を method に応じた実行アダプタで走らせ、`(status, payload)` を返す。
+
+        - `("ok", 出力文字列)`: 通常完了
+        - `("hold", 承認ID)`: 実行中に承認保留が起きた（§3.3 (4)）
+
+        **保留を例外で返さない**のが要点（§8.10「昇格ラダーを回さない」）。例外にすると
+        呼び出し元の昇格ラダーが「モデル障害」と誤認して次段モデルで同じ作業を再実行し、
+        別の手順で承認を迂回しうる。保留は障害ではないため戻り値で表現する。
+
+        保留の判定に worker の終了状態は使えない。承認をブロックされた worker は「指示どおり
+        終わった」＝正常終了で返る（実機確認済み）ため、根拠は承認レコード（当該タスクに
+        status=pending かつ held_at を持つもの）に一本化する。worker が例外で終わった場合も
+        先に保留を確認する — 承認ブロック後に worker 側で別のエラーが起きても、実体は保留で
+        あり failed に倒すと人間の承認が届かなくなるため、保留を例外より優先する。
 
         instance_id に model_name を含めるため、昇格で複数モデルを順に走らせても
         workspace / tmux セッション名が衝突しない（Layer3 review 由来の是正を踏襲）。
         """
         model_conf = self.config["models"].get(model_name, {})
         method = _select_method(model_conf, use_case="default")
-        if method == "subprocess":
-            # subprocess 単発実行（ollama / 単発 API）
-            return await asyncio.to_thread(
-                self.process_mgr.run_model_subprocess, model_name, model_conf, command)
-        # headless（Claude Code）/ pty（agy 対話等の汎用対話 CLI）
-        model_flag = model_conf.get("model_flag", "")
-        cli_command = model_conf.get("command", "claude")
-        instance_id = f"{item['task_id']}-step{step}-{model_name}"
-        workspace = self._resolve_workspace(item)
-        if method == "headless":
-            return await self._run_worker_headless(
-                instance_id, cli_command, command, model_flag, workspace,
-                channel=channel, team_id=team_id, task_id=item["task_id"], thread_ts=thread_ts)
-        return await self._run_worker_pty(
-            instance_id, cli_command, command, channel, model_flag, workspace,
-            team_id=team_id, task_id=item["task_id"], thread_ts=thread_ts)
+        task_id = item["task_id"]
+        try:
+            if method == "subprocess":
+                # subprocess 単発実行（ollama / 単発 API）
+                output = await asyncio.to_thread(
+                    self.process_mgr.run_model_subprocess, model_name, model_conf, command)
+            else:
+                # headless（Claude Code）/ pty（agy 対話等の汎用対話 CLI）
+                model_flag = model_conf.get("model_flag", "")
+                cli_command = model_conf.get("command", "claude")
+                instance_id = f"{task_id}-step{step}-{model_name}"
+                workspace = self._resolve_workspace(item)
+                if method == "headless":
+                    output = await self._run_worker_headless(
+                        instance_id, cli_command, command, model_flag, workspace,
+                        channel=channel, team_id=team_id, task_id=task_id, thread_ts=thread_ts)
+                else:
+                    output = await self._run_worker_pty(
+                        instance_id, cli_command, command, channel, model_flag, workspace,
+                        team_id=team_id, task_id=task_id, thread_ts=thread_ts)
+        except Exception:
+            held = await asyncio.to_thread(self._held_approval, task_id)
+            if held:
+                return ("hold", held)
+            raise
+        held = await asyncio.to_thread(self._held_approval, task_id)
+        if held:
+            return ("hold", held)
+        return ("ok", output)
+
+    def _held_approval(self, task_id: str) -> str | None:
+        """当該タスクに未決着の保留レコードがあれば承認 ID を返す（無ければ None）。
+
+        保留レコードの条件は「status=pending かつ held_at を持つ」（§8.10）。承認パイプライン
+        （Tier3Handler）が別プロセスで書き、sa-ru はここで読むだけの片方向共有で、両者は
+        `approval.dir` という 1 つの設定値で結ばれる。done/ 配下は決着済みのため走査しない。
+        走査失敗（ディレクトリ不在・破損レコード）は保留なしとして扱う — 保留を見落とせば
+        タスクは通常の完了/失敗判定に落ちるだけで、承認レコード自体は生き続ける。
+
+        走査そのものは `_held_request_ids` に一本化する（検知と退避が別々の述語で保留を
+        数えると、片方だけが拾うレコードが取り残される）。
+        """
+        held = self._held_request_ids(task_id)
+        return held[0] if held else None
 
     async def _execute_worker_task(self, item: dict):
         """ワーカーがキューから受け取ったサブタスクを実行し、結果を Future にセットする。
@@ -1063,6 +1587,10 @@ class Orchestrator:
             _execute_heavy_with_release が 1 スロット保持。逐次昇格はその 1 枠で足りる）
           - 明示指定（`_user_specified`）は昇格・レーン跨ぎ再投入をしない（指定モデル尊重）
         昇格の引き金は「例外・タイムアウト」と「worker 出力の ESCALATE: 自己申告」の 2 つ（設計書 §2.2）。
+
+        承認保留（`_run_candidate` が `("hold", 承認ID)` を返す）はこのどちらでもない。昇格せず
+        再投入もせず、ApprovalHold を future にセットして即座に返る（§8.10）。ここで昇格すると
+        次段モデルが別の手順で同じ操作に到達し、人間の承認を待たずに実行しうる。
         """
         command = item["_command"]
         step = item["_step"]
@@ -1070,6 +1598,14 @@ class Orchestrator:
         channel = item.get("channel_id")
         team_id = item.get("team_id")
         thread_ts = item.get("thread_ts")
+
+        # 中止済みタスク（§8.10d）のサブタスクは実行しない。cancel 発行とキュー滞留の隙間
+        # （worker 未取得の投入済み item・昇格の agent レーン再投入）からの遅延実行を塞ぐ。
+        # future は cancel で解決する（連鎖側も cancel 済みのため待ち手は居ない）。
+        if item.get("task_id") in self._cancelled_tasks:
+            if not result_future.done():
+                result_future.cancel()
+            return
 
         # cross-review 分岐: 2 つ以上のモデル指定で並行投入
         raw_model = item.get("_model")
@@ -1092,8 +1628,13 @@ class Orchestrator:
         if lane == "inline":
             model_name = candidates[0]
             try:
-                output = await self._run_candidate(
+                status, payload = await self._run_candidate(
                     item, model_name, command, step, channel, team_id, thread_ts)
+                if status == "hold":
+                    # 承認保留。昇格も再投入もせず、このサブタスクを未了のまま畳む（§8.10）
+                    result_future.set_exception(ApprovalHold(payload))
+                    return
+                output = payload
                 reason = _escalate_reason(output)
                 if reason and not user_specified and len(candidates) > 1:
                     await self._notify(
@@ -1121,8 +1662,14 @@ class Orchestrator:
                     await self._notify(
                         f"  {candidates[idx - 1]} → {model_name} へ昇格実行", channel,
                         team_id=team_id, thread_ts=thread_ts)
-                output = await self._run_candidate(
+                status, payload = await self._run_candidate(
                     item, model_name, command, step, channel, team_id, thread_ts)
+                if status == "hold":
+                    # 承認保留。次段モデルへ昇格させると承認を迂回した実行になりうるため、
+                    # ここで候補ループを打ち切る（§8.10「昇格ラダーを回さない」）。
+                    result_future.set_exception(ApprovalHold(payload))
+                    return
+                output = payload
                 reason = _escalate_reason(output)
                 if reason and not user_specified and idx < len(candidates) - 1:
                     # 上位段が残っていれば昇格継続（この出力は採用しない）
@@ -1206,6 +1753,14 @@ class Orchestrator:
                 return (model_name, e)
 
         results = await asyncio.gather(*[_run_one(m) for m in models])
+
+        # 承認保留は統合より先に判定する（§8.10）。保留された（＝操作をブロックされた）モデルの
+        # 出力を混ぜて統合すると、承認前の中途半端な成果が「完了結果」として記録される。
+        held = await asyncio.to_thread(self._held_approval, item["task_id"])
+        if held:
+            result_future.set_exception(ApprovalHold(held))
+            return
+
         successes = [(m, r) for m, r in results if not isinstance(r, Exception)]
         failures = [(m, r) for m, r in results if isinstance(r, Exception)]
 
@@ -1375,6 +1930,16 @@ class Orchestrator:
         （team_id / channel / thread_ts / task_id）はフック stdin に乗らないため、ここで settings の
         フックコマンド引数へ焼き込む。
         """
+        # 起動前プリフライト: SSH / git remote / Anthropic の認証・到達性を検査し、不合格なら
+        # worker を起動しない。失敗種別と実出力の該当行を Slack へ明示し、SSH と Anthropic の
+        # 混同診断を防ぐ。昇格ラダーの再突入（TTL 内キャッシュの再検出）では同じ通知を重ねない。
+        # 例外はそのまま送出し、既存の失敗経路（昇格・failed 決着・Slack 通知）に乗せる。
+        try:
+            await asyncio.to_thread(self.preflight.check, workspace, cli_command)
+        except PreflightFailure as pf:
+            if not pf.cached:
+                await self._notify(pf.report(), channel, team_id=team_id, thread_ts=thread_ts)
+            raise
         # headless 運用値（フック timeout・python パス・全体上限）は sa-ru.yaml の headless
         # ブロックを唯一の源にする（コード既定値なし。欠落は KeyError で即落とし診断位置を揃える）
         hcfg = self.config["headless"]
@@ -1396,6 +1961,12 @@ class Orchestrator:
             instance_id, command=cli_command, model_flag=model_flag,
             ssh_host=self._mbp_host, cwd=workspace, hook_settings_path=settings_path)
         result = await runner.run(command, timeout=hcfg["run_timeout_sec"])
+        # 終了コードによる成功判定の機械化（§8.9）。result イベントを受信していても
+        # 非 0 終了は成功として扱わず、失敗経路（retry / 昇格ラダー）へ回す。
+        if result.returncode not in (0, None):
+            raise RuntimeError(
+                f"headless worker が非 0 終了 (exit={result.returncode}): {instance_id}: "
+                f"{(result.text or '')[:200]}")
         return result.text
 
     # ── /exam_gw ドライラン結果フォーマット ──
@@ -1472,13 +2043,19 @@ class Orchestrator:
 
     # ── ユーティリティ ──
 
-    async def _update_status(self, path: str, status: str, result: str = None) -> str:
+    async def _update_status(self, path: str, status: str, result: str = None, *,
+                             extra: dict | None = None) -> str:
         """タスクファイルの status を更新する。completed/failed はアーカイブ。
-        in_progress / completed / failed 遷移時に qu-e へタスクコンテキストを push する（§8.13）。
+        in_progress / completed / failed / pending_approval 遷移時に qu-e へタスクコンテキストを
+        push する（§8.13）。
 
         qu-e への push は SSH（同期・接続タイムアウトまで待つ）を含むため、イベントループを
         凍結させないよう to_thread で別スレッド実行する（§10.7）。ファイル I/O は高速なローカル
         操作のためそのまま行う。
+
+        extra は status と同時に書き込む追加フィールド（承認保留の completed_steps /
+        held_approval_id / 凍結プランなど）。読み直した最新のタスクへマージするため、
+        別経路の書込と競合しても status 以外の更新を取りこぼさない。
 
         戻り値はタスクファイルの最終所在（アーカイブ後は done/{日付}/ 配下）。完了・失敗
         通知に「結果の正本ファイルパス」を併記するために使う（§8.9）。
@@ -1489,12 +2066,16 @@ class Orchestrator:
         task["updated_at"] = datetime.datetime.now().isoformat()
         if result:
             task["result"] = result
+        if extra:
+            task.update(extra)
         # 状態遷移の書換も原子書込に統一（§8.3 書込の原子性）。書込中クラッシュで壊れた task が
         # 本パスに残り、次回起動の予約回収スキャンを誤らせるのを防ぐ。
         atomic_write_json(path, task)
 
         # §8.13 タスクコンテキスト共有(qu-e へ SSH push)。SSH の同期ブロッキングを別スレッドへ逃がす。
-        if status in ("in_progress", "completed", "failed"):
+        # pending_approval も push する。qu-e は終了系 status（completed/failed）でのみ workspace を
+        # 掃除・監視解除するため、保留を「終了」と伝えると再投入前に成果物が消えうる。
+        if status in ("in_progress", "completed", "failed", STATUS_PENDING_APPROVAL):
             await asyncio.to_thread(self._push_task_context, task)
 
         # completed/failed のファイルを done/{日付}/ に移動（ディレクトリ走査の肥大化防止）

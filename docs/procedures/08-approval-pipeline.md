@@ -48,7 +48,7 @@ sa-ru (Mac mini・interactive)
         ├── classifier     （ya-ta 連携 → Tier 判定、§3.3）
         ├── tier1_handler  （Low Risk: 自動承認）
         ├── tier2_handler  （Medium Risk: qu-e 審査 → deny 時 escalate、§8.8）
-        ├── tier3_handler  （High Risk: Slack 経由人間承認、§8.9、5 分タイムアウト）
+        ├── tier3_handler  （High Risk: Slack 経由人間承認、§8.9、猶予超過で保留・自動 deny なし）
         └── audit_logger   （jsonl 監査ログ、§3.5）
 ```
 
@@ -133,7 +133,9 @@ sudo 等のコマンドを投入し、Tier 3 ハンドラから Slack に承認�
 | Slack 通知 | 承認リクエストがチャネルに投稿される（Approve / Reject ボタン付き） | 通知が届かない、ボタン欠落 |
 | Approve ボタン | `y` が stdin に送信される、`decision: allow` | stdin 送信なし |
 | Reject ボタン | `n` が stdin に送信される、`decision: deny` | stdin 送信なし |
-| タイムアウト | `tier3_timeout_sec`（既定 300 秒）経過で自動 deny | タイムアウトせず無限待機 |
+| 猶予超過（保留） | `hold_grace_sec`（既定 60 秒）経過で worker が畳まれる。承認ファイルは `status=pending` のまま残り `held_at` が追記される。タスクは `completed` ではなく `pending_approval`、`completed_steps` が永続化される | 自動 deny される（`status=timeout` が書かれる）／タスクが `completed` になる |
+| 保留後の Approve | 承認ファイルが `done/` へ退避され、未了サブタスクのみが同じ workspace で再実行される | 再投入されない／済んだサブタスクが再実行される |
+| 保留後の Reject | タスクが `failed` として中止され Slack に通知される | 実行されてしまう |
 
 ### 5. 監査ログ記録
 
@@ -200,7 +202,7 @@ ssh mac-mini "launchctl bootstrap gui/\$(id -u) ~/Library/LaunchAgents/com.taka-
 
 ## 検証項目
 
-> **検証概要**: y/n 承認パイプラインが sa-ru の一部として組み込まれ、対話型 worker CLI からの y/n プロンプトを Tier 1/2/3 に分類し、それぞれ自動承認 / qu-e 審査 / Slack 経由人間承認を実行できることを確認する。`always_deny` 即時拒否、5 分タイムアウト、jsonl 監査ログを含む。
+> **検証概要**: y/n 承認パイプラインが sa-ru の一部として組み込まれ、対話型 worker CLI からの y/n プロンプトを Tier 1/2/3 に分類し、それぞれ自動承認 / qu-e 審査 / Slack 経由人間承認を実行できることを確認する。`always_deny` 即時拒否、承認 pending の保留・再投入（自動 deny なし）、jsonl 監査ログを含む。
 
 | # | 検証項目 | 対応 |
 |---|---------|------|
@@ -213,7 +215,12 @@ ssh mac-mini "launchctl bootstrap gui/\$(id -u) ~/Library/LaunchAgents/com.taka-
 | 7 | Tier 3（sudo 等）が Slack に通知を送信する | 動作確認 4 |
 | 8 | Slack の Approve ボタンで `y` が stdin に送信される | 動作確認 4 |
 | 9 | Slack の Reject ボタンで `n` が stdin に送信される | 動作確認 4 |
-| 10 | Tier 3 タイムアウト（`tier3_timeout_sec` 既定 300 秒）で自動 deny | 動作確認 4 |
+| 10 | 猶予（`hold_grace_sec` 既定 60 秒）超過で worker が畳まれ、承認は `pending` のまま存置される（自動 deny されない） | 動作確認 4 |
+| 10a | 保留時にタスクが `completed` でなく `pending_approval` になり、`completed_steps` が永続化される | 動作確認 4 |
+| 10b | 保留後の Approve で未了サブタスクのみが再投入される（済んだ step は再実行されない） | 動作確認 4 |
+| 10c | 保留後の Reject でタスクが `failed` として中止され Slack に通知される | 動作確認 4 |
+| 10d | 保留中は agent レーンの並行枠（`heavy_limiter`）が解放され、他タスクが実行できる | 動作確認 4 |
+| 10e | 保留中に sa-ru を再起動しても保留が失われず、その後の Approve で再投入される | 動作確認 4 |
 | 11 | 全操作が監査ログ（approval-audit.jsonl）に記録される | 動作確認 5 |
 | 12 | `always_deny` リストのコマンドが即座に拒否される | 動作確認 6 |
 | 13 | decide デーモンが launchd 常駐し UDS を待ち受けている | 動作確認 7 |
@@ -231,14 +238,15 @@ ssh mac-mini "launchctl bootstrap gui/\$(id -u) ~/Library/LaunchAgents/com.taka-
 | `RiskClassifier.classify()` | [`classifier.py`](../../src/approval-pipeline/classifier.py) | ya-ta へ Tier 判定を依頼（設計書 §3.3）。ya-ta はライブラリ方式のため `ai_gateway.RiskClassifier` を **in-process** 呼出（同期処理は to_thread） |
 | `Tier1Handler.handle()` | [`tier1_handler.py`](../../src/approval-pipeline/tier1_handler.py) | Low Risk: 自動承認 |
 | `Tier2Handler.handle()` | [`tier2_handler.py`](../../src/approval-pipeline/tier2_handler.py) | Medium Risk: qu-e 審査（§8.8）。qu-e へ **SSH** で `review_cli.py` を 1 ショット実行 → JSON。approve のみ承認、deny / escalate および失敗時は escalate を返す |
-| `Tier3Handler.handle()` | [`tier3_handler.py`](../../src/approval-pipeline/tier3_handler.py) | High Risk: Slack 経由人間承認（§8.9）、`tier3_timeout_sec` で自動 deny |
+| `Tier3Handler.handle()` | [`tier3_handler.py`](../../src/approval-pipeline/tier3_handler.py) | High Risk: Slack 経由人間承認（§8.9）。`hold_grace_sec` 超過で `hold`（承認は pending 存置・自動 deny しない。§8.10） |
 | `AuditLogger.log()` | [`audit_logger.py`](../../src/approval-pipeline/audit_logger.py) | jsonl 形式の監査ログ（§3.5） |
 | `DecideDaemon` / `PipelineHolder` | [`decide_daemon.py`](../../src/approval-pipeline/decide_daemon.py) | headless フック判定の常駐サーバ（UDS・asyncio 並行・config mtime 再ロード。設計 Appendix §2.1） |
 | `decide_client.main()` | [`decide_client.py`](../../src/approval-pipeline/decide_client.py) | フックの薄い入口（標準ライブラリのみ）。allow=exit 0 / deny・全異常=exit 2 の出力契約 |
 
 ### 設定
 
-- [`src/approval-pipeline/config/pipeline.yaml`](../../src/approval-pipeline/config/pipeline.yaml) — パイプライン設定を一元管理（`tier3_timeout_sec` / `audit.log_path` / `safety.always_deny` / `safety.always_escalate_to_human`）
+- [`src/approval-pipeline/config/pipeline.yaml`](../../src/approval-pipeline/config/pipeline.yaml) — パイプライン設定を一元管理（`audit.log_path` / `safety.always_deny` / `safety.always_escalate_to_human`）
+- [`src/orchestrator/config/sa-ru.yaml`](../../src/orchestrator/config/sa-ru.yaml) `approval` ブロック — Tier2/Tier3 の運用値（`tier2_timeout_sec` / `hold_grace_sec` / `max_reinject` / `poll_interval_sec`）
 - [`src/orchestrator/config/sa-ru.yaml`](../../src/orchestrator/config/sa-ru.yaml) `headless` ブロック — フックコマンドの組み立て材料（`mini_host` / `decide_client` / `decide_socket` / `python_bin` / `hook_timeout_sec`）
 
 ### テスト

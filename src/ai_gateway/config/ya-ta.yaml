@@ -3,6 +3,14 @@ ya-ta:
   model: "qwen3.6:27b-q4_K_M" # タスク分解・分類・リスク判定に使うモデル（ollama HTTP API 経由）。
                               # deepseek-r1:32b から入替（設計書 §2.2: GPQA 62.1→87.8 ほか全項目優位・
                               # 4bit 19GB→17GB）
+  risk_model: "qwen3.6:35b-a3b-q4_K_M"  # 承認ゲートのリスク分類（Tier 1/2/3）専用モデル。分解用の
+                              # 27b（dense）と分けるのは、リスク分類が worker のツール呼び出しごとに
+                              # 同期で挟まり、レイテンシがツール数に比例して worker の実行時間を支配
+                              # するため（実測 2026-07-29: 1 worker ステップ 68.6 秒のうち承認判定
+                              # 47.3 秒＝69%）。MoE（アクティブ 3B）は同一プロンプト・同一 tier 判定で
+                              # 大幅に速い（実測 2026-07-30・Mac mini・両モデル常駐・5 操作:
+                              # 27b dense 9.4〜12.8 秒 → 35b-a3b 2.0〜2.4 秒。tier は 5 操作すべて一致）。
+                              # sa-ru の会話脳と同一モデルのため常駐は 1 本で足り、追加メモリは不要
   llm_timeout_sec: 300        # 分解・分類・リスク判定 1 回のタイムアウト。旧値 60 秒は正常分解の
                               # 実測 58 秒と同水準で、正常動作でも受付失敗する際どい設定だった。
                               # 思考型モデルは思考が長引き得るため余裕を大きく取る。実測ログ
@@ -69,13 +77,14 @@ routing:
 #   - 自動推測を上書きしたい場合のみ明示記述する（複数 CLI 提供ベンダー・自前 CLI 等）
 models:
   opus:
-    full_name: "claude-opus-4.8"
+    full_name: "claude-opus-5"
     type: api
     vendor: anthropic
     methods: [headless]
     command: claude
     model_flag: "--model opus" # heavy デフォルト（明示指定必須。claude CLI 既定は端末の ~/.claude/settings.json
-                                # の model 設定に従うため無指定だと Opus 4.8 が保証されない。実機検証で確認済）
+                                # の model 設定に従うため無指定だと Opus 5 が保証されない。実機検証で確認済。
+                                # エイリアス opus は 2026-07-25 実機で Claude Opus 5 に解決）
     capabilities: [code, design, reasoning, implementation]
     description: "重量タスクの既定。探索・試行錯誤・ツール使用を伴う作業"
 
@@ -90,69 +99,94 @@ models:
     capabilities: [code, design, reasoning, implementation]
     description: "最難関タスク用。:fable で明示指定（難易度自動振り分けは Phase2）"
 
-  opus4.6:
-    full_name: "claude-opus-4.6"
-    type: api
-    vendor: anthropic
-    methods: [headless]
-    command: claude
-    model_flag: ""
-    capabilities: [code, design, reasoning, implementation]
-    description: "重量タスク。探索・試行錯誤・ツール使用を伴う作業"
-
   sonnet:
-    full_name: "claude-sonnet-4.6"
+    full_name: "claude-sonnet-5"
     type: api
     vendor: anthropic
     methods: [headless]
     command: claude
-    model_flag: "--model sonnet"   # エイリアス指定（"sonnet-4.6"は無効値・実機検証で拒否を確認）
+    model_flag: "--model sonnet"   # エイリアス指定（"sonnet-5"等のバージョン付き値は無効・実機検証で拒否を確認）。
+                                    # エイリアス sonnet は 2026-07-25 実機で Claude Sonnet 5 に解決
     capabilities: [code, reasoning]
     description: "中量タスク。Opus より高速・低コスト"
 
   haiku:
-    full_name: "claude-haiku-4.5"
+    full_name: "claude-haiku-4-5-20251001"
     type: api
     vendor: anthropic
     methods: [headless]
     command: claude
-    model_flag: "--model haiku"   # エイリアス指定（"haiku-4.5"は無効値・実機検証で拒否を確認）
+    model_flag: "--model haiku"   # エイリアス指定（"haiku-4.5"は無効値・実機検証で拒否を確認）。
+                                   # Claude 5 世代でも Haiku は 4.5 が最新（2026-07-25 実機で確認）
     capabilities: [light-task, qa]
     description: "軽量タスク。高速応答"
 
   gemini:
-    full_name: "gemini-3.5-flash"
+    full_name: "gemini-3.6-flash"
     type: api
     vendor: google
-    methods: [pty, subprocess]   # heavy 対話 = pty、高度なマルチモーダル解析単発 / cross-review / フォールバック = subprocess
+    methods: [subprocess]        # 単発のみ（高度なマルチモーダル解析 / cross-review / フォールバック）。
+                                 # pty を外した理由（2026-07-28）: pty の承認配線は実機 E2E で一度も
+                                 # 検証されておらず（E2E T08-V23 は未実施）、承認プロンプトに誰も
+                                 # 答えなかったときの挙動も未測定。未検証の承認経路を有効なまま
+                                 # 残すより閉じる方が安全と判断した（設計 §8.6）。
+                                 # 再開の条件: 無応答時の挙動を実測し fail-closed を確認すること。
+                                 # 実測は agy のクォータ枯渇（2026-07-28 時点で復帰まで約 96 時間）で保留中
     command: agy                 # Antigravity CLI（Gemini CLI の後継）。認証は macOS keychain 依存（設計書 §8.5/§8.6）
     keychain_auth: true          # 認証が macOS keychain 依存 → SSH 直実行不可。GUI 起源 tmux 内で実行（§8.6）
-    model_flag: "-p"   # agy: -p=非対話単発。--model は付加しない — subprocess 経路は run_model_subprocess が
-                        # プロンプトを model_flag の末尾に追記するため "-p --model X <prompt>" の語順になり、
-                        # agy の -p は次トークンをプロンプト値として消費する実装のため --model の文字列自体を
-                        # プロンプトとして誤消費し本来のプロンプトが黙って破棄される（実機検証で再現・2026-07-03）。
-                        # agy 既定モデルが 3.5 Flash のため --model 省略でも要件（Flash 応答）を満たす
+    model_flag: "-p"   # agy: -p=非対話単発。--model は付加しない — agy 既定が 3.6 Flash (High) へ更新された
+                        # ため省略で要件を満たす。本番経路（GUI 起源 tmux）でログ実測・2026-07-26:
+                        #   --model なし → label="Gemini 3.6 Flash (High)"
+                        # --model を併用する場合は必ず -p より前に置き、値は括弧付きの表示名にする
+                        # （"-high" スラッグは解決されず既定へ黙って落ちる。gemini-pro 側コメント参照）
     capabilities: [multimodal-analysis, code, reasoning]
     capability_description: |
       - 動画・音声・画像の高度な解析（理解）を含むタスク → model: "gemini"
         （基本的な解析はローカル gemma4 が担当。生成は Phase 2 — 設計書 §2.4 参照）
       - heavy 対話タスクのセカンドオピニオン → cross-review
       - Opus 障害時のフォールバック（テキスト・コード）
-    description: "Gemini 既定（3.5 Flash）。高速・低コストで高度なマルチモーダル解析 + heavy 対話"
+    description: "Gemini 既定（3.6 Flash）。高速・低コストで高度なマルチモーダル解析 + heavy 対話"
 
   gemini-pro:
     full_name: "gemini-3.1-pro"
     type: api
     vendor: google
-    methods: [pty, subprocess]
+    methods: [subprocess]        # subprocess 単発のみ。pty を外した理由: 下の model_flag は
+                                 # 二重引用符と括弧を含み、PTY 経路の起動文字列
+                                 # （pty_wrapper._build_invocation → ssh -tt 'tmux new-session … "<invocation>"'）
+                                 # の入れ子クォートを壊す（remote zsh が `no matches found: (High) -p` で失敗。
+                                 # 2026-07-25 に同一構成文字列で再現）。:gemini-pro の用途（高度な
+                                 # マルチモーダル解析の単発・長文脈）は subprocess で満たせる。
+                                 # PTY 経路のクォート堅牢化は別タスク #129 で対応する
     command: agy
     keychain_auth: true
-    model_flag: "-p --model gemini-3.1-pro"   # agy: 最上位を明示選択（Phase2 未着手・現状無効。理由2件:
-                                                # (a) subprocess 経路は語順が "-p --model X <prompt>" になり
-                                                #     プロンプトが破棄される（gemini 側コメント参照）。
-                                                # (b) 語順を正しても（"-p <prompt> --model X"）agy 1.0.16 は
-                                                #     --model で実際に 3.1 Pro へ切替わらない（自己申告が常に
-                                                #     3.5 Flash のまま。実機検証で再現・2026-07-03）
+    model_flag: '--model "Gemini 3.1 Pro (High)" -p'   # agy: 最上位を明示選択。2026-07-03 に無効だった 2 点は
+                                                        # agy 1.1.7 実機（2026-07-26）で解消を確認:
+                                                        # (a) 語順を "--model X -p <prompt>" にすれば -p が
+                                                        #     プロンプトを正しく取る（--model を -p の後ろに
+                                                        #     置くと --model がプロンプトとして消費される）。
+                                                        # (b) モデル名は括弧付きの表示名（"Gemini 3.1 Pro (High)"）
+                                                        #     でなければ切替わらない。旧値 "gemini-3.1-pro" が
+                                                        #     無効だった真因はこれ。
+                                                        # ⚠️ `agy models` の出力を写経しないこと: 1.1.7 の
+                                                        #    `agy models` はスラッグ（gemini-3.1-pro-high）を出すが、
+                                                        #    --model はスラッグを一部しか解決できない。本番経路
+                                                        #    （GUI 起源 tmux）での実測 2026-07-26:
+                                                        #      gemini-3.1-pro-high  → Gemini 3.6 Flash (High)  ✗
+                                                        #      gemini-3.1-pro-low   → Gemini 3.1 Pro (Low)     ○
+                                                        #      "Gemini 3.1 Pro (High)" → Gemini 3.1 Pro (High) ○
+                                                        #    両方とも `agy models` に載るのに -high だけ解決されない
+                                                        #    ＝ agy 側のマッピング欠落。エラーにならず黙って既定へ
+                                                        #    落ちるため、値を変えたら必ず下記で実測すること。
+                                                        # 検証方法（モデルの自己申告は実測で揺れるため使わない）:
+                                                        #   agy --log-file /tmp/a.log --model <X> -p 'say ok'
+                                                        #   grep 'Propagating selected model override' /tmp/a.log
+                                                        #   → label="Gemini 3.1 Pro (High)" を確認
+                                                        # NOTE: ログには `not logged into Antigravity`
+                                                        #   （load code assist / ListExperiments のポーリング失敗）が
+                                                        #   常時 20 件前後出るが、モデル選択・推論とは無関係。
+                                                        #   CLI 再ログイン後も消えないことを確認済み（2026-07-26）。
+                                                        #   この警告を認証障害と誤読して調査しないこと
     capabilities: [multimodal-analysis, code, reasoning]
     capability_description: |
       - 複雑・創造的タスクで Gemini の最上位が要るとき → model: "gemini-pro"
@@ -163,8 +197,15 @@ models:
     full_name: "gemma-4-31b"
     type: local
     methods: [subprocess]
-    command: ollama              # ollama run gemma4:31b の形で呼び出す
+    command: ollama              # 参考表示用（実行は下の api_url へ HTTP。CLI は起動しない）
     model_id: "gemma4:31b"
+    api_url: "http://localhost:11434/api/generate"  # MBP 上の ollama 生成エンドポイント。
+                                 # localhost は「MBP 自身から見た」の意（SSH で MBP に入ってから
+                                 # curl で叩く。ポートは開けない＝通信方式は SSH のまま）
+    keep_alive_sec: 1800         # 生成後にモデルを常駐させ続ける秒数。CLI 単発（旧実装）は
+                                 # 呼び出しごとにモデルロードを払い、inline 1 件に 68 秒 / 146 秒を
+                                 # 要していた（2026-07-29 本番ログ実測）。MBP は worker と qu-e が
+                                 # メモリを分け合うため無期限（-1）は取らず、30 分で解放する
     capabilities: [inline-generation, qa]   # inline 純生成専用へ降格。
                                              # ファイル読み取り・フォーマット変換は capability から外した
                                              # （ツール文脈が要る作業は agent レーンが担う）

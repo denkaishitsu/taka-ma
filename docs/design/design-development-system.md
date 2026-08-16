@@ -12,8 +12,8 @@
 - [2. 役割分担と知能の配置](#2-役割分担と知能の配置)
   - [2.1 sa-ru（Qwen3.6-35B-A3B — Mac mini 常駐）](#21-sa-ruqwen36-35b-a3b--mac-mini-常駐)
   - [2.2 ya-ta（Qwen3.6-27B — Mac mini、差し替え可）](#22-ya-taqwen36-27b--mac-mini差し替え可)
-  - [2.3 Claude Code ×N（Opus 4.8 — MBP 並行実行）](#23-claude-code-nopus-48--mbp-並行実行)
-  - [2.4 Gemini 3.5 Flash（API — MBP）](#24-gemini-35-flashapi--mbp)
+  - [2.3 Claude Code ×N（Opus 5 — MBP 並行実行）](#23-claude-code-nopus-5--mbp-並行実行)
+  - [2.4 Gemini 3.6 Flash（API — MBP）](#24-gemini-36-flashapi--mbp)
   - [2.5 Gemma 4 31B（MBP ローカル）](#25-gemma-4-31bmbp-ローカル)
   - [2.6 qu-e（Qwen3.6-35B-A3B — MBP ローカル）](#26-qu-eqwen36-35b-a3b--mbp-ローカル)
 - [3. 承認パイプライン設計](#3-承認パイプライン設計)
@@ -105,8 +105,8 @@
 | sa-ru | Qwen3.6-35B-A3B | ローカル常駐（テキスト＋画像 vision） | Mac mini | stdout文脈抽出、オーケストレーション、stdin制御、人間とのテキスト/画像会話 |
 | ya-ta | Qwen3.6-27B | ローカル（差し替え可） | Mac mini | タスク難易度判定、最適モデル選択・ルーティング |
 | 軽量タスク処理 | Gemma 4 31B | ローカル | MBP | 単純な質問応答、フォーマット変換等 |
-| 重量タスク処理 | Claude Opus 4.8 | API (ProMax契約済) | MBP (Claude Code ×N) | 要件定義、設計、実装、テスト（最難関は Fable 5） |
-| 重量タスク処理、 | Gemini 3.5 Flash | API (契約済) | MBP | heavy 対話、cross-review、Opus 障害時フォールバック（テキスト・コード）、高度なマルチモーダル解析（最上位は 3.1 Pro） |
+| 重量タスク処理 | Claude Opus 5 | API (ProMax契約済) | MBP (Claude Code ×N) | 要件定義、設計、実装、テスト（最難関は Fable 5） |
+| 重量タスク処理、 | Gemini 3.6 Flash | API (契約済) | MBP | heavy 対話、cross-review、Opus 障害時フォールバック（テキスト・コード）、高度なマルチモーダル解析（最上位は 3.1 Pro） |
 | qu-e | Qwen3.6-35B-A3B | ローカル | MBP | コード検証、監視、y/n Tier2審査 |
 
 ### 1.4 全体アーキテクチャ構成図
@@ -134,8 +134,8 @@ flowchart TD
     subgraph MBP["💻 MacBook Pro — Execution Hub"]
         ROUTER{"ya-taの判定\n(execution × depth\n+ confidence)\n→ orchestrator 写像"}
         ROUTER -->|"inline (純生成)"| LLAMA["Gemma 4 31B<br>ローカル推論"]
-        ROUTER -->|"agent (haiku/sonnet/opus)"| CC["Claude Code ×N<br>(Opus 4.8 — API)"]
-        ROUTER -->|"agent (:gemini) /<br>高度なマルチモーダル解析 /<br>セカンドオピニオン /<br>fallback"| GEMINI["Gemini 3.5 Flash<br>(API)"]
+        ROUTER -->|"agent (haiku/sonnet/opus)"| CC["Claude Code ×N<br>(Opus 5 — API)"]
+        ROUTER -->|"agent (:gemini) /<br>高度なマルチモーダル解析 /<br>セカンドオピニオン /<br>fallback"| GEMINI["Gemini 3.6 Flash<br>(API)"]
 
         LLAMA --> SENT
         CC --> SENT
@@ -211,21 +211,22 @@ flowchart TD
 - **検証コマンド `/exam_gw`**: タスク分解・分類・モデル選択・実行方式の判定結果のみ返すドライラン
 - 将来のモデル差し替えに備え、独立した箱として設計
 
-### 2.3 Claude Code ×N（Opus 4.8 — MBP 並行実行）
+### 2.3 Claude Code ×N（Opus 5 — MBP 並行実行）
 
-- ProMax契約のClaude Opus 4.8をCLIで複数インスタンス並行起動（最難関タスクは Fable 5 を明示指定）
+- ProMax契約のClaude Opus 5をCLIで複数インスタンス並行起動（最難関タスクは Fable 5 を `:fable` で明示指定）
 - 各インスタンスが独立してAnthropic APIと通信
 - 役割例: Frontend / Backend / QA・テスト
 
-### 2.4 Gemini 3.5 Flash（API — MBP）
+### 2.4 Gemini 3.6 Flash（API — MBP）
 
 - Pro 契約による API 利用。CLI は **agy（Antigravity CLI）** — Gemini CLI の後継のコーディングエージェント。認証は macOS keychain 依存（§8.5 / §8.6）
-- **モデル版**: 既定は **Gemini 3.5 Flash**（agy 既定）。最上位が要るタスクは 3.1 Pro を `:gemini-pro` で明示指定する（`agy -p --model <name>`）
+- **モデル版**: 既定は **Gemini 3.6 Flash**（agy 既定）。最上位が要るタスクは 3.1 Pro を `:gemini-pro` で明示指定する（`agy --model "<agy models の表示名>" -p`。`--model` は `-p` より前・名前は `agy models` の表示名そのままが必須。agy 1.0.16 実機で確認）
+- **`:gemini-pro` は subprocess 単発のみ**: 表示名が空白と括弧を含むため、PTY 経路の起動文字列（`ssh -tt 'tmux new-session … "<invocation>"'`）の入れ子クォートを壊す。`:gemini-pro` の用途（高度なマルチモーダル解析の単発・長文脈）は subprocess で満たせるため `methods: [subprocess]` に限定する。PTY 経路のクォート堅牢化は別タスク
 - **役割（初期リリース）**: **heavy 対話 / cross-review / Opus 障害時フォールバック（テキスト・コード）**。heavy 対話タスクは Claude Code 同等（`:gemini` 指定で利用）
 - **マルチモーダル解析の初期リリース方針**: 音声・画像・動画の基本的な解析（理解）は**ローカル gemma4:31b（MBP worker、マルチモーダル）**で賄い、**高度な解析のみ** Gemini API（agy）経由とする。sa-ru 会話脳（Qwen3.6-35B-A3B）は会話中の画像理解（vision）のみ担い、音声・動画の解析タスクは worker 側へ委譲する
 - **生成は Phase 2（生成基盤）へ延期**: 動画・音楽等の生成は初期リリースの対象外。生成基盤（veo / lyria / Runway / Suno 等の外部サービス登録制）は Phase 2 として設計・実装する（前方参照）
 - セカンドオピニオン / フォールバックは **ya-ta の汎用機能**（§8.4.x 相互扶助機能）であり、Gemini に限定されない。Gemini は当該機能に参加する 1 候補として扱われる
-- **meta カテゴリ廃止（2026-04-19）**: Gemini のコンテキスト窓が 1M（Opus 4.6 と同じ）になり、「長文コンテキスト担当」という meta の技術的根拠が消失。Gemini の差別化要因はマルチモーダルに絞られた
+- **meta カテゴリ廃止（2026-04-19）**: Gemini のコンテキスト窓が 1M（Opus と同じ）になり、「長文コンテキスト担当」という meta の技術的根拠が消失。Gemini の差別化要因はマルチモーダルに絞られた
 - コードベース解析・アーキテクチャ判断は heavy（Opus）が主担当（メタ推論は heavy に統合）
 
 ### 2.5 Gemma 4 31B（MBP ローカル）
@@ -264,7 +265,7 @@ flowchart TD
 承認の**判定中核**（Tier1/2/3・安全性・§8.10）は CLI 非依存で共通。**承認要求の取得と決定の伝達**のみアダプタごとに異なる。
 
 - **headless アダプタ（Claude Code）**: `claude -p --output-format stream-json --verbose --include-hook-events`。**PreToolUse フック**が各ツール実行前に構造化 JSON（`tool_name`/`tool_input`）を stdin で受け、判定中核を呼び、`permissionDecision:"allow"`（許可）/ exit 2（拒否）を返す。判定中核は Mac mini 常駐の decide デーモンが実行し、フックは薄いクライアントとして SSH 経由で問い合わせる（§8.5）。完了は `result` イベント（実機検証で確定。詳細は Appendix §0）
-- **interactive(pty) アダプタ（agy 対話・将来 Codex 等の汎用対話 CLI）**: `pexpect` で子プロセス起動、レガシー y/n（`[y/n]`/`(yes/no)`/`Allow?`）を stdout から検出、判定中核を呼び、`y`/`n` を stdin 送信
+- **interactive(pty) アダプタ（将来 Codex 等の汎用対話 CLI。現在この経路を使う登録モデルは無い・§8.6）**: `pexpect` で子プロセス起動、レガシー y/n（`[y/n]`/`(yes/no)`/`Allow?`）を stdout から検出、判定中核を呼び、`y`/`n` を stdin 送信
 - **subprocess アダプタ（ollama / keychain 依存 agy）**: 単発実行。per-tool 承認は持たない（§8.7 / §8.6）
 
 ### 3.3 リスク判定（スコープ判定 → 三段階リスク分類）
@@ -353,6 +354,29 @@ headless アダプタの判定入力（`tool_name`/`tool_input`）は worker ラ
 
 > headless アダプタ（Claude Code）はこの信頼境界の対象外（`tool_input` が権威的）。本規定は stdout スクレイプに依存する interactive(pty) 専用。
 
+#### (4) 人間承認は期限を持たない（保留 → 決着後に未了分から再投入）
+
+Tier 3 の人間承認に期限を設けて自動 deny すると、人が席を外していただけで作業が失われる。しかも「操作はブロックされたのにタスクは成功として記録される」という記録の嘘が残る。人間は放置してよく、系は放置に耐える、を成り立たせる。
+
+**設計の要点は「worker のセッションを復元しない」こと**。承認待ちは worker を畳んで**保留状態**に落とし、決着後は「そこまでの成果物を前提に、未了のサブタスクから実行する」新しい worker 実行として再投入する。セッション復元を前提にすると、識別子の永続化・再開後に同じ操作を二度聞かないための一回限りの許可・その指紋照合・照合が外れたときの循環と、対処が連鎖的に必要になる。復元しないと決めることで、この連鎖が根元から不要になる。
+
+| 決定 | 意味 | 中核が返すもの | タスク状態 |
+|---|---|---|---|
+| allow | 実行してよい | `Decision{allow:true}` | 継続 |
+| deny | 実行してはならない（`always_deny`・Reject 等） | `Decision{allow:false}` | 中止（`failed`） |
+| **hold** | 今は決まらない。**待たせず畳んで、決着後にやり直す** | `Decision{allow:false, hold:true}` | `pending_approval`（保留） |
+
+**規定:**
+
+- **hold は「拒否」ではない**。承認要求は `pending` のまま生き続け、期限で失効しない。人間はいつ押してもよい。
+- **保留を成功として記録しない**（従来の最大の実害）。操作がブロックされた以上、タスクは `completed` にしてはならない。
+- **保留状態はディスク上で自己完結する**。必要な情報は「タスクファイル（元の指示・計画・workspace・Slack 宛先・**済んだサブタスクの結果**）」と「承認ファイル（何を承認待ちか）」の 2 つだけ。プロセス内のメモリに待機状態を抱えないため、sa-ru を再起動しても保留は失われない。
+- **再投入は新規の worker 実行**。成果物は workspace に残っており、済んだサブタスクの出力はタスクファイルに永続化されている。この 2 つが文脈であり、worker のセッション履歴は文脈の担い手ではない。
+- **CLI に依存しない**。再投入は「未了サブタスクを実行する」以上のことを要求しないため、どの実行アダプタでも成立する。特定 CLI の再開機能に依存しない（§8.5 seam B）。
+- **保留中は並行枠を握らない**（§10.4）。人間待ちは無期限であり、枠を占有し続けると他タスクが進めなくなる。
+
+> **git は人が管理する**: workspace の commit / branch は人間の裁量に属し、系は保留・再投入に際して自動 commit や自動 stash を行わない。これは中断特有の話ではなく通常の完了時と同じ扱いであり、承認機構の責務に含めない。
+
 ### 3.4 承認フロー図
 
 > **実装**: [構築手順書 08-approval-pipeline.md](../procedures/08-approval-pipeline.md)（`ApprovalPipeline.process()`）
@@ -406,10 +430,16 @@ flowchart TD
     T3 --> SLACK
 
     SLACK["Slack通知\n承認リクエスト送信"]
-    SLACK --> H{"Human判定"}
+    SLACK --> H{"Human判定\n(猶予 hold_grace_sec 内)"}
 
     H -->|"Approve"| Y3["✅ allow を返す\n(フック allow / y 送信)\n実行許可"]
     H -->|"Reject"| N["❌ deny を返す\n(フック exit 2 / n 送信)\n実行拒否"]
+    H -->|"猶予超過\n(未決着)"| INT
+
+    INT["⏸ hold を返す\n承認は pending のまま存置\nworker を畳む\nタスク pending_approval・並行枠を解放\n(completed にしない)"]
+    INT --> WAIT{"人間の決着\n(期限なし)"}
+    WAIT -->|"Approve"| RES["🔄 未了サブタスクから再投入\n文脈 = workspace の成果物\n+ タスクファイルの済み結果"]
+    WAIT -->|"Reject"| N
 
     style A fill:#EEEDFE,stroke:#534AB7,color:#3C3489
     style B fill:#E1F5EE,stroke:#0F6E56,color:#085041
@@ -433,6 +463,9 @@ flowchart TD
     style Y2 fill:#EAF3DE,stroke:#3B6D11,color:#27500A
     style Y3 fill:#EAF3DE,stroke:#3B6D11,color:#27500A
     style N fill:#FCEBEB,stroke:#A32D2D,color:#791F1F
+    style INT fill:#FAECE7,stroke:#993C1D,color:#712B13
+    style WAIT fill:#FAEEDA,stroke:#854F0B,color:#633806
+    style RES fill:#EAF3DE,stroke:#3B6D11,color:#27500A
 ```
 
 > **degraded（fail-closed）**: `pipeline.yaml` のロードに失敗した場合、静的安全性チェックはコード固定デフォルトで継続しつつ、チェックにもスコープにも該当せず本来「ya-ta Risk classification」へ進むはずの操作を Tier 3（人間承認）へ直行させる（LLM 自動 allow へは倒さない）。詳細は §3.3 (0)「チェックは無効化されない」。
@@ -634,6 +667,16 @@ pyinfra <host> pyinfra/deploys/<component>.py
 - 常駐サービスの停止を最優先（launchd `KeepAlive` の自動再起動を止める）。
 - 共有資源（汎用 Homebrew パッケージ等）・外部資産（Slack App・API キー・Tailscale）は `teardown` に含めず、利用者の明示判断に委ねる。
 - 俯瞰と手動手順は [構築手順書 00](../procedures/00-overview.md#アンインストール方法と仕組み) を参照。
+
+### 6.6 配備元ガード（未マージ配備の停止）
+
+未マージ worktree からの pyinfra 配備は「main に無いコミットの内容」を実機へ書き、他タスクのマージ済み修正を静かに巻き戻しうる（2026-07-31: #135 未マージ worktree からの配備が #136 修正済み converse.md を修正前へ上書きした実事故。`private/docs/incidents/2026-08-14-wave1-B-regression-report.md` 検証1）。再発防止として、全 deploy は読み込み時に **配備元ガード** を通す。
+
+- 実装は `pyinfra/deploys/_guard.py` の `ensure_merged_head()`。各 deploy が `ensure_brew_path()` と同位置（読み込み時・オペレーション宣言より前）で呼ぶ。
+- 検査: 配備元リポジトリの HEAD コミットが **main（`origin/main` またはローカル `main` のいずれか）に含まれる**こと。未マージなら配備全体を即時エラー停止する。
+- 検査不能（git 不在・リポジトリ外・main 参照なし）も黙って通さず停止する（フェイルクローズ）。
+- 迂回は明示フラグ **`TAKA_MA_ALLOW_UNMERGED=1`**（環境変数・値 `"1"` のみ有効）に限る。迂回時はその旨を stderr に明示する。
+- 判定ロジックは純粋関数 `evaluate()` に分離し、pyinfra 無しで単体テスト可能（`pyinfra/tests/test_deploy_guard.py`）。
 
 ---
 
@@ -854,6 +897,14 @@ flowchart LR
 
 sa-ru は脳モデル（`sa-ru.model`）で各発話を処理し、`ready=false` なら会話返信（Slack 直送）、`ready=true` なら構造化要約 + **計画プレビュー**（§10.2.1）+ 着手確認ボタンを提示する。`force_ready=true`（`/taka-ma-go`）は判定を待たず要約に進む。
 
+> **確認系質問への実測応答（probe）**: リポジトリ・ブランチ・ファイル名等、**実状態の確認**を求める発話には、宣言（「実行して結果を報告します」）を返さない。脳 LLM は出力 JSON に `probe: "repo_status"` を立てて返し（`ready=false`）、sa-ru が当該会話の直近タスクの workspace（§8.13）に対して読み取り専用コマンド（`git remote -v` / `git rev-parse --abbrev-ref HEAD` / `ls -la`）を SSH 実行し、その実出力（rc 併記）を **1 メッセージ**で返信する。実行不能（workspace 不明・SSH 不達等）の場合も、その事実とエラーを同じ 1 メッセージで返す。返信本文は脳 LLM の生成テキストではなくコマンド実出力から組み立てる（§8.9「完了報告の実出力グラウンディング」と同じ規律）。直近タスクの workspace は確定タスク生成・完了還流の時点で会話セッションに記録し、セッション永続化と同様に再起動をまたいで保持する。
+
+> **会話出口の内部 JSON フィルタ**: 脳 LLM の応答契約 `{reply, ready, summary}` はパース不能な壊れ形（切断・多重 JSON・裸キー等）で返ることがある。パース失敗時のフォールバックは素の stdout を会話返信に回す（解釈できない出力で勝手に実行へ進めない安全側）が、引用符付き契約キー（`"reply"` / `"ready"` / `"summary"` ＋コロン。Python dict 風のシングルクォートも含む）の断片を含む出力は内部構造の漏出になるため人へ見せず、定型の言い直し文言へ縮退する（`_CONTRACT_KEY_RE` で検出）。縮退時も会話継続（`ready=false`）を維持してタスクは止めず、縮退文言・壊れ出力とも履歴へは残さない（エラー文言のオウム返し防止と同じ扱い）。2026-08-10 Slack DM インシデント F2（planner 内部構造の生 JSON 漏出）の再発防止。
+
+> **ready 判定の方針（明確な単発依頼の即時発火）**: ready 判定の基準は converse.md「毎ターン行う判定」が正本。**対象**（ファイル・リポジトリ・成果物）と**動作**（要約・作成・修正・調査等）が発話から特定できる明確な依頼は、完了条件が明示されていなくても 1 発話で `ready=true` とし、確認質問を挟まず計画プレビュー＋着手確認へ進む（実測 2026-08-16: 「リポジトリ: /path の README を要約して」で `ready=false` のまま「要約しますね」と宣言だけ返して停止する取りこぼしを確認。#taka-ma/144）。あわせて**宣言と判定の一致**を課す: 着手を宣言する reply（「〜しますね」等）を書けるのは `ready=true` のときだけ（宣言と実態の乖離は 2026-08-10 インシデント F2 と同型）。雑談・知識質問・相談・対象や動作が特定できない依頼は従来どおり `ready=false`（過剰発火の抑制は同判定の退行テストで担保）。
+
+> **契約逸脱（`ready` キー欠落・型不正）の明示処理**: JSON としてはパースできても、契約キー `ready` 自体が欠落した応答や、boolean 以外の値（`"true"` 等の文字列・数値・null）を持つ応答が返ることがある（qwen3.6:35b-a3b・think=false の実測 2026-08-16）。この逸脱は暗黙のフォールバック（欠落 → None → falsy）に任せず、明示コード（`_coerce_ready`）で処理する: いずれの逸脱も**安全側の会話継続（`ready=false`）へ縮退**し（解釈できない応答で実行確認へ進めない。文字列 `"false"` を truthy と誤解釈して実行へ進む事故も同時に塞ぐ）、warning ログへ記録して**発生率を観測可能にする**（プロンプト側の契約記述強化の効果測定に使う）。逸脱応答でも `reply` は通常どおり会話返信へ回し、会話は止めない。ready 判定の基準そのものはプロンプト（converse.md）の責務であり、この処理は値の型・存在の検証のみを行う。
+
 > **計画確認中の発話の扱い（訂正経路）**: 当該 `conversation_id` に `pending` の確認レコード（§8.10b）が在るあいだ、後続の発話は会話ではなく**提示済みプランへの訂正**として先に解釈する（§10.2.1「訂正の入力経路」）。訂正として解釈できた発話は会話履歴を進めず、プランを更新して再提示する。訂正と解釈できない発話は通常の会話処理へ落とす（人間がプランを捨てて話を続けられる経路を塞がない）。
 
 **会話セッション履歴の永続化:**
@@ -930,7 +981,7 @@ dispatcher は未処理タスク（`init`）を `accepted` に予約してから
 | 方式 | Python ライブラリ import（同一プロセス内） |
 | 呼び出し元 | `src/sa-ru/orchestrator.py` |
 | 呼び出し先 | `src/ya-ta/decomposer.py`, `src/ya-ta/classifier.py`, `src/ya-ta/risk_classifier.py` |
-| LLM バックエンド | Qwen3.6-27B（ollama localhost・HTTP API） |
+| LLM バックエンド | 分解・分類: Qwen3.6-27B（dense）／リスク判定: Qwen3.6-35B-A3B（MoE）。いずれも ollama localhost・HTTP API（下記「リスク判定のモデル分離」） |
 
 **ya-ta は launchd サービスとしては廃止。** sa-ru が直接 import して関数呼び出しする。これによりクラッシュ問題（exit -15）が構造的に解消される。モジュールとしての独立性は維持する（将来のモデル差し替え対応）。
 
@@ -946,10 +997,25 @@ sa-ru プロセス内の全ローカル LLM 呼び出し（会話脳・分解・
 
 思考型モデルでは思考トークンの生成が応答時間の支配項になる（実測: 会話 1 ターンの思考約 1400 トークン＝30 秒、分解の思考 3352 トークン＝281 秒。think 無効化でそれぞれ 2〜3 秒・12 秒）。呼び出し用途ごとに config の `llm_think` で制御する（`sa-ru.yaml`＝会話 / `ya-ta.yaml`＝分解・分類・リスク判定。未指定はモデル既定に従い、think 非対応モデルには送らない）。会話・分解いずれも構造化出力が主で、思考の品質寄与より応答時間の実害が大きいことを実機で確認して無効化を既定とした。判定品質の劣化が運用ログ（判定ログ §8.4.1）で観測された場合は、該当用途のみ有効へ戻して比較する。
 
+**リスク判定のモデル分離（応答速度）:**
+
+リスク判定は worker のツール呼び出しごとに同期で挟まる位置に在り、1 回の所要時間がツール数に比例して worker の実行時間へ積み上がる。実測（2026-07-29 本番ログ・ファイル 1 個作成の agent サブタスク）では、worker ステップ 68.6 秒のうち承認判定が 47.3 秒（69%）を占め、その内訳はツール 3 回分のリスク判定 32.6 秒 ＋ qu-e 審査 14.7 秒だった。つまり worker の起動・推論ではなく**承認ゲート内のローカル LLM が支配項**である。
+
+そこでリスク判定のモデルを分解用と分けて `ya-ta.yaml` の `risk_model` で指定する（分解は判定品質優先で dense、リスク判定は応答速度優先で MoE）。実測（2026-07-30・Mac mini・両モデル常駐・同一プロンプト 5 操作: 読み取り / 書き込み / `rm -rf` / `git push --force` / 参照系コマンド）:
+
+| モデル | 1 判定あたり | tier 判定 |
+|---|---|---|
+| Qwen3.6-27B（dense・従来） | 9.4〜12.8 秒 | 基準 |
+| Qwen3.6-35B-A3B（MoE・採用） | 2.0〜2.4 秒 | 5 操作すべて一致 |
+
+MoE 側は sa-ru の会話脳と同一モデルで、Mac mini に既に常駐しているため追加メモリを要さない。tier の一致は上記 5 操作での確認であり、判定品質の継続監視は判定ログ（§8.4.1）で行う。
+
 **タスク分解の呼び出し:**
 
 ユーザーの1つの指示をサブタスクに分解し、各サブタスクの分類と依存関係を判定する。
 単純な指示（1つのモデルで完結する）はサブタスク1件として返す。
+
+**分解粒度（過剰分割の抑制）:** 分割は「対象が別々で依存が無い（並行実行で短くなる）」か「前段の結果を見ないと後段が決まらない」ときに限る。同じ対象に対して同じ担当が続けて行うだけの工程（内容を決める → その内容をファイルへ書く 等）を分けると、実行者は同じまま worker 起動と操作ごとの承認判定が丸ごと重複し、その分だけ遅くなる。実測（2026-07-29）ではファイル 1 個の作成が 2 サブタスクに分割され、余分な 1 件が 68 秒を要した。この規則は分解プロンプト（`src/ai_gateway/prompts/decompose_task.md`）に置く。
 
 ```python
 from ya_ta.decomposer import TaskDecomposer
@@ -1091,12 +1157,22 @@ agent 実行（旧 heavy）で使用する worker 実行は **3 つの実行ア�
 | アダプタ | 対象 | 承認要求の取得（→ 中核へ） | 決定の伝達 | 起動 |
 |---|---|---|---|---|
 | **headless** | Claude Code（`methods:[headless]`） | **PreToolUse フック** stdin の `{tool_name, tool_input, tool_use_id}` | フックが `permissionDecision:"allow"` / exit 2 | `claude -p --output-format stream-json --verbose --include-hook-events --settings <hook> --model <flag>`（argv 配列・SSH 経由 MBP） |
-| **interactive(pty)** | 汎用対話 CLI（agy 対話・将来 Codex。`methods:[pty]`） | interceptor の**レガシー y/n** 検出（`[y/n]`/`(yes/no)`/`Allow?`）＋ context 抽出。承認要求の信頼境界とフェイルセーフは §3.3 (3) | `WorkerPtyWrapper` が `y`/`n` を stdin 送信 | SSH + pexpect + tmux |
+| **interactive(pty)** | 汎用対話 CLI（将来 Codex 等。`methods:[pty]`）。**現在これを宣言する登録モデルは無い**（§8.6） | interceptor の**レガシー y/n** 検出（`[y/n]`/`(yes/no)`/`Allow?`）＋ context 抽出。承認要求の信頼境界とフェイルセーフは §3.3 (3) | `WorkerPtyWrapper` が `y`/`n` を stdin 送信 | SSH + pexpect + tmux |
 | **subprocess** | ollama / keychain 依存 agy（§8.6/§8.7） | per-tool 承認なし（対象外） | — | 単発 stdin |
+
+**worker 起動前の認証プリフライト（headless 起動直前・`AuthPreflight`）:**
+
+worker ホストでのタスク失敗は (1) sa-ru → worker ホストの SSH 断、(2) worker ホスト → git remote の認証・到達性、(3) Anthropic 認証の失効のどの経路でも起き、事後のエラー文からの推測は SSH 認証エラーと Anthropic subscription エラーの混同（登録済み鍵への再作成提案という誤診断）を招いた実績がある。headless アダプタは worker 起動の直前に `AuthPreflight` で 3 経路を依存の浅い順（SSH → git → Anthropic）に検査し、最初の不合格で打ち切って worker を起動しない。
+
+- **判定は exit code のみ**: SSH は `ssh <mbp> true`、git は workspace の `git ls-remote origin HEAD`（stdout 破棄）、Anthropic は worker CLI の最小プローブ（`claude -p ok`・stdout 破棄）。鍵・トークン本体を出力するコマンドは使わない。workspace が git repo でない / origin 未設定（新規 clone 運用）は git 検査の対象外とし不合格にしない。
+- **報告は種別＋エラー実出力の該当 1 行**: 不合格時は原因経路（ssh / git / anthropic）と「どの経路の問題で・どの経路の問題ではないか」の切り分け事実、エラー出力の最終行（既知トークン形式は伏字化）を Slack へ通知する。対処提案（鍵の再作成等）は出さない。合格・対象外は無音で通過する。
+- **TTL キャッシュ**: PASS は `pass_ttl_sec` 内で再検査しない（多段起動で Anthropic プローブの実推論コストを毎回払わない）。FAIL は `fail_ttl_sec` 内の再検出に cached 印を付け、昇格ラダー再突入時の重複 Slack 通知を抑止しつつ、復旧後の再試行を長く塞がない。運用値は sa-ru.yaml の `preflight` ブロックが唯一の源（コード側に既定値なし）。
+- 不合格は例外としてそのまま既存の失敗経路（昇格・failed 決着・Slack 通知）へ乗る。検査自体は CLI 非依存の SSH/git 検査＋アダプタ固有の認証プローブで構成し、headless アダプタ側（Claude 固有経路）から呼ぶ。
 
 **headless アダプタ（Claude Code）の実行フロー:**
 
 ```
+0. sa-ru: AuthPreflight（SSH → git remote → Anthropic）— 不合格なら worker を起動せず種別明示で Slack 通知
 1. sa-ru: workspace(/opt/taka-ma/work/{task_id}) を mkdir → claude -p "<task>" を argv 配列で SSH 起動
 2. sa-ru: stream-json を逐次パース（session_id を system/init から取得、tool_use/text を蓄積）
 3. 各ツール実行前: PreToolUse フック（MBP）→ SSH（ControlMaster 多重化）→ Mac mini の decide デーモン
@@ -1104,6 +1180,21 @@ agent 実行（旧 heavy）で使用する worker 実行は **3 つの実行ア�
 4. 完了: result イベント受信で自己終了 → 結果を取得 → Slack 通知
    （result 無しでプロセス終了 = ハング（v2.1.163+ の5秒 grace kill）→ retry/fallback。無応答スタック検知を本経路に統合）
 ```
+
+**承認保留時のアダプタ責務（§3.3 (4) / §8.10）:**
+
+保留（hold）は**セッションの復元を前提としない**。アダプタが担うのは「ツールをブロックし、worker の実行実体を確実に畳む」ことだけで、再開に必要な文脈はアダプタの外（タスクファイルと workspace）にある。したがって**どのアダプタも特別な再開機能を要求されない**。
+
+| アダプタ | ブロックの伝達 | worker を畳む手段 |
+|---|---|---|
+| **headless** | フックが exit 2 | worker はツールを諦めて自ら終了する。終了しない場合も全体上限（`run_timeout_sec`）と `ssh -tt` の SIGHUP 伝播で回収される（下記 資源回収） |
+| **interactive(pty)** | `n`（拒否）を stdin 送信 | tmux セッションを kill（無応答で放置しない） |
+| **subprocess** | — | per-tool 承認を持たないため保留は発生しない |
+
+- **worker の終了状態を保留の根拠にしない**: ブロックされた worker は「指示どおり終わっただけ」＝ `is_error=false` の正常終了として返る（headless は実機実測 2026-07-27。Claude Code 2.1.220 で haiku / sonnet / opus いずれもツール試行 1 回で終了）。判定根拠は §8.10 の承認レコードに一本化する。
+- **「答えないこと」を拒否として使わない**: 猶予超過時は必ず能動的にブロックを伝達し、実行実体を畳む。無応答のまま生かしておくと、拒否の成立が worker 側の未応答時の既定動作に依存してしまう。
+
+> ⚠️ **interactive(pty) 経路は現在どの登録モデルからも使われていない**（2026-07-28。`ya-ta.yaml` から `pty` を外した・§8.6）。本経路の承認配線は実機 end-to-end 検証がされておらず（E2E T08-V23 は 2026-07-06 時点で未実施＝スキップ）、「承認プロンプトに誰も答えなかったとき worker がどう振る舞うか」も未測定であるため、未検証のまま有効にしておかない判断による。アダプタの実装（`WorkerPtyWrapper` / interceptor のレガシー y/n 検出）は将来の対話 CLI 向けに温存する。**再開の条件**: 無応答時の挙動を実測し fail-closed を確認すること。
 
 **承認フックの判定実行系（decide デーモン — Mac mini 常駐）:**
 
@@ -1137,7 +1228,7 @@ worker は SSH 越しに MBP 上で動く。sa-ru 側でタイムアウトや完
 
 Antigravity CLI（`agy` — Gemini CLI の後継のコーディングエージェント）固有の通信仕様。**高度なマルチモーダル解析**（動画・音声・画像の理解）の単発実行で使用する subprocess 経路を定義する。基本的な解析はローカル gemma4:31b（MBP worker）が担い（§2.4）、生成は Phase 2（生成基盤・§2.4）へ延期。
 
-> **NOTE**: agy は対話型 heavy タスクにも対応可能で、その経路は §8.5（worker CLI、実行アダプタ抽象）の interactive アダプタに統合済。Gemini 3.1 Pro などに関する用途別の参加（cross-review / fallback / 高度な解析 / 対話）の全体像は **§8.4.x 相互扶助機能** を参照。`ya-ta.yaml` の `gemini.methods: [pty, subprocess]` で両対応を宣言。
+> **NOTE（2026-07-28 改訂）**: agy は現在 **subprocess 単発のみ**（`ya-ta.yaml` の `gemini.methods: [subprocess]`）。以前は interactive(pty) にも対応を宣言していたが、**pty の承認配線は実機 E2E で一度も検証されておらず**（E2E T08-V23 は 2026-07-06 時点で未実施）、承認プロンプトに誰も答えなかったときの挙動も未測定であるため、未検証の承認経路を有効なまま残さない判断で外した。再開の条件は「無応答時の挙動を実測し fail-closed を確認すること」。用途別の参加（cross-review / fallback / 高度な解析）の全体像は **§8.4.x 相互扶助機能** を参照。
 
 | 項目 | 仕様 |
 |------|------|
@@ -1147,6 +1238,18 @@ Antigravity CLI（`agy` — Gemini CLI の後継のコーディングエージ�
 | 主用途 | 高度なマルチモーダル解析の単発 / cross-review 参加時の並行投入 / API 障害 fallback（テキスト・コード）での順次代替 |
 
 経路選択は orchestrator が用途に応じて動的に決める（`_select_method()`、構築手順書 05 主要 API 参照）。
+
+> **NOTE（agy の権限モデル・実測 2026-07-28）**: agy でツールが実行される条件は「**静的許可リストに合致する AND PreToolUse フックが deny を返さない**」である。フックは**許可を与える力を持たず**（`decision:"allow"` を返しても静的許可に無い操作は実行されない）、**拒否する力のみを持つ**（静的許可にある操作を deny で止められる）。したがって**フックが故障しても静的許可の範囲を超えない**。
+>
+> ここから、agy を per-tool 承認付き worker として使う場合の構成が決まる。**門は静的許可リスト**（`~/.gemini/antigravity-cli/settings.json` の `permissions.allow`。場所が違うと効かない）に置き、**フックは拒否専用の追加ゲート**として使う。実質のセキュリティ境界は静的許可リストであり、これを最小権限で設計することが多層防御の前提になる。フックの `allow` に依存する設計にしてはならない。
+>
+> **`--dangerously-skip-permissions` は使わない**（§3.1）。このフラグを付けると静的許可の門が外れてフックが唯一の門になり、フック異常（異常終了・不正 JSON・timeout・コマンド不在の 4 条件すべてで再現）でツールがそのまま実行される。フラグを使わない限りこの経路は生じない。
+>
+> なお素の `agy -p` は許可規則が無ければ read すら auto-deny する完全な fail-closed であり、本節の単発実行はこの性質の上に成り立つ。既存の **interactive(pty) 経路（§8.5）はフックを使わない別経路**であり、本 NOTE の権限モデルは適用されない（pty の無応答時挙動は未測定・§8.5 の ⚠️ を参照）。
+>
+> 詳細な実測マトリクスと再現手順は調査資料（`private/docs/agy-headless-approval-model/`）に集約する。**agy は自己更新するため、バージョンが上がったら権限モデルを再測すること**（採否判断の土台が変わる）。
+
+
 
 **エラーハンドリング:**
 
@@ -1158,9 +1261,11 @@ Antigravity CLI（`agy` — Gemini CLI の後継のコーディングエージ�
 
 | 項目 | 仕様 |
 |------|------|
-| 方式 | SSH + ollama CLI（`RemoteProcessManager.run_model_subprocess`） |
-| コマンド | `ssh mbp "ollama run gemma4:31b"`。**プロンプトは stdin で渡す**（`risk_classifier.py` の既存 ollama 呼出と統一） |
-| 出力 | stdout（プレーンテキスト） |
+| 方式 | SSH + ollama HTTP API（`RemoteProcessManager.run_model_subprocess` → `_run_local_model_http`） |
+| コマンド | `ssh mbp "curl … http://localhost:11434/api/generate"`。**リクエスト JSON は stdin で渡す**（ssh → リモート zsh の再解釈でプロンプト本文が壊れるのを避ける） |
+| 出力 | 応答 JSON の `response` フィールド |
+
+**なぜ CLI（`ollama run`）ではないか:** CLI 単発は呼び出しごとに CLI 起動とモデルロードを払い、`keep_alive` を制御できない（sa-ru / ya-ta が §8.4 で HTTP API へ移行したのと同じ理由。inline レーンだけ CLI のまま残っていた）。「純生成の速い経路」であるはずの inline が、実測（2026-07-29 本番ログ）で 1 件 68 秒・146 秒を要していた。常駐時間は `ya-ta.yaml` の `models.gemma.keep_alive_sec` で管理する（MBP は worker と qu-e がメモリを分け合うため無期限にはしない）。ポートは開けず、SSH で MBP に入ってから MBP 自身の localhost API を叩く（通信方式は SSH のまま・§1.3）。
 
 **エラーハンドリング:**
 
@@ -1236,7 +1341,9 @@ Antigravity CLI（`agy` — Gemini CLI の後継のコーディングエージ�
 | Tier 3 承認リクエスト | Block Kit ボタン付き承認フォーム | 送信元 |
 | タスク完了 | 結果全文（切り詰めない）＋結果ファイルパス併記 | 送信元 |
 | タスク失敗 | 「タスク失敗: {error}」＋結果ファイルパス併記 | 送信元 |
-| タイムアウト | 「承認タイムアウト（5分）: 自動 deny しました」 | 送信元 |
+| 承認待ちで保留 | 「承認待ちのため保留しました。期限はありません。承認いただければ未了分から再開します」 | 送信元 |
+| 保留からの再投入 | 「承認を確認しました。未了分から再開します」 | 送信元 |
+| 却下による中止 | 「却下により中止しました」 | 送信元 |
 | システムアラート | ヘルスチェック異常等 | デフォルト（#taka-ma） |
 
 **完了通知の内容規律（切り詰めの禁止）:**
@@ -1245,6 +1352,17 @@ Antigravity CLI（`agy` — Gemini CLI の後継のコーディングエージ�
 - 完了・失敗いずれも、**結果の正本ファイルパス**（`/opt/taka-ma/data/tasks/done/{日付}/` の task JSON）を必ず併記する。Slack 上の表示がどうであれ、人間が全文へ到達できる経路を常に残す
 - **会話への還流**: タスク完了時、当該タスクの発生元会話セッション（conversation_id は task の team_id / channel_id / thread_ts から復元）へ「結果要約＋結果パス」を assistant ターンとして追記する（§8.3 の永続化セッション）。完了後の後続質問（「さっきの回答はどこ」等）に会話脳が文脈として答えられるようにする
 
+**完了報告の実出力グラウンディング（虚偽完了報告の禁止）:**
+
+worker の最終出力は LLM の自己申告テキストであり、完了・成功の判定根拠にしない。完了通知の文言は、worker プロセスの exit code と、sa-ru 自身が実行した検証コマンドの実出力から機械的に導出する。検証の実行主体は orchestrator の GroundingVerifier で、worker 出力は「どの検証を要するか」の選別にのみ使い、判定材料は検証コマンドの rc・実出力に限る。
+
+- **push の主張**: worker 出力が push 完了を主張する場合、sa-ru は当該タスクの workspace（§8.13）に対し `git ls-remote`（remote 側の当該ブランチ先端とローカル HEAD の一致）を SSH で実行し、その実出力を通知に併記する。一致を確認できない場合（remote 未設定・ハッシュ不一致・コマンド非 0 終了・SSH 不達）は「push は未完了」と報告する。完了と未完了の中間表現（「おそらく完了」等）は使わない
+- **コミットの主張**: `git log` 実出力の実ハッシュを併記する。取得できなければ「コミットを確認できない」と報告する
+- **ファイル生成の報告**: workspace の実パスと `ls` 実出力を併記する
+- **worker の exit code**: headless worker の終了コードが非 0 の場合、result イベントの有無に依らず成功として扱わず、失敗経路（retry / 昇格）へ回す
+- 検証コマンドの実行結果（rc・実出力）は完了通知だけでなく結果ファイル（正本）にも記録する。タスクファイルの status はサブタスク連鎖の実行状態を表し、グラウンディング判定は通知・結果本文側で表現する
+- **会話への還流にも同じ判定を先頭に併記する**。worker の自己申告（「完了しました」）を会話脳が事実として引き継がない
+
 ### 8.10 ⑧ u-zu → sa-ru（承認結果通知）
 
 | 項目 | 仕様 |
@@ -1252,7 +1370,7 @@ Antigravity CLI（`agy` — Gemini CLI の後継のコーディングエージ�
 | 方式 | ファイルベース |
 | ディレクトリ | `/opt/taka-ma/data/approvals/` |
 | ファイル名 | `{request_id}.json` |
-| 監視方法 | sa-ru がポーリング（1秒間隔、承認待ち中のみ） |
+| 監視方法 | sa-ru がポーリング（1秒間隔、承認待ち中のみ）。決着待ちの中断レコードは常駐ループが同間隔で走査 |
 
 **承認ファイル形式:**
 
@@ -1286,16 +1404,66 @@ Antigravity CLI（`agy` — Gemini CLI の後継のコーディングエージ�
 > 承認パイプラインの実行プロセスは、headless=decide デーモン（§8.5・Mac mini 常駐）、interactive=sa-ru 内（in-process）。
 ```
 
-> Tier3 のポーリング（§8.10 のファイルベース cross-process、1秒間隔・最大300秒）は温存。headless アダプタではフックが同期 shell として承認結果を待ち allow/deny を返すため、フック timeout は 300 秒を超える値（例 310 秒）に設定する。
+> Tier3 のポーリング（§8.10 のファイルベース cross-process、1秒間隔）は温存。ただし待ち上限は承認の期限ではなく `hold_grace_sec`（worker を待たせる上限）であり、超過時は下記「承認 pending の保留と再投入」に従う。headless アダプタではフックが同期 shell としてこの猶予の間だけ待つため、タイムアウト鎖は `hold_grace_sec` ＋ 前段（分類・qu-e 審査）＜ デーモン ＜ クライアント ＜ フック の包含関係を保つ（既定値では猶予 60 秒・qu-e 120 秒に対しデーモン 305 ＜ クライアント 308 ＜ フック 310 秒で余裕を持って成立する）。
 
 > **決定の一意性（排他制御）**: status の `pending` → `approved`/`rejected` 遷移は、承認ファイル単位の排他ロック下で read-modify-write する。同一ボタンの多重押下、Approve と Reject の同時押下、u-zu の決定と sa-ru の timeout 確定が競合しても、`pending` を終端へ移せるのは 1 回だけで、後続は「処理済み」を返す（双方が成功報告する事故を防ぐ）。sa-ru 側の timeout 確定も同じロックを取る（フロー 4 と 5 の相互排他）。
 >
 > **request_id の検証**: `/taka-ma-approve <request_id>` はユーザー入力の request_id をそのままファイル名に用いるため、受理する形式を uuid 相当（英数・ハイフンのみ）に限定し、パス区切り・`..` を含むものは拒否する（`{request_id}.json` を経由した承認ディレクトリ外へのパストラバーサルを防ぐ）。
 
-**タイムアウト:**
+**承認 pending の保留と再投入（自動 deny は行わない）:**
 
-- 5分間 `pending` のまま → sa-ru が自動 `deny`、status を `timeout` に更新
-- Slack にタイムアウト通知を送信
+人間の承認は**期限を持たない**。承認待ちの上限は「承認の期限」ではなく「**worker を待たせておく上限**」として扱い、超えたら worker だけを畳んで承認は生かしたままにする（§3.3 (4)）。
+
+| 段 | 挙動 |
+|---|---|
+| 猶予 | `approval.hold_grace_sec`（sa-ru.yaml が唯一の源）。この間だけフックが同期的に待つ |
+| 猶予超過 = **保留** | 承認レコードを `status=pending` のまま**存置**（`done/` へ退避しない）し `held_at` を追記。中核は `Decision{allow:false, hold:true}` を返す。ツールはブロックされ、worker は畳まれる。タスクは `completed` でも `failed` でもなく **`pending_approval`** |
+| 決着（Approve） | 未了サブタスクから**再投入**（新規 worker 実行）。文脈は workspace の成果物とタスクファイルの済み結果 |
+| 決着（Reject） | タスクを中止（`failed`）して Slack 通知 |
+
+- **`status=timeout` は新規に書かない**（自動 deny の廃止）。過去レコードとの互換で読み取り側は `timeout` を終端として受理する。
+- **保留の検知は worker の終了状態を根拠にしない**。ブロックされた worker は「指示どおり終わっただけ」＝正常終了として返るため、異常終了を期待した判定は成立しない。sa-ru は「当該タスクに `status=pending` かつ `held_at` を持つ承認レコードがあるか」で保留を判定する。
+- **保留は冪等**。worker が別のツールで迂回を試みても、同一タスクに未決着の保留レコードがある間は、**新規レコードの作成も Slack 再投稿も行わず、猶予を待たずに即座に hold を返す**。これにより「迂回 N 回 × 猶予」の待ち時間累積が起きない。
+
+**保留時に追記するフィールド（承認ファイル）:**
+
+```json
+{
+  "status": "pending",
+  "held_at": "2026-04-08T10:01:00+09:00"
+}
+```
+
+**保留時に追記するフィールド（タスクファイル）— 再投入の文脈:**
+
+```json
+{
+  "status": "pending_approval",
+  "held_approval_id": "{request_id}",
+  "completed_steps": {
+    "1": "step 1 の出力（全文は結果ファイルが正本）",
+    "2": "step 2 の出力"
+  }
+}
+```
+
+> `completed_steps` が本設計の要。従来、済んだサブタスクの出力は `_execute_chain` のメモリ上（`results` dict）にしか無く、sa-ru を再起動すると失われた。ここへ永続化することで、保留状態はディスク上で自己完結し、プロセスの生死と独立する。元の指示・計画・`workspace`・Slack 宛先（`team_id` / `channel_id` / `thread_ts`）・モデル指定は既にタスクファイルが保持しているため、追加はこの 2 キーのみ。
+
+**再投入（Approve 後）:**
+
+```
+1. sa-ru: 承認レコードの決着を検知（poll・approval.poll_interval_sec）
+2. sa-ru: 承認レコードを done/ へ退避（保留の解消。以後は新しい承認要求を立てられる）
+3. sa-ru: タスクを status=init へ戻し、completed_steps を残したまま再投入
+4. dispatcher: 凍結プラン（_plan）のうち completed_steps に無い step だけを実行
+5. worker: 同じ workspace（前回の成果物が残っている）で未了分を実行
+```
+
+- **既に済んだサブタスクを再実行しない**。`completed_steps` にある step はその値を結果として扱い、依存する後続へ引き渡す（§10.5 の結果受け渡しと同じ経路）。
+- **同じ操作を人間に二度聞くことはあり得る**。再投入後に同じ高リスク操作へ到達すれば、再び Tier3 が立つ。これは仕様であり、承認を握り越さない安全側の挙動である。ただし承認と再投入が延々循環しないよう、同一タスクの再投入回数に上限を設ける（`approval.max_reinject`。超過時は `failed` とし、収束しなかったことを Slack へ明示する）。
+- **昇格ラダーを回さない**。保留は worker の障害ではないため、モデル障害や `ESCALATE` 申告と同一視して次段モデルへ昇格させてはならない（承認を迂回した実行になりうる）。実装上は保留を**例外として流さない**ことで担保する（§10.3）。
+
+**Slack 表示**: 保留時「承認待ちのため保留しました。期限はありません。承認いただければ未了分から再開します」／再投入時「承認を確認しました。未了分から再開します」／却下時「却下により中止しました」。
 
 ### 8.10b 計画確認ゲート（会話 → 実行の移譲トリガー）
 
@@ -1410,7 +1578,67 @@ Slack から MBP の稼働 ollama モデルを手動 unload する経路。停�
 > 間で sa-ru が落ちてもファイルは pending で残り、次回起動で再実行される（取りこぼし防止）。
 > stop_ollama は冪等（既に停止済なら「稼働モデル無し」になるだけ）なので再実行は安全。
 
-### 8.11 qu-e → sa-ru（監査アラート）
+### 8.10d 中止・取消命令の即時実行（承認ゲートを通さない制御コマンド分類）
+
+「中止します」「キャンセル」「stop」等の**停止指示**は実行依頼ではなく制御コマンドである。
+これを通常発話と同じ会話ゲートに流すと、脳 LLM が「実行意図が固まった」と誤読して
+「この内容で着手します（着手/やり直す）」ボタンを提示する — 中止の命令に承認を求める —
+という転倒が起きる（Slack 実運用で発生・再発防止）。停止指示は計画確認ゲート（§8.10b）にも
+訂正解釈（§10.2.1）にも掛けず、**検知した時点で即時実行**する。
+
+**判定（ya-ta: `TaskClassifier.classify_control`）** — 2 段構成:
+
+1. **キーワード前置ゲート（決定的・LLM なし）**: 発話に停止語彙
+   （中止/中断/停止/取り消し/取消/取りやめ/やめ/止め/ストップ/キャンセル、stop/cancel/abort）が
+   含まれない場合は即座に「制御ではない」。通常会話にレイテンシを一切足さない。
+2. **LLM 弁別（ya-ta モデル、`prompts/classify_control.md`）**: キーワードを含む発話のみ、
+   「既存作業への停止命令」か「停止語彙を含むだけの開発依頼・質問」（例:「キャンセル機能を実装して」
+   「中断処理のバグを直して」）かを弁別する。出力は `{"control": "cancel"|"none", "reason", "confidence"}`。
+
+判定不能（JSON 不正・ollama 障害）は「制御ではない」＝会話側へ縮退する（fail-safe）。
+このとき会話脳も同一 ollama で応答不能のため着手ボタンは提示され得ず、
+「LLM 障害時に承認ゲートへ落ちて転倒が再発する」穴にはならない。
+制御判定は execution × depth 分類（§8.4）とは独立の前段判定である
+（あちらは「実行するタスク」の性質判定であり、制御命令はタスクではないため軸を混ぜない）。
+
+**介入点（sa-ru: `ConversationManager.handle_message` 最前段）**: 訂正解釈
+（`_handle_correction`）・脳 LLM 呼び出しより**前**に判定する。提示中の計画がある状態での
+「中止」は計画への訂正ではなく破棄命令だからである。`/taka-ma-go`（force_ready）は
+明示の実行エスケープなので制御判定に掛けない。
+
+**停止対象の特定（決定的規則）**: 発話と同一会話面（`team_id` + `channel_id` 一致）の
+以下 4 区分を全て止める。規則が決定的なため対象の曖昧さは生じず、確認往復は行わない。
+対象ゼロのときは「停止対象なし」を 1 メッセージで返す（承認ゲート形式の確認は用いない）。
+
+| 区分 | 状態 | 停止アクション |
+|------|------|----------------|
+| 提示中の計画 | exec-confirm レコード status=pending | status=cancelled に書換えて done/ へ退避。以後の着手ボタン押下はレコード不在として安全に無視される（`resolve_exec_confirm` は pending 以外/不在で False） |
+| 未着手タスク | status=init / accepted | status=failed（result に中止命令による停止と明記） |
+| 実行中タスク | status=in_progress | 実行台帳の asyncio タスク群を cancel（下記）→ status=failed（同上） |
+| 承認保留タスク | status=pending_approval | 保留承認レコードを done/ へ退避（§8.10 の退避と同じ）→ status=failed（同上） |
+
+終端 status は **failed を再利用**し、result に中止命令による停止であることを刻む
+（§8.10 の「却下により中止しました」と同じ規律）。専用の終端 status を新設しない理由:
+アーカイブ（done/ 移動）・qu-e への終了通知（workspace 掃除・監視解除）・起動時予約回収の
+非対象、という終端の契約がすべて failed の既存経路で満たされ、新 status は 3 コンポーネント
+（sa-ru / u-zu / qu-e）への契約追加になるため。
+
+**実行中タスクの停止の実体（実行台帳）**: dispatcher は連鎖実行を起動する際に
+`task_id → {チェーン asyncio.Task, worker asyncio.Task 群}` を実行台帳に登録し、完了時に
+自動削除する。中止はこの台帳を引いて cancel する:
+
+- チェーン cancel で以降のサブタスク投入・昇格が止まる。
+- worker cancel の遠隔プロセス回収は実行アダプタごとの既存資源回収経路に乗せる:
+  headless は CancelledError でローカル ssh を kill（`-tt` により SIGHUP がリモートの
+  `claude -p` へ伝播・§8.5 資源回収と同経路）、interactive(pty) は finally の
+  `wrapper.close`（tmux kill-session）。
+- subprocess（ollama 単発）は別スレッド同期実行のため途中打ち切りできない（既知の限界）。
+  実行は走り切るが結果は破棄され、後続ステップは走らない。
+- キューに滞留中（worker 未取得）のサブタスクは、中止済み task_id 集合により worker 取得時に
+  スキップする（cancel の隙間からの遅延実行を防ぐ）。
+
+**報告（1 メッセージ）**: 対象の特定結果と停止したものの一覧**のみ**を返す。作業手順の説明・
+次アクションの提案は返さない。発話と報告は会話セッション履歴へ追記する（後続会話の文脈維持）。
 
 | 項目 | 仕様 |
 |------|------|
@@ -1515,8 +1743,10 @@ file_audit の watchdog 監査は「変更の検知」であり、コミット�
 | 内容 | `task_id`, `command`, `channel_id`, `team_id`, `thread_ts`, `status`, `workspace` |
 | 用途 | qu-e が file_audit 判定時に「実行中タスクの指示範囲」判定材料。`workspace` は動的監視（§8.12）の登録・解除にも用いる |
 | `workspace` の決定 | 既定はタスク専用作業ディレクトリ `{workspace_base}/{task_id}`。**実開発リポジトリの明示指定**があるときはその絶対パス（下記）。worker（headless / pty）はこの `workspace` を cwd として起動する |
-| 実開発リポジトリの明示指定 | 会話の生文に `repo:/絶対/パス` 記法で指定する（`:モデル名` の明示モデル指定と同じ「要約対象の生文から抽出」方式。脳 LLM の要約は生文を言い換えるため記法が消える）。着手確認レコード → 確定タスク `workspace` → dispatcher → §8.13 push と伝搬する |
-| `repo:` パスの検証（fail-closed） | パスは SSH コマンド文字列・worker の cwd に乗るため、**絶対パス・安全文字（英数 `. _ - /`）のみ・`..` 成分不可**を sa-ru 側で強制し、不一致は着手させずユーザーへ差し戻す。`~` 前置きは不可（MBP 側ホームを sa-ru が解決できない。qu-e 側は防御的に expanduser して照合する） |
+| 実開発リポジトリの明示指定 | 会話の生文に `repo:/絶対/パス` 記法で指定する（`:モデル名` の明示モデル指定と同じ「要約対象の生文から抽出」方式。脳 LLM の要約は生文を言い換えるため記法が消える）。加えて**自然文のリポジトリ指定**（`#Repo ~/DevDev/...`「リポジトリ: /path」等、マーカー語 repo / repository / リポジトリ ＋パス）も同一の検証・展開を経て配線する（記法を知らない人間の現実の指定形。2026-08-10 インシデント根本原因 1）。自然文候補が検証を通らないときは会話を止めず `repo:` 記法での再指定を促す。着手確認レコード → 確定タスク `workspace` → dispatcher → §8.13 push と伝搬する |
+| 指定のセッション持続 | 抽出は ready を発火させた最終発話に限らず**ユーザー発話ごと**に行い、検証済みの値を会話セッションへ持続させる（セッション永続化ファイルにも保存。再起動・TTL 経過後も回復）。同一セッションで複数回指定されたときは最後の指定が勝つ。「冒頭でリポジトリ指定 → 後の発話で着手」の自然な流れで指定が落ちない（#143） |
+| `repo:` パスの検証（fail-closed） | パスは SSH コマンド文字列・worker の cwd に乗るため、**絶対パス・安全文字（英数 `. _ - /`）のみ・`..` 成分不可**を sa-ru 側で強制し、不一致は着手させずユーザーへ差し戻す。`~/` 前置きは worker ホスト（MBP）の HOME（`sa-ru.yaml` `task_context.worker_home` が唯一の供給元）へ**展開してから**同じ検証に通す。`worker_home` 未設定時は従来どおり差し戻す（誤ったホームで展開しない安全側。qu-e 側は防御的に expanduser して照合する） |
+| 着手確認での明示 | 着手確認の提示文に `workspace:` 行を**常に**出す。明示指定があればそのパス、無ければ「未指定（既定の空作業場）」と `repo:/絶対パス` での指定方法を明示する（未指定のまま空 workspace で worker が走ることに人間が着手前に気づけるようにする・#143） |
 | `workspace` の存在保証 | sa-ru は `in_progress` push と**同一 SSH コマンド内で先に `mkdir -p {workspace}`** を実行する。qu-e はこの push を受けて動的監視を登録するため、登録時点でのディレクトリ存在が順序として保証される（新規 clone 運用ではこの空ディレクトリへタスク内で worker が clone する） |
 | パス→task_id 帰属 | qu-e は file_audit の変更パスを `workspace` 接頭辞で照合し、**並行実行中の複数タスクから正しい task_id を特定**する（最長一致優先）。一致なしかつ in_progress が複数のときは曖昧として帰属せず、フォールバック通知に委ねる |
 | 起動時初期スキャン | qu-e は起動時に受信ディレクトリの**既存 task_context ファイルを読み込んでから**監視を開始する（読み込み規則はイベント受信時と同一: 終了系 status は保持しない）。qu-e 停止中・再起動中に push された文脈を取りこぼすと、実行中タスクの変更が匿名（`status=none`）と誤判定されアラートが濫発するため |
@@ -1670,7 +1900,14 @@ sequenceDiagram
   └─ Tier 3 (High Risk) ──→ Slack 承認リクエスト（§8.10 ポーリング）
         ├─ Approve ──→ allow ──→ 実行
         ├─ Reject ──→ deny ──→ 中止
-        └─ 5分タイムアウト ──→ 自動 deny ──→ 中止
+        └─ 猶予（hold_grace_sec）超過 ──→ hold（保留）
+              │  承認は pending のまま存置（自動 deny しない）
+              │  worker を畳む、タスク pending_approval（completed にしない）、並行枠を解放
+              │  済んだサブタスクの結果をタスクファイルへ永続化
+              └─ 人間の決着（期限なし）
+                    ├─ Approve ──→ 未了サブタスクから再投入 ──→ 実行
+                    │              （文脈 = workspace の成果物 + completed_steps）
+                    └─ Reject ──→ deny ──→ 中止
 ```
 
 ---
@@ -1882,6 +2119,10 @@ Step 2 (agent) ─────┘                   ──→ Step 5 (inline) �
 | inline（`queue_inline`） | 制限なし | `asyncio.create_task()` で都度起動 |
 | agent（`queue_agent`） | 最大 `max_heavy_instances`（既定 3、実行時可変） | `DynamicConcurrencyLimiter`（`heavy_limiter`）で制御。上限は qu-e のリソース最適化通知（§8.14）で動的増減 |
 
+**人間待ちで枠を占有しない**: agent レーンのサブタスクが承認 pending で保留（§8.10）したとき、worker は畳まれ当該サブタスクは `heavy_limiter` の枠を**解放**する。人間の決着は期限を持たないため、待っている間ずっと 1 枠を握り続けると並行数が実質目減りし、最悪すべての枠が人間待ちで埋まって他タスクが進まなくなる。
+
+保留はタスク単位で畳む（サブタスクだけを宙吊りにしない）。`_execute_chain` の実行を打ち切り、済んだサブタスクの結果を `completed_steps` としてタスクファイルへ永続化してからチェーンを終了する。これにより待機状態がメモリ上の future に残らず、sa-ru の再起動を跨いで保留が生き残る。決着後の再投入では、未了サブタスクが改めて `queue_agent` へ入り枠を取り直す。
+
 ### 10.5 結果の受け渡し
 
 前のステップの結果は、次のステップのコマンドに文脈として組み込まれる。
@@ -1956,7 +2197,10 @@ sa-ru のローカル LLM 処理（会話応答の生成・タスク分解）は
 | V-08 | Tier 2 qu-e 審査 | Write tool_use → qu-e 呼び出し | SSH 経由で review_cli.py が実行され JSON 応答 |
 | V-09 | Tier 2 → Tier 3 エスカレート | qu-e deny → Slack 承認リクエスト | Slack に Block Kit ボタンが表示 |
 | V-10 | Tier 3 人間承認 | Slack で Approve ボタン → フック allow | 承認ファイルの status=approved、実行続行 |
-| V-11 | Tier 3 タイムアウト | 5分放置 → 自動 deny | status=timeout、フック exit 2、Slack に通知 |
+| V-11 | 承認 pending の保留 | 猶予（`hold_grace_sec`）超過まで放置 | 承認ファイルは status=pending 存置＋`held_at` 追記、フック exit 2、worker は畳まれる、タスクは `completed` ではなく `pending_approval`、`completed_steps` が永続化、並行枠が解放、Slack に保留通知 |
+| V-11a | 保留からの再投入 | V-11 の後に Slack で Approve | 承認ファイルが done/ へ退避され、未了サブタスクのみ再実行（`completed_steps` の step は再実行されない）。同じ workspace で継続 |
+| V-11b | 保留からの却下 | V-11 の後に Slack で Reject | タスク中止（`failed`）＋Slack 通知 |
+| V-11c | sa-ru 再起動を跨ぐ保留 | V-11 の後に sa-ru を再起動し、その後 Approve | 保留が失われず再投入される（状態がディスク上で自己完結していること） |
 | V-20 | 抽象化不変条件 | 承認判定中核 `decide()`/`ApprovalPipeline` を grep | stream-json/フック/pexpect/allowedTools 等の CLI 固有語が現れない |
 | V-12 | タスク完了通知 | タスク実行完了 → Slack に通知 | `#taka-ma` に完了メッセージ |
 | V-13 | Gemini フォールバック実行 | Opus 障害時に Gemini にフォールバック | Gemini の応答が Slack に通知 |
@@ -1977,7 +2221,7 @@ sa-ru のローカル LLM 処理（会話応答の生成・タスク分解）は
 1. Slack: /taka-ma-task "このJSONをYAMLに変換して: {\"a\": 1}"
 2. u-zu → タスクファイル作成
 3. sa-ru → ya-ta: inline 判定（conf ≥ 閾値 → gemma）
-4. sa-ru → SSH → MBP: ollama run gemma4:31b
+4. sa-ru → SSH → MBP: ollama HTTP API（/api/generate・keep_alive で常駐）
 5. Gemma 4 → 結果返却
 6. sa-ru → Slack: 結果通知
 ```
@@ -2016,14 +2260,23 @@ sa-ru のローカル LLM 処理（会話応答の生成・タスク分解）は
 13. sa-ru → Slack: 結果通知
 ```
 
-**シナリオ 4: Tier 3 タイムアウト**
+**シナリオ 4: 承認 pending で保留し、後から承認して未了分から再投入**
 
 ```
 1. シナリオ3の手順8まで同じ
-2. 5分間応答なし
-3. sa-ru: 自動 deny → フックが exit 2（拒否）
-4. Claude Code: 中止
-5. sa-ru → Slack: タイムアウト通知
+2. 猶予（hold_grace_sec）内に応答なし
+3. sa-ru: 承認ファイルを pending 存置のまま held_at を追記 → フックが exit 2
+4. worker: ツール呼び出しを諦めて正常終了（result・is_error=false）
+5. sa-ru: 済んだサブタスクの結果を completed_steps としてタスクファイルへ永続化し、
+        タスクを pending_approval へ（completed にしない）→ 並行枠を解放
+        → Slack に保留通知（期限が無いことを明示）
+6. （時間経過。sa-ru が再起動しても保留は残る）
+7. 人間: Slack で Approve → u-zu が承認ファイルを approved に更新
+8. sa-ru: 決着を検知 → 承認ファイルを done/ へ退避 → タスクを status=init へ戻して再投入
+9. dispatcher: 凍結プランのうち completed_steps に無い step だけを実行
+        （同じ workspace に前回の成果物が残っている）
+10. sa-ru → Slack: 再開通知 → 結果通知
+    （7 で Reject の場合: タスクを failed として中止し Slack に却下通知）
 ```
 
 **シナリオ 5: agent/deep 推論タスク（コードベース解析・アーキテクチャ評価等）**

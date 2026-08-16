@@ -50,6 +50,8 @@ pyinfra -y @local pyinfra/deploys/common.py
 
 > **NOTE（実行モデル）**: 旧版は `pyinfra mac-mini ...` / `pyinfra mbp ...` と記載していたが、これはホストを定義した**インベントリ**が前提で、かつ制御ノード→対象機の SSH（02 の成果）を必要とする。共通基盤（01）を SSH 確立前に通すため、本手順は各機ローカルの `@local` 実行に統一する。制御ノードから遠隔一括適用したい場合はインベントリ整備後に 02 完了を前提として行う。
 
+> **NOTE（配備元ガード・全 deploy 共通）**: すべての pyinfra deploy は読み込み時に**配備元 HEAD が main（origin/main またはローカル main）に含まれるか**を検査し、未マージのコミットからの配備は `[deploy-guard] … 停止します` で即時停止する（設計書 §6.6。未マージ worktree 配備が main 済み修正を実機上で巻き戻した 2026-07-31 の事故の再発防止）。git 不在・リポジトリ外・main 参照なしの検査不能時も停止する（fail-closed）。意図的に未マージ配備が必要な場合のみ `TAKA_MA_ALLOW_UNMERGED=1` を付けて迂回する（stderr に迂回の旨が明示される）。
+
 [`pyinfra/deploys/common.py`](../../pyinfra/deploys/common.py) が下記を冪等に実行する:
 
 | 内容 | 実装 |

@@ -24,6 +24,24 @@ import sys
 
 MANIFEST_PATH = "/opt/taka-ma/data/install-manifest.jsonl"
 
+# Homebrew の標準 prefix（Apple Silicon / Intel）。
+# 撤去は brew / npm を名前で呼ぶため、非対話 SSH（PATH に /opt/homebrew/bin が
+# 入らない）で起動されると subprocess が FileNotFoundError を投げ、LIFO の途中で
+# ランナーごと落ちて撤去が中断する（check=False では防げない＝実行ファイル不在は
+# 戻り値でなく例外）。deploy 側 pyinfra/deploys/_env.py と同じ正規化を行うが、
+# 本ファイルは /opt/taka-ma/lib/ へ単体で配置され、旧い導入済みマシンでも
+# そのまま動く必要があるため import 依存を作らず意図的に自前で持つ。
+_BREW_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
+
+
+def ensure_brew_path() -> None:
+    """このプロセスの PATH に Homebrew の bin を（不足していれば）前置する。"""
+    # 空要素はカレントディレクトリ扱いになるため捨てる（PATH 未設定環境での混入防止）。
+    current = [d for d in os.environ.get("PATH", "").split(os.pathsep) if d]
+    missing = [d for d in _BREW_BIN_DIRS if d not in current]
+    if missing:
+        os.environ["PATH"] = os.pathsep.join(missing + current)
+
 
 def load_records(path: str) -> list:
     """JSONL を読み、レコードのリストを返す。空行は無視。"""
@@ -127,6 +145,10 @@ def main(argv=None):
     parser.add_argument("--manifest", default=MANIFEST_PATH,
                         help=f"マニフェストのパス（既定: {MANIFEST_PATH}）")
     args = parser.parse_args(argv)
+
+    # SSH 越し（非対話シェル）から起動されても brew / npm を解決できるようにする。
+    # 対話シェルから叩く従来の実行は PATH が既に通っているため挙動が変わらない。
+    ensure_brew_path()
 
     records = load_records(args.manifest)
     if not records:

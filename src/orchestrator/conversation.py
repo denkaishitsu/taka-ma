@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import threading
 import time
 import uuid
@@ -54,6 +55,24 @@ _REPO_TOKEN_RE = re.compile(r"(?<!\S)repo:(\S+)")
 # 受け付ける workspace パス。SSH コマンド文字列・worker の cwd に乗るため、
 # 絶対パス・安全文字（英数 . _ - /）のみに制限する（§8.13 repo: パスの検証、fail-closed）。
 _SAFE_WORKSPACE_RE = re.compile(r"\A/[A-Za-z0-9._/\-]+\Z")
+# 脳 LLM 応答契約 {reply, ready, summary}（§8.3）のキーが生テキストへ混じっているかの検出。
+# JSONDecodeError フォールバックに来る出力は定義上パース不能（切断・多重 JSON 等の壊れ形）
+# なので json.loads では判定できず、「引用符付き契約キー + コロン」の形で検出する。壊れ形には
+# Python dict 風のシングルクォート（'reply':）もあり得るため引用符は "/' の両方を受ける。
+# 人向け返信に内部 JSON を 1 断片も見せないため、キー 1 つの出現でも縮退する（安全側・
+# #taka-ma/142。実害は 2026-08-10 Slack DM インシデント F2 の生 JSON 漏出）。
+_CONTRACT_KEY_RE = re.compile(r"""["'](?:reply|ready|summary)["']\s*:""")
+# 自然文のリポジトリ指定（§8.13 / #143）。インシデント発端の `#Repo ~/DevDev/...` のように、
+# 人間は `repo:` 記法ではなくマーカー語＋パスで指定する現実がある（2026-08-10 インシデント
+# 根本原因 1）。マーカー語（repo / repository / リポジトリ）に区切り（: ： = は を の・空白）を
+# 挟んで続く `/...` または `~/...` パスを候補として拾い、`repo:` 記法と同一の検証・展開に通す。
+# 直前が英数・`-`・`/` のもの（URL の `.../repo:tag` や `my-repo` 等の埋め込み）は誤検知する
+# ためマーカーとして扱わない。
+_REPO_MENTION_RE = re.compile(
+    r"(?<![A-Za-z0-9_/\-])#?(?:repo(?:sitory)?|リポジトリ)"
+    r"(?:\s*(?:[:：=＝]|は|を|の)\s*|\s+)"
+    r"((?:~/|/)[A-Za-z0-9._\-][A-Za-z0-9._/\-]*)",
+    re.IGNORECASE)
 
 
 class InvalidWorkspaceError(ValueError):
@@ -69,7 +88,7 @@ class ConversationManager:
     """
 
     def __init__(self, config, slack_notifier, task_dir: str, classifier=None,
-                 plan_service=None):
+                 plan_service=None, process_mgr=None, canceller=None):
         """会話マネージャを構築する。
 
         Args:
@@ -84,8 +103,22 @@ class ConversationManager:
             plan_service: 計画プレビューの生成・整形・訂正（orchestrator.plan.PlanService）。
                 意図が固まった時点でここで分解まで済ませ、計画を提示して承認を取る
                 （設計書 §8.10b 計画確認ゲート / §10.2.1 計画プレビュー契約）。
+            process_mgr: 確認系質問への実測応答（§8.3 probe）で読み取り専用コマンドを
+                workspace に SSH 実行する手段（RemoteProcessManager）。None なら probe は
+                「実行手段なし」の事実を返信する（宣言は返さない）。
+            canceller: 停止命令の実行本体（設計書 §8.10d）。Orchestrator.request_cancel を
+                注入する（発話 msg を受け、同一会話面の計画/タスクを停止して停止結果 dict を
+                返す同期呼び出し。会話処理は to_thread 上のため同期でよい）。None なら
+                制御判定を行わない（単体テスト・段階導入用）。
         """
         self.config = config
+        self.process_mgr = process_mgr
+        # probe の対象 workspace の既定 base（Orchestrator._workspace_for と同じ解決規則）
+        self.workspace_base = config.get("task_context", {}).get(
+            "workspace_base", "/opt/taka-ma/work")
+        # conversation_id → 直近タスクの workspace（確認系質問の実測対象。§8.3 probe）。
+        # セッション永続化ファイルにも保存し、再起動をまたいで保持する
+        self._last_workspace: dict[str, str] = {}
         self.plan_service = plan_service
         self.model = config["sa-ru"]["model"]              # 脳モデル（sa-ru.yaml が正本）
         # 接続先・会話タイムアウトは config を唯一の源にする（設計書 §8.4。コード既定値なし）
@@ -97,6 +130,7 @@ class ConversationManager:
         self.slack = slack_notifier
         self.task_dir = task_dir                            # 確定タスクの書き出し先（dispatcher が走査）
         self.classifier = classifier
+        self.canceller = canceller                          # 停止命令の実行本体（§8.10d）
         self.confirm_dir = config["exec_confirm"]["dir"]    # 着手確認レコードの dir
         os.makedirs(self.confirm_dir, exist_ok=True)
         # 会話プロンプトは静的なので起動時に 1 度だけ読む（毎ターンの disk I/O を避ける）
@@ -109,8 +143,18 @@ class ConversationManager:
         # sa-ru.yaml を唯一の供給元とする（コード側に既定値を置くと供給元が二重になる）
         self.sessions_dir = config["conversation"]["sessions_dir"]
         os.makedirs(self.sessions_dir, exist_ok=True)
+        # worker ホスト（MBP）の HOME 絶対パス（sa-ru.yaml task_context.worker_home が唯一の
+        # 供給元）。`~/` 前置きのリポジトリ指定をここで絶対パスへ展開する（§8.13 / #143。
+        # sa-ru は MBP 側ホームを自力解決できない）。未設定なら ~ 指定は従来どおり差し戻す
+        # （fail-closed。誤ったホームで展開して無関係パスへ書くより安全側）
+        self.worker_home = (config.get("task_context") or {}).get("worker_home")
         # conversation_id → [{"role": "user"|"assistant", "text": str}, ...]
         self.sessions: dict[str, list[dict]] = {}
+        # conversation_id → 検証済み workspace 絶対パス。repo: / 自然文指定はセッション単位で
+        # 持続させる（§8.13 / #143。抽出を ready を発火させた最終発話に限ると「冒頭で指定 →
+        # 後の発話で着手」という自然な流れで指定が落ちる。2026-08-14 Wave1-B 検証 2）。
+        # セッション永続化ファイルにも保存し、再起動・TTL 経過後も失わない
+        self.session_workspace: dict[str, str] = {}
         # conversation_id → 最終アクセス時刻（monotonic 秒）。エビクション判定に使う
         self._last_seen: dict[str, float] = {}
         # セッション辞書の排他。会話処理は to_thread（別スレッド）、タスク結果の還流
@@ -137,7 +181,16 @@ class ConversationManager:
         if os.path.exists(path):
             try:
                 with open(path) as f:
-                    history = json.load(f).get("turns", [])
+                    data = json.load(f)
+                history = data.get("turns", [])
+                # 直近タスクの workspace も回復する（§8.3 probe。再起動後の確認系質問に
+                # 「workspace 不明」で答えないため。メモリ上の値が新しい可能性があるため上書きしない）
+                if data.get("last_workspace") and cid not in self._last_workspace:
+                    self._last_workspace[cid] = data["last_workspace"]
+                # workspace 指定もセッションの記憶として回復する（§8.13 / #143。
+                # 再起動・TTL 経過で「冒頭のリポジトリ指定」を失わない）
+                if data.get("workspace"):
+                    self.session_workspace[cid] = data["workspace"]
             except (OSError, json.JSONDecodeError, AttributeError):
                 # 壊れた永続化ファイルで会話全体を止めない。新規セッションとして進める
                 logger.exception("会話セッションの読込失敗（新規で継続）: %s", path)
@@ -151,6 +204,9 @@ class ConversationManager:
             atomic_write_json(self._session_path(cid), {
                 "conversation_id": cid,
                 "turns": history,
+                "last_workspace": self._last_workspace.get(cid),  # §8.3 probe の実測対象
+                # 検証済み workspace 指定（§8.13 / #143）。会話ターンと同じ寿命で持続させる
+                "workspace": self.session_workspace.get(cid),
                 "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             })
         except OSError:
@@ -159,13 +215,17 @@ class ConversationManager:
     # ── 会話処理（会話ループから to_thread で呼ばれる：脳 LLM は同期ブロック） ──
 
     @staticmethod
-    def parse_workspace(text: str) -> tuple[str, str | None]:
+    def parse_workspace(text: str, worker_home: str | None = None) -> tuple[str, str | None]:
         """生文から `repo:<絶対パス>` を抽出し、(除去後テキスト, workspace|None) を返す。
 
         `:モデル名` 指定（classifier.parse_model）より先に呼ぶこと。`repo:/path` の
         `:/path` 部分が parse_model の `:(\\S+)` に誤マッチして未登録モデル扱いになるため、
         先に取り除く必要がある。検証（§8.13 repo: パスの検証）に通らない指定は
         InvalidWorkspaceError で着手前に差し戻す（fail-closed）。
+
+        worker_home: worker ホスト（MBP）の HOME 絶対パス。`~/` 前置きはこの値で展開して
+        から検証する（§8.13 / #143。人間の指定は `~/DevDev/...` が現実形）。未指定（None）
+        なら展開できないため従来どおり差し戻す。
         """
         matches = _REPO_TOKEN_RE.findall(text)
         if not matches:
@@ -174,14 +234,51 @@ class ConversationManager:
             raise InvalidWorkspaceError("repo: 指定が複数あります。1 つにしてください")
         workspace = matches[0].rstrip("/")
         if workspace.startswith("~"):
-            raise InvalidWorkspaceError(
-                "repo: は絶対パスで指定してください（~ は使えません。"
-                "例: repo:/Users/<user>/DevDev/xxx）")
+            if worker_home and (workspace == "~" or workspace.startswith("~/")):
+                # worker ホスト側 HOME への展開（§8.13。展開後を通常の検証に通す）
+                workspace = worker_home.rstrip("/") + workspace[1:]
+            else:
+                raise InvalidWorkspaceError(
+                    "repo: は絶対パスで指定してください（~ は使えません。"
+                    "例: repo:/Users/<user>/DevDev/xxx）")
         if not _SAFE_WORKSPACE_RE.match(workspace) or ".." in workspace.split("/"):
             raise InvalidWorkspaceError(
                 "repo: のパスが不正です（絶対パス・英数と . _ - / のみ・.. 不可）")
         clean = _REPO_TOKEN_RE.sub("", text).strip()
         return clean, workspace
+
+    @staticmethod
+    def find_repo_mention(text: str) -> str | None:
+        """自然文のリポジトリ指定（`#Repo ~/path`『リポジトリ: /path』等）のパス候補を返す。
+
+        `repo:` 記法が無いときのフォールバック（§8.13 / #143。インシデント発端メッセージは
+        `#Repo ~/DevDev/...` 形式で、記法抽出だけでは workspace に乗らなかった）。候補は
+        呼び出し側で `repo:` 記法と同一の検証・~ 展開に通す。複数あれば最後（最新の言及）を採る。
+        """
+        matches = _REPO_MENTION_RE.findall(text)
+        return matches[-1] if matches else None
+
+    def _extract_workspace(self, text: str) -> tuple[str, str | None, str | None]:
+        """発話 1 件から workspace 指定を抽出する。(repo: 除去後テキスト, workspace, 案内文言)。
+
+        - `repo:` 記法の不正は InvalidWorkspaceError を送出（明示記法は fail-closed に差し戻す）
+        - 自然文指定（find_repo_mention）が検証を通らない場合は例外にせず案内文言を返す
+          （ヒューリスティック検出で会話を堰き止めない。repo: 記法での再指定を促す・#143）
+        """
+        clean, workspace = self.parse_workspace(text, worker_home=self.worker_home)
+        if workspace is not None:
+            return clean, workspace, None
+        raw = self.find_repo_mention(text)
+        if raw is None:
+            return clean, None, None
+        try:
+            # 候補を repo: 記法に包み直し、記法指定と同一の検証・~ 展開に通す（規則の二重化防止）
+            _, workspace = self.parse_workspace(f"repo:{raw}", worker_home=self.worker_home)
+            return clean, workspace, None
+        except InvalidWorkspaceError as e:
+            return clean, None, (
+                f"リポジトリ指定と思われる `{raw}` を workspace に設定できませんでした（{e}）。"
+                "`repo:/絶対パス` 記法で指定し直してください。")
 
     def _evict_idle_sessions(self, now: float):
         """TTL を超えて使われていないセッションをメモリからアンロードする。
@@ -192,6 +289,8 @@ class ConversationManager:
         for c in stale:
             self.sessions.pop(c, None)
             self._last_seen.pop(c, None)
+            # workspace も同時にアンロードする（永続化ファイルに残るため次の発話で回復する）
+            self.session_workspace.pop(c, None)
 
     def handle_message(self, msg: dict, progress: GenerationProgress | None = None):
         """1 件の発話を処理する。会話継続なら返信、意図が固まれば着手確認を提示する。
@@ -204,17 +303,49 @@ class ConversationManager:
         # 計測できるようにする。実運用フィードバックを受けて追加）。
         logger.info("会話メッセージ処理開始: conversation_id=%s", cid)
 
+        # 停止命令（制御コマンド）は訂正解釈・脳 LLM より前に判定し、承認ゲートに掛けず
+        # 即時実行する（設計書 §8.10d）。提示中の計画がある状態での「中止」は計画への訂正
+        # ではなく破棄命令のため、訂正解釈より先でなければならない。/taka-ma-go は明示の
+        # 実行エスケープなので制御判定に掛けない。
+        if (not msg.get("force_ready") and self.canceller is not None
+                and self.classifier is not None
+                and self.classifier.classify_control(msg["text"]) == "cancel"):
+            self._handle_cancel(msg)
+            return
+
         # 計画確認中（pending の確認レコードがある）なら、発話をまず「提示済みプランへの訂正」
         # として解釈する（設計書 §8.3 訂正経路 / §10.2.1）。訂正と解釈できなければ通常の会話へ
         # 落とす（人間がプランを捨てて話を続ける経路を塞がない）。/taka-ma-go は締め直しの
         # 明示エスケープなので訂正解釈に回さない。
         if not msg.get("force_ready") and self._handle_correction(msg, progress=progress):
             return
+
+        # workspace 指定（repo: 記法・自然文）は発話ごとに抽出してセッションへ持続させる
+        # （§8.13 / #143。ready を発火させた最終発話だけを見る方式では「冒頭で指定 → 後の
+        # 発話で着手」の流れで指定が落ちる）。`repo:` 記法の不正はこの時点で差し戻し、
+        # 会話・着手へ進めない（fail-closed。従来は ready 時のみ検証していたが、指摘が早い
+        # ほど人間の修正コストが低い）。自然文候補の不正は案内のみで会話は続ける。
+        try:
+            text_wo_repo, workspace, guidance = self._extract_workspace(msg["text"])
+        except InvalidWorkspaceError as e:
+            self.slack.notify(
+                str(e), msg.get("channel_id"),
+                team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
+            return
+        if guidance:
+            self.slack.notify(
+                guidance, msg.get("channel_id"),
+                team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
+
         now = time.monotonic()
         with self._sessions_lock:
             self._evict_idle_sessions(now)
             self._last_seen[cid] = now
             history = self._load_or_create_session(cid)
+            if workspace is not None:
+                # 最後に指定された値が勝つ（同一セッションで指定し直せる）。永続化は
+                # 直後の _persist_session が turns と一緒に書く
+                self.session_workspace[cid] = workspace
             history.append({"role": "user", "text": msg["text"]})
             # 履歴は直近 MAX_HISTORY_TURNS に丸める（プロンプト肥大・KV キャッシュ膨張防止）
             if len(history) > MAX_HISTORY_TURNS:
@@ -231,20 +362,22 @@ class ConversationManager:
         else:
             result = self._invoke_llm(history_snapshot, force=False, progress=progress)
 
+        # 確認系質問（リポジトリ・ブランチ・ファイル名等の実状態）には宣言でなく実行結果を
+        # 返す（§8.3 probe）。脳 LLM は「どの実測が要るか」の選別のみを担い、返信本文は
+        # コマンド実出力から機械的に組み立てる（§8.9 と同じ規律）
+        if not result.get("ready") and result.get("probe"):
+            self._answer_probe(msg)
+            return
+
         if result.get("ready") and result.get("summary"):
             summary = result["summary"]
             self._append_turn(cid, "assistant", summary)
-            # `repo:` 実開発リポジトリ指定と `:opus` 等の明示モデル指定は要約（脳 LLM の
-            # 言い換え）には残らないため、要約対象の生文から直接抽出する（§8.13 /
-            # 設計書「ユーザーモデル指定」）。repo: を先に除去しないと `:/path` が
-            # parse_model に未登録モデルとして誤検出される。
-            try:
-                text_wo_repo, workspace = self.parse_workspace(msg["text"])
-            except InvalidWorkspaceError as e:
-                self.slack.notify(
-                    str(e), msg.get("channel_id"),
-                    team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
-                return
+            # workspace はセッション持続値を採る（このターンの指定は上で反映済み。§8.13 / #143）。
+            # `:opus` 等の明示モデル指定は要約（脳 LLM の言い換え）には残らないため、要約対象の
+            # 生文から直接抽出する（設計書「ユーザーモデル指定」）。repo: を先に除去した
+            # text_wo_repo を使う（`:/path` が parse_model に未登録モデルとして誤検出されるため）。
+            with self._sessions_lock:
+                workspace = self.session_workspace.get(cid)
             models: list[str] = []
             if self.classifier is not None:
                 try:
@@ -266,6 +399,108 @@ class ConversationManager:
                 reply, msg.get("channel_id"),
                 team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
 
+    # probe で実行する読み取り専用コマンド（§8.3「確認系質問への実測応答」で固定列挙）。
+    # 任意コマンド実行の入り口にしない（脳 LLM が選べるのは probe 種別のみ・コマンドはコード固定）
+    _PROBE_COMMANDS = ("git -C {ws} remote -v",
+                       "git -C {ws} rev-parse --abbrev-ref HEAD",
+                       "ls -la {ws}")
+    # probe 1 コマンドの SSH タイムアウト（秒）と、返信へ載せる 1 出力の上限文字数
+    _PROBE_TIMEOUT_SEC = 30
+    _PROBE_OUTPUT_MAX_CHARS = 1500
+
+    def _answer_probe(self, msg: dict):
+        """確認系質問に実行結果（実出力）で答える（§8.3 probe）。
+
+        返信は必ず 1 メッセージ。実行できた場合はコマンドごとの rc・実出力、実行不能
+        （workspace 不明・SSH 手段なし・SSH 不達）の場合はその事実とエラーを返す。
+        いずれも脳 LLM の生成テキストは使わない（宣言反復＝2026-08-10 インシデント F2 の再発防止）。
+        """
+        cid = msg["conversation_id"]
+        with self._sessions_lock:
+            # _last_workspace は永続化ファイルからの遅延回復を経る（_load_or_create_session）
+            self._load_or_create_session(cid)
+            workspace = self._last_workspace.get(cid)
+        if self.process_mgr is None:
+            text = "実測確認を実行できません: SSH 実行手段が未構成です（sa-ru の構成異常）"
+        elif not workspace:
+            text = ("実測確認を実行できません: この会話で実行したタスクの workspace が"
+                    "見つかりません。タスクを実行してから再度お尋ねください")
+        else:
+            ws = shlex.quote(workspace)
+            lines = [f"実測結果（workspace: {workspace}）"]
+            for template in self._PROBE_COMMANDS:
+                cmd = template.format(ws=ws)
+                rc, output = self.process_mgr.run_ssh_probe(
+                    cmd, timeout=self._PROBE_TIMEOUT_SEC)
+                out = (output or "").strip()
+                if len(out) > self._PROBE_OUTPUT_MAX_CHARS:
+                    out = out[:self._PROBE_OUTPUT_MAX_CHARS] + "\n…（以降略）"
+                lines.append(f"$ {cmd} (rc={rc})")
+                lines.append(out if out else "（出力なし）")
+            text = "\n".join(lines)
+        # 実測結果を会話履歴にも残す（後続ターンで脳が事実として参照できるようにする）
+        self._append_turn(cid, "assistant", text)
+        self.slack.notify(
+            text, msg.get("channel_id"),
+            team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
+
+    def _set_last_workspace(self, cid: str, workspace: str):
+        """会話の「直近タスクの workspace」を記録し、セッションと一緒に永続化する（§8.3 probe）。"""
+        if not cid or not workspace:
+            return
+        with self._sessions_lock:
+            history = self._load_or_create_session(cid)
+            self._last_workspace[cid] = workspace
+            self._persist_session(cid, history)
+
+    # ── 停止命令の即時実行（設計書 §8.10d） ──
+
+    def _handle_cancel(self, msg: dict):
+        """停止命令を即時実行し、対象の特定結果と停止一覧のみを 1 メッセージで返す（§8.10d）。
+
+        承認ゲート（着手/やり直す）は経由しない。停止の実体（計画破棄・タスク停止）は注入された
+        canceller（Orchestrator.request_cancel）へ委譲し、ここは報告整形と会話履歴への追記
+        （後続会話の文脈維持）のみを担う。失敗は原因を明示して返す（無言ドロップ防止・§8.3 の
+        エラーハンドリングと同じ規律。原因不明の包括表現は使わない）。
+        """
+        cid = msg["conversation_id"]
+        logger.info("停止命令を検知: conversation_id=%s", cid)
+        error = False
+        try:
+            report = self.canceller(msg)
+            reply = self._format_cancel_report(report)
+        except Exception as e:
+            logger.exception("停止命令の実行に失敗")
+            reply = f"中止処理に失敗しました（{type(e).__name__}: {e}）。"
+            error = True
+        self._append_turn(cid, "user", msg["text"])
+        # エラー文言はシステムメッセージであり会話ではないため履歴に残さない（残すと後続
+        # ターンで脳が文脈としてオウム返しする・handle_message のエラー経路と同じ規律）
+        if not error:
+            self._append_turn(cid, "assistant", reply)
+        self.slack.notify(
+            reply, msg.get("channel_id"),
+            team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
+
+    @staticmethod
+    def _format_cancel_report(report: dict) -> str:
+        """停止結果を「特定結果 + 停止一覧のみ」の 1 メッセージに整形する（§8.10d 報告規律）。
+
+        作業手順の説明・次アクションの提案は含めない。対象ゼロは「停止対象なし」を返す
+        （承認ゲート形式の確認は用いない）。
+        """
+        sections = [
+            ("提示中の計画を破棄", report.get("confirms") or []),
+            ("実行中タスクを停止", report.get("running") or []),
+            ("未着手タスクを停止", report.get("queued") or []),
+            ("承認待ちタスクを停止", report.get("held") or []),
+        ]
+        lines = [f"- {label}: {item}" for label, items in sections for item in items]
+        if not lines:
+            return ("停止対象の作業はありませんでした"
+                    "（この会話に提示中の計画・実行中/待機中のタスクは見つかりません）。")
+        return f"🛑 中止しました（{len(lines)} 件）\n" + "\n".join(lines)
+
     def _append_turn(self, cid: str, role: str, text: str):
         """セッションへ 1 ターン追記し、丸め・永続化まで行う（排他付き）。"""
         with self._sessions_lock:
@@ -275,12 +510,16 @@ class ConversationManager:
                 del history[:-MAX_HISTORY_TURNS]
             self._persist_session(cid, history)
 
-    def append_task_result(self, task: dict, result_text: str, result_path: str):
+    def append_task_result(self, task: dict, result_text: str, result_path: str,
+                           workspace: str | None = None):
         """タスク完了結果を発生元の会話セッションへ assistant ターンとして還流する。
 
         設計書 §8.9「会話への還流」。これにより完了後の後続質問（「さっきの回答はどこ」等)
         に会話脳が文脈として答えられる。conversation_id はタスクの team/channel/thread から
         復元する（u-zu の採番規則 §8.3: thread_ts が無い DM 等は user_id）。
+        result_text はグラウンディング判定を先頭に併記したもの（§8.9。worker の自己申告を
+        会話脳が事実として引き継がない）。workspace は確認系質問（§8.3 probe）の実測対象
+        として会話に紐付ける。
         """
         tail = task.get("thread_ts") or task.get("user_id") or ""
         if not tail:
@@ -289,6 +528,8 @@ class ConversationManager:
         # import 共有はできず、空要素の '-' 置換まで含めて式を一致させる。ズレると還流が
         # 実セッションに届かず新規セッションへ落ちる）
         cid = f"{task.get('team_id') or '-'}:{task.get('channel_id') or '-'}:{tail}"
+        if workspace:
+            self._set_last_workspace(cid, workspace)
         summary = result_text[:RESULT_REFLOW_MAX_CHARS]
         if len(result_text) > RESULT_REFLOW_MAX_CHARS:
             summary += "\n…（以降略）"
@@ -296,12 +537,47 @@ class ConversationManager:
             cid, "assistant",
             f"（タスク実行完了。結果の要約は以下、全文は結果ファイル {result_path} にあります）\n{summary}")
 
+    @staticmethod
+    def _coerce_ready(parsed: dict) -> bool:
+        """パース済み応答から契約キー `ready` を取り出し、boolean へ確定させる（#taka-ma/145）。
+
+        契約 {reply, ready, summary}（§8.3）では ready は必須の boolean だが、脳 LLM
+        （qwen3.6:35b-a3b・think=false）が ready キー自体を欠落した JSON を返すことが
+        実測されている（2026-08-16 分離実行）。従来は None が falsy として偶然会話継続に
+        落ちるだけで契約逸脱を検知していなかった。逸脱の扱いを暗黙でなく明示コードで
+        定義する:
+
+        - ready キー欠落 → 安全側の会話継続（False）を明示的に選び、warning で欠落を記録
+        - ready が boolean 以外（"true" 等の文字列・数値・null） → 同じく False + warning。
+          従来の bool() 変換では文字列 "false" が truthy となり誤って実行確認へ進み得た
+        - ready が boolean → そのまま返す（正常系・ログなし）
+
+        いずれも例外を投げない（壊れ応答で会話を止めない。JSONDecodeError フォール
+        バック・#142 の契約キーフィルタと同じく「解釈できない出力で実行へ進めない」側に
+        倒す）。warning は発生率の観測点（このログの件数 / 会話ターン数）として使う。
+        """
+        if "ready" not in parsed:
+            logger.warning(
+                "会話 LLM 応答が契約逸脱: ready キー欠落（会話継続へ縮退・keys=%s）",
+                sorted(parsed.keys()))
+            return False
+        ready = parsed["ready"]
+        if not isinstance(ready, bool):
+            logger.warning(
+                "会話 LLM 応答が契約逸脱: ready が boolean でない"
+                "（type=%s value=%.80r・会話継続へ縮退）",
+                type(ready).__name__, ready)
+            return False
+        return ready
+
     def _invoke_llm(self, history: list[dict], force: bool,
                     progress: GenerationProgress | None = None) -> dict:
         """脳 LLM（sa-ru.model）を呼び、{reply, ready, summary} を返す。
 
         パース失敗時は会話継続（ready=false）にフォールバックし、素の stdout を返信に回す
-        （安全側: 解釈できない出力で勝手に実行へ進めない）。force=True は要約を促す指示を足す。
+        （安全側: 解釈できない出力で勝手に実行へ進めない）。ただし契約 JSON の断片が
+        混じった出力は人向け文言へ縮退し、内部 JSON を Slack へ生で見せない（#taka-ma/142）。
+        force=True は要約を促す指示を足す。
 
         失敗は原因別に扱う（設計書 §8.3 エラーハンドリング）: タイムアウト・接続失敗は
         1 回リトライし、それでも失敗したら原因を明示した文言を返信に回す。原因不明の
@@ -335,14 +611,31 @@ class ConversationManager:
             # （gemma4:12b の実機検証で再現・2026-07-04）。ai_gateway 側 classifier/decomposer
             # と同じ extract_json でフェンス除去してからパースする（同根の欠陥・§9.2 と同一パターン）。
             parsed = json.loads(extract_json(stdout))
+            # probe は許可値のみ通す（コマンドはコード側 _PROBE_COMMANDS で固定。脳 LLM の
+            # 出力を任意コマンド実行に接続しない・§8.3「確認系質問への実測応答」）
+            probe = parsed.get("probe")
             return {
                 "reply": parsed.get("reply", ""),
-                "ready": bool(parsed.get("ready", False)),
+                "ready": self._coerce_ready(parsed),
                 "summary": parsed.get("summary"),
+                "probe": probe if probe == "repo_status" else None,
             }
         except json.JSONDecodeError:
             # JSON 化できない出力は会話継続に回す（解釈できない出力で実行へ進めない）
-            return {"reply": (stdout or "").strip(), "ready": False, "summary": None}
+            text = (stdout or "").strip()
+            if _CONTRACT_KEY_RE.search(text):
+                # 契約 JSON 断片の混じった壊れ出力は人に見せない（会話出口の内部 JSON
+                # フィルタ・#taka-ma/142）。タスクは止めず会話継続（ready=false）のまま
+                # 言い直しを促す。error=True でエラー文言を履歴に残さない（脳がオウム
+                # 返しする実機再現 2026-07-14 と同じ扱い。壊れ出力自体も文脈にしない）
+                logger.warning(
+                    "会話 LLM 出力に契約 JSON 断片が混入（人向け文言へ縮退・生出力 %d 文字）",
+                    len(text))
+                return {
+                    "reply": "（応答の整形に失敗しました。もう一度お願いします）",
+                    "ready": False, "summary": None, "error": True,
+                }
+            return {"reply": text, "ready": False, "summary": None}
         except OllamaTimeoutError:
             logger.exception("会話 LLM がタイムアウト（リトライ含め 2 回失敗）")
             return {
@@ -529,10 +822,17 @@ class ConversationManager:
                     exec_request_id, msg["conversation_id"],
                     len(plan) if plan else 0)
         plan_text = self.plan_service.render(plan) if (plan and self.plan_service) else None
+        # workspace は指定の有無にかかわらず常に提示する（§8.13 / #143。未指定のまま空の
+        # 使い捨て作業場で worker が走ることに人間が着手前に気づけるようにする。2026-08-10
+        # インシデントでは未指定が提示文に出ず、10 日間誰も気づけなかった）
+        workspace_text = workspace or (
+            "未指定（既定の空作業場）— 実リポジトリで作業させるには"
+            " `repo:/絶対パス` を指定してください")
         self.slack.send_exec_confirm_request(
             exec_request_id, summary,
             channel=msg.get("channel_id"), team_id=msg.get("team_id"),
-            thread_ts=msg.get("thread_ts"), plan_text=plan_text)
+            thread_ts=msg.get("thread_ts"), plan_text=plan_text,
+            workspace_text=workspace_text)
 
     # ── 着手確認の決着（確認ループから呼ばれる） ──
 
@@ -573,6 +873,11 @@ class ConversationManager:
         path = os.path.join(self.task_dir, f"{ts}_{task_id}.json")
         # 原子書込。dispatcher が部分書込の init タスクを拾う torn-read を防ぐ（§8.3 書込の原子性）。
         atomic_write_json(path, task)
+        # 実行 workspace を会話に紐付ける（§8.3 probe。repo: 指定が無ければ既定の
+        # {workspace_base}/{task_id} — Orchestrator._workspace_for と同じ解決規則）
+        self._set_last_workspace(
+            record.get("conversation_id"),
+            record.get("workspace") or f"{self.workspace_base}/{task_id}")
         self.slack.notify(
             "着手します。実行を開始しました。",
             record.get("channel_id"), team_id=record.get("team_id"),

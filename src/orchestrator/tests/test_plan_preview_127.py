@@ -411,6 +411,8 @@ def test_dispatcher_uses_frozen_plan_without_redecompose(config, tmp_path):
     o._notify = _notify
     o._daily_cleanup = _daily_cleanup
     o._execute_chain = _execute_chain
+    o._running_tasks = {}       # 実行台帳（§8.10d）。dispatcher の連鎖起動が登録する
+    o._cancelled_tasks = set()  # 中止済み集合（§8.10d）。連鎖起動前のガードが参照する
 
     async def _run():
         with pytest.raises(asyncio.CancelledError):
@@ -433,7 +435,8 @@ class _FakeNotifier:
         self.notes.append(text)
 
     def send_exec_confirm_request(self, exec_request_id, summary, channel=None,
-                                  team_id=None, thread_ts=None, plan_text=None):
+                                  team_id=None, thread_ts=None, plan_text=None,
+                                  workspace_text=None):
         self.notes.append(plan_text or "")
 
     def send_plan_update(self, exec_request_id, body, channel=None,

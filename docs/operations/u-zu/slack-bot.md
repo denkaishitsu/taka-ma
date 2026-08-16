@@ -26,6 +26,9 @@
   - [複数モデル指定（cross-review）](#複数モデル指定cross-review)
   - [不正なモデル指定](#不正なモデル指定)
   - [ya-ta 検証コマンド（ドライラン）](#ya-ta-検証コマンドドライラン)
+- [プロジェクト別チャンネル運用](#プロジェクト別チャンネル運用)
+  - [チャンネル追加手順](#チャンネル追加手順)
+  - [リポジトリの指定](#リポジトリの指定)
 
 ## サービス管理
 
@@ -151,6 +154,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.taka-ma.sa-ru.plist
 
 ```
 /taka-ma-model add opus47 --full-name "claude-opus-4.7" --vendor anthropic --methods pty --model-flag "--model opus-4.7"
+/taka-ma-model add llama4 --full-name "llama-4-8b" --model-id llama4:8b --methods subprocess --api-url http://localhost:11434/api/generate --keep-alive-sec 1800
 /taka-ma-model update opus47 --model-flag "--model opus-4.7-latest"
 /taka-ma-model remove opus47
 /taka-ma-model list
@@ -158,7 +162,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.taka-ma.sa-ru.plist
 /taka-ma-model uninstall opus47     ← ya-ta.yaml から削除 + sa-ru 再起動
 ```
 
-- `add` / `update` / `remove`: ya-ta.yaml の models セクションを編集
+- `add` / `update` / `remove`: ya-ta.yaml の models セクションを編集。ローカルモデル（`type: local`）は `--api-url`（実行機から見た ollama 生成エンドポイント）と `--keep-alive-sec`（モデルを常駐させ続ける秒数）も必須。ローカルモデルの実行は CLI 起動ではなく HTTP API 呼び出しのため（設計書 §8.7）、この 2 つが無いと登録できても実行時に落ちる
 - `install`: ya-ta.yaml に反映し、必要に応じてモデルのダウンロード（ollama pull 等）+ sa-ru 再起動。ローカルモデル（`type: local`）の `install` は `model_id` が必須で、未設定のまま実行すると（実体を何もダウンロードせずに成功と誤報しないよう）エラーになる
 - `uninstall`: ya-ta.yaml から削除 + sa-ru 再起動
 
@@ -239,10 +243,12 @@ sa-ru への話しかけ方は 3 通りある。**返信がスレッドに入る
 
 | 指定名 | モデル（例） | 用途 |
 |--------|-------------|------|
-| `:opus` | Claude Opus 4.6 | 重量タスク（デフォルト） |
-| `:sonnet` | Claude Sonnet 4.6 | 中量タスク（Opus より高速・低コスト） |
+| `:opus` | Claude Opus 5 | 重量タスク（デフォルト） |
+| `:fable` | Claude Fable 5 | 最難関タスク（明示指定のみ） |
+| `:sonnet` | Claude Sonnet 5 | 中量タスク（Opus より高速・低コスト） |
 | `:haiku` | Claude Haiku 4.5 | 軽量タスク（高速応答） |
-| `:gemini` | Gemini 3.5 Flash | 高度なマルチモーダル解析（動画・音声・画像の理解） |
+| `:gemini` | Gemini 3.6 Flash | 高度なマルチモーダル解析（動画・音声・画像の理解） |
+| `:gemini-pro` | Gemini 3.1 Pro | Gemini 最上位（明示指定のみ） |
 | `:gemma` | Gemma 4 31B | ローカル軽量（デフォルト light） |
 
 > ya-ta.yaml にモデルを追加・変更すれば、この一覧も変わる。不正なモデル名を指定した場合は、その時点で登録済みのモデル一覧がエラーとして返る。
@@ -271,3 +277,34 @@ sa-ru への話しかけ方は 3 通りある。**返信がスレッドに入る
 ```
 /taka-ma-task プロジェクトを解析して :gemini、問題点を改修して /exam_gw
 ```
+
+## プロジェクト別チャンネル運用
+
+プロジェクトごとに Private Channel を分け、それぞれのチャンネルで `@taka-ma` と会話して開発を進められる。
+
+u-zu に受信チャンネルの許可リストは無く、**Bot が招待されている任意の Private Channel** の `@taka-ma` メンションを受け付ける（認可はユーザー ID のみ。[`src/slack_bot/handlers/events.py`](../../../src/slack_bot/handlers/events.py) `handle_mention()`）。返信・計画提示・承認・完了通知は受信イベントの `channel_id` / `thread_ts` に返るため、チャンネルを増やしても混線しない。会話セッションも `(team_id, channel_id, thread_ts)` 単位で分離される（`conversation_id`、設計書 §8.3）。構築手順書 3-1 の `SLACK_CHANNEL_ID` は `channel_id` を持たない通知のフォールバック先であり、受信を制限しない。
+
+### チャンネル追加手順
+
+1. Slack でプロジェクト用の Private Channel を作成する（例: `#taka-ma-myproject`）。パブリックチャンネルは対象外（App manifest に `channels:*` scope / `message.channels` event が無い。設計書 §1.2「sa-ru が外部と通信できるのは Slack Private channel のみ」）
+2. チャンネル内で `/invite @taka-ma` を実行して Bot を招待する
+3. `@taka-ma <発話>` で会話を開始する
+
+`.env` の変更・再デプロイ・u-zu の再起動は不要。招待した時点で使える。招待を忘れると、メンション自体が届かないか、届いても返信の `chat_postMessage` が `not_in_channel` で失敗しユーザーには無反応に見えるので注意。
+
+別ワークスペースのチャンネルを使う場合のみ、事前に構築手順書 [`03-slack-bot.md`](../../procedures/03-slack-bot.md) 3-4 のトークン登録（`SLACK_BOT_TOKEN_<TEAM_ID>` 等）が必要。
+
+### リポジトリの指定
+
+作業対象リポジトリは発話中に `repo:<絶対パス>` で明示するか、自然文で指定する（設計書 §8.13。自然文配線は #taka-ma/143）。
+
+```
+@taka-ma repo:/Users/xxx/DevDev/myproject ログインフォームを実装して
+@taka-ma リポジトリ: /Users/xxx/DevDev/myproject の README を要約して
+```
+
+- 自然文指定はマーカー語（repo / repository / リポジトリ）＋区切り＋パスの形で検出され、`repo:` 記法と**同一の検証・展開**に通される（検証を通らない候補は案内文言で `repo:` 記法での再指定を促す。会話は止まらない）
+- 指定は**会話セッションに持続**する（冒頭で指定 → 後の発話で着手、でも落ちない。再起動・時間経過も跨ぐ。指定し直せば最後の値が勝つ）。着手のたびに書き直す必要はない
+- `~/` 前置きは worker ホストの HOME（`sa-ru.yaml` の `task_context.worker_home`）で絶対パスに展開される（未設定環境では従来どおり差し戻し）
+- **着手確認に `workspace:` 行が常時表示される**。未指定の場合は「未指定（既定の空作業場）」と明示されるので、意図しない使い捨て workspace（`{workspace_base}/{task_id}`、既定 `/opt/taka-ma/work/<task_id>`）で走る前に気づける
+- パスは絶対パス・安全文字のみ・`..` 不可（fail-closed 検証。`repo:` 記法の不正は発話時点で差し戻される）

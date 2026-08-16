@@ -132,11 +132,17 @@ class SlackNotifier:
                                   channel: str | None = None,
                                   team_id: str | None = None,
                                   thread_ts: str | None = None,
-                                  plan_text: str | None = None):
+                                  plan_text: str | None = None,
+                                  workspace_text: str | None = None):
         """会話から固まった意図の要約 + 計画プレビュー + 着手/やり直すボタンを送信する（§8.3 (B)）。
 
         plan_text は分解結果のプレビュー本文（§10.2.1。wave 段組み・重さ・モデル）。分解に
         失敗した縮退時のみ None で、その場合は従来どおり要約のみを提示する。
+
+        workspace_text は worker の作業場所の提示文（§8.13 / #143）。会話由来の着手確認では
+        常に渡され、指定パスまたは「未指定（既定の空作業場）」を要約の直下に明示する
+        （未指定のまま空作業場で走ることに人間が着手前に気づけるようにする）。None は
+        非会話経路の互換のため行自体を出さない。
 
         ボタンは u-zu の `exec_confirm` / `exec_reject` ハンドラで受信し、確認レコードの
         status を更新する。sa-ru 側ループが confirmed を検知して確定タスクを生成する。
@@ -148,6 +154,9 @@ class SlackNotifier:
             {"type": "header", "text": {"type": "plain_text", "text": "📝 この内容で着手します"}},
             {"type": "section", "text": {"type": "mrkdwn", "text": f"*要約:*\n{summary}"}},
         ]
+        if workspace_text is not None:
+            blocks.append({"type": "section",
+                           "text": {"type": "mrkdwn", "text": f"*workspace:* {workspace_text}"}})
         blocks += self._plan_blocks(plan_text, exec_request_id)
         blocks.append(self._confirm_buttons(exec_request_id))
         self._client_for(team_id).chat_postMessage(

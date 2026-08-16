@@ -4,7 +4,9 @@
 - run_ssh_command(): SSH 経由で任意コマンド実行（汎用、モデル固有関数は作らない）
 """
 
+import json
 import logging
+import shlex
 import subprocess
 
 from orchestrator.pty_wrapper import ClaudeCodeWrapper
@@ -137,6 +139,27 @@ class RemoteProcessManager:
             raise RuntimeError(f"SSH command failed: {result.stderr}")
         return result.stdout
 
+    def run_ssh_probe(self, command: str, timeout: int = 30) -> tuple[int, str]:
+        """検証用コマンドを MBP 上で SSH 実行し、(rc, 出力) を返す。非 0 でも例外化しない。
+
+        グラウンディング検証（設計書 §8.9）・確認系質問への実測応答（§8.3 probe）用。
+        run_ssh_command と違い、rc 非 0 は「検証対象がその状態にない」という判定材料であって
+        エラーではないため、呼び出し側へそのまま返す。SSH 自体の実行不能（タイムアウト・
+        起動失敗）は rc=-1 とエラー文で表現し、例外を上へ漏らさない（検証不能も 1 つの実測結果）。
+        出力は stdout と stderr を連結して返す（git は診断を stderr に出すため、証跡として両方要る）。
+        """
+        try:
+            result = subprocess.run(
+                ["ssh", self.ssh_host, command],
+                capture_output=True, text=True, timeout=timeout,
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            return -1, f"SSH 実行不能: {e}"
+        out = result.stdout.strip()
+        err = result.stderr.strip()
+        combined = out + (("\n" + err) if err else "") if out else err
+        return result.returncode, combined
+
     def run_model_subprocess(self, model_name: str, model_conf: dict, prompt: str,
                              timeout: int = 300) -> str:
         """MBP 上の worker モデルに 1 回だけ推論させ、その出力テキストを返す。
@@ -150,7 +173,7 @@ class RemoteProcessManager:
         流し込む（ollama も多くの CLI もプロンプトを stdin から受け取るため）。
 
         起動コマンドはモデル定義（ya-ta.yaml の models.<name>）から組み立てる:
-          - ローカルモデル (type=local): ``<command> run <model_id>``  例) ollama run gemma4:31b
+          - ローカルモデル (type=local): MBP 上の ollama HTTP API を SSH 越しに叩く（下記）
           - 外部 API の CLI (type=api):  ``<command> <model_flag>``    例) gemini
 
         引数:
@@ -162,13 +185,16 @@ class RemoteProcessManager:
         # 起動する CLI の実行ファイル名（例: "ollama" / "agy"）。プロンプト本文 prompt とは別物。
         cli = model_conf.get("command", "")
         if model_conf.get("type") == "local":
-            # ローカルモデルは `<cli> run <model_id>`（ollama 形式）で起動する
-            model_id = model_conf.get("model_id", model_name)
-            remote = f"{cli} run {model_id}".strip()
-        else:
-            # 外部 API の CLI は `<cli> <flag>` で起動（どのモデルを使うかはフラグ側で指定）
-            model_flag = model_conf.get("model_flag", "")
-            remote = f"{cli} {model_flag}".strip()
+            # ローカルモデル（inline レーン）は ollama の HTTP API を SSH 越しに叩く。
+            # 旧実装の `ollama run <model_id>`（CLI 単発）は呼び出しごとに CLI 起動と
+            # モデルのロードを払い、keep_alive を制御できない（ya-ta / sa-ru が同じ理由で
+            # HTTP API へ移行済み・llm.py 冒頭）。inline レーンは「純生成の速い経路」の
+            # はずが、実測（2026-07-29 本番ログ）で 1 件 68 秒 / 146 秒を要していた。
+            # ポートは開けず SSH 越しに MBP のローカル API を叩く（通信方式は SSH のまま）。
+            return self._run_local_model_http(model_name, model_conf, prompt, timeout)
+        # 外部 API の CLI は `<cli> <flag>` で起動（どのモデルを使うかはフラグ側で指定）
+        model_flag = model_conf.get("model_flag", "")
+        remote = f"{cli} {model_flag}".strip()
         # 認証が macOS keychain 依存の CLI（agy 等、ya-ta.yaml で keychain_auth: true）は
         # SSH セッションから keychain を読めないため、GUI 起源 tmux サーバ内で実行する（§8.6）
         if model_conf.get("keychain_auth"):
@@ -182,6 +208,56 @@ class RemoteProcessManager:
         if result.returncode != 0:
             raise RuntimeError(f"model subprocess failed ({model_name}): {result.stderr}")
         return result.stdout
+
+    def _run_local_model_http(self, model_name: str, model_conf: dict, prompt: str,
+                              timeout: int) -> str:
+        """MBP 常駐 ollama の HTTP API（/api/generate）へ SSH 越しに 1 回だけ生成させる。
+
+        なぜ CLI（`ollama run`）ではないか: CLI 単発は呼び出しごとに CLI 起動とモデルのロードを
+        払い、常駐時間（keep_alive）を制御できない。ya-ta / sa-ru は同じ理由で HTTP API へ
+        移行済み（llm.py 冒頭）。inline レーンだけ CLI のまま取り残されていた。
+
+        なぜ SSH 越しの curl か: ollama は MBP の localhost にのみ待ち受けており、ポートは
+        開けない（通信方式は SSH・プロジェクト方針）。SSH で MBP に入り、MBP 自身の
+        localhost API を curl で叩くことで、方針を保ったまま HTTP API の利点を得る。
+
+        接続先とモデル常駐時間はモデル定義（ya-ta.yaml の models.<name>）から取る:
+          api_url:        MBP から見た ollama の生成エンドポイント
+          keep_alive_sec: 生成後にモデルを常駐させ続ける秒数（負値＝無期限）
+        いずれもコード側に既定値を置かない（供給元を yaml 1 本に保つ・欠落は KeyError で即落とす）。
+        """
+        payload = {
+            "model": model_conf.get("model_id", model_name),
+            "prompt": prompt,
+            "stream": False,
+            "keep_alive": model_conf["keep_alive_sec"],
+        }
+        # curl は stdin（`@-`）から本文を受け取る。プロンプトを引数やヒアドキュメントに
+        # 展開しないのは、ssh → リモート zsh の再解釈で本文が壊れるのを避けるため。
+        # --max-time はローカル側 timeout より短くし、リモート側が先に諦めて理由を返すようにする。
+        remote = (f"curl -sS --max-time {max(timeout - 5, 5)} "
+                  f"-H 'Content-Type: application/json' --data-binary @- "
+                  f"{shlex.quote(model_conf['api_url'])}")
+        result = subprocess.run(
+            ["ssh", self.ssh_host, remote],
+            input=json.dumps(payload, ensure_ascii=False),
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"model subprocess failed ({model_name}): ollama HTTP API 呼び出し失敗: "
+                f"{result.stderr.strip()[:300]}")
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError as e:
+            # 応答が JSON でない＝ ollama 未起動・プロキシ等の異常。部分出力を生成結果として
+            # 返さない（空文字が「モデルが何も答えなかった」と誤読されるのを防ぐ）
+            raise RuntimeError(
+                f"model subprocess failed ({model_name}): ollama 応答を解釈できません: "
+                f"{result.stdout.strip()[:300]}") from e
+        if data.get("error"):
+            raise RuntimeError(f"model subprocess failed ({model_name}): {data['error']}")
+        return data.get("response", "")
 
     # GUI 起源 tmux サーバのセッション名（launchd com.taka-ma.worker-tmux が起動、構築手順書 06 Step 2-3b）
     GUI_TMUX_SESSION = "taka-ma-worker"

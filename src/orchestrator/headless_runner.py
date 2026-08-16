@@ -86,11 +86,16 @@ class HeadlessResult:
 
     text: 最終出力（result イベントの result、無ければ蓄積した assistant テキスト）。
     session_id: system/init で得たセッション ID（--resume 等の将来利用向け）。
+    returncode: worker プロセスの終了コード（ssh -tt がリモート claude -p の exit code を
+        伝播する）。成功文言の機械導出に使う（設計 §8.9: 非 0 は result イベントの有無に
+        依らず成功として扱わない）。run() が proc.wait 後に設定する。
     """
 
-    def __init__(self, text: str, session_id: str | None):
+    def __init__(self, text: str, session_id: str | None,
+                 returncode: int | None = None):
         self.text = text
         self.session_id = session_id
+        self.returncode = returncode
 
 
 class WorkerHeadlessRunner:
@@ -172,7 +177,17 @@ class WorkerHeadlessRunner:
             proc.kill()
             await proc.wait()
             raise RuntimeError(f"headless worker timeout: {self.instance_id}")
+        except asyncio.CancelledError:
+            # 中止命令（§8.10d）等で worker タスクが cancel された場合もタイムアウトと同じ
+            # 資源回収経路に乗せる。ここで殺さないとローカル ssh とリモート claude -p が
+            # 孤児化して走り続ける（§8.5 資源回収）。
+            proc.kill()
+            await proc.wait()
+            raise
         await proc.wait()
+        # 終了コードを結果へ焼き込む（成功文言の機械導出・設計 §8.9。result イベント受信済み
+        # でも非 0 終了なら呼び出し側が失敗として扱う）
+        result.returncode = proc.returncode
         return result
 
     async def _consume_stream(self, proc) -> HeadlessResult:

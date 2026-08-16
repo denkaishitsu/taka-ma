@@ -26,9 +26,9 @@ MBP 上で稼働する **タスク実行モデル（worker LLM）** 群を構築
 
 | モデル | 役割 | 推論方式 | 呼び出し経路 |
 |--------|------|---------|--------------|
-| Claude Code（Opus 4.8） | heavy 主軸(要件定義 / 設計 / 実装 / テスト等の探索的タスク) | API(ProMax サブスク) | `methods: [pty]` — SSH + 汎用 PTY ラッパー(`WorkerPtyWrapper`、y/n プロンプト介入) |
-| Antigravity CLI（Gemini 3.5 Flash） | heavy 対話タスク / cross-review 参加 / Opus 障害時フォールバック(テキスト・コード) / 高度なマルチモーダル解析(基本はローカル gemma4、設計書 §2.4) | API(Pro サブスク) | `methods: [pty, subprocess]` — **両対応**。対話 heavy = PTY(§8.5 と共通)、高度な解析単発 / cross-review / フォールバック = subprocess(`agy -p`) |
-| Gemma 4 31B | light(軽量タスク、1 回の応答で完結するもの) | ローカル(ollama) | `methods: [subprocess]` — SSH + subprocess(`ollama run gemma4:31b`) |
+| Claude Code（Opus 5） | heavy 主軸(要件定義 / 設計 / 実装 / テスト等の探索的タスク) | API(ProMax サブスク) | `methods: [pty]` — SSH + 汎用 PTY ラッパー(`WorkerPtyWrapper`、y/n プロンプト介入) |
+| Antigravity CLI（Gemini 3.6 Flash） | heavy 対話タスク / cross-review 参加 / Opus 障害時フォールバック(テキスト・コード) / 高度なマルチモーダル解析(基本はローカル gemma4、設計書 §2.4) | API(Pro サブスク) | `methods: [pty, subprocess]` — **両対応**。対話 heavy = PTY(§8.5 と共通)、高度な解析単発 / cross-review / フォールバック = subprocess(`agy -p`) |
+| Gemma 4 31B | light(軽量タスク、1 回の応答で完結するもの) | ローカル(ollama) | `methods: [subprocess]` — SSH + ollama HTTP API(`curl … localhost:11434/api/generate`。CLI は起動しない。設計書 §8.7) |
 
 > **NOTE**: 役割・通信仕様の詳細は設計書 §1.3(モデル配置一覧)/ §2.3 〜 §2.5(役割分担)/ §7(軽量タスク処理モデル)/ §8.4.x(相互扶助機能)/ §8.5 〜 §8.7(通信仕様)を参照。meta カテゴリは廃止済(2026-04-19)。Gemini 3.1 Pro の固有の強みは「高度なマルチモーダル解析」(基本解析はローカル gemma4、生成は Phase 2 — 設計書 §2.4)だが、heavy 対話 / cross-review / フォールバックは **全モデル横断の汎用機能**(§8.4.x)で固定されない。
 
@@ -38,7 +38,7 @@ MBP 上で稼働する **タスク実行モデル（worker LLM）** 群を構築
 sa-ru (Mac mini) ──SSH──→ MBP
                             ├── Claude Code ×N (heavy 主軸、PTY: 汎用 WorkerPtyWrapper、起動コマンド: claude)
                             ├── Antigravity CLI (PTY: 対話 heavy / subprocess: 高度なマルチモーダル解析単発・cross-review・フォールバック、起動コマンド: agy)
-                            └── Gemma 4 31B (ollama) (light、subprocess、`ollama run gemma4:31b`)
+                            └── Gemma 4 31B (ollama) (light、subprocess、SSH 越しに ollama HTTP API を呼ぶ)
 ```
 
 ## 実行場所
@@ -131,12 +131,12 @@ ssh mbp "ollama list | grep gemma4"
 ### 2. Gemma 4 31B 単発実行(light)
 
 ```bash
-ssh mbp "ollama run gemma4:31b 'What is 2+2? Answer in one word.'"
+ssh mbp "curl -sS -H 'Content-Type: application/json' -d '{\"model\":\"gemma4:31b\",\"prompt\":\"What is 2+2? Answer in one word.\",\"stream\":false,\"keep_alive\":1800}' http://localhost:11434/api/generate"
 ```
 
 | 観点 | 成功 | エラー |
 |------|------|--------|
-| 標準出力 | Gemma からの応答テキストが返る(例: `4`) | エラーで終了、空応答、ollama 未起動 |
+| 標準出力 | 応答 JSON が返り `response` フィールドに答えが入る(例: `4`) | 接続失敗(`curl: (7)`＝ollama 未起動)、`error` フィールド(モデル未 pull)、空応答 |
 
 ### 3. Claude Code 単発実行(heavy 主軸)
 
@@ -148,7 +148,7 @@ ssh mbp "claude -p 'Explain Pyinfra in one sentence.'"
 | 観点 | 成功 | エラー |
 |------|------|--------|
 | `--version` の出力 | バージョン文字列が返る | コマンド未認識 |
-| `-p` の出力 | Claude Opus 4.8 の応答が返る | 認証エラー(OAuth 未完了)、API エラー、空応答 |
+| `-p` の出力 | Claude Opus 5 の応答が返る | 認証エラー(OAuth 未完了)、API エラー、空応答 |
 
 ### 4. Antigravity CLI 単発実行(高度なマルチモーダル解析 / セカンドオピニオン参加 / フォールバック)
 
@@ -162,14 +162,14 @@ sleep 20 && ssh mbp "cat /tmp/agy-check.txt"
 | 観点 | 成功 | エラー |
 |------|------|--------|
 | `--version` の出力 | バージョン文字列が返る | コマンド未認識 |
-| `-p` の出力 | Gemini 3.5 Flash の応答が返る | 認証エラー(`authentication failed or timed out` = 素の SSH 直実行 or OAuth 未完了)、API エラー、空応答 |
+| `-p` の出力 | Gemini 3.6 Flash の応答が返る | 認証エラー(`authentication failed or timed out` = 素の SSH 直実行 or OAuth 未完了)、API エラー、空応答 |
 
 ### 5. Mac mini から SSH 経由で 3 モデルが起動できる
 
 Mac mini 側(sa-ru 環境)から SSH 経由で各モデルへ単発実行を投げる。
 
 ```bash
-ssh mac-mini "ssh mbp 'ollama run gemma4:31b \"hi\"'"
+ssh mac-mini "ssh mbp 'curl -sS -d \"{\\\"model\\\":\\\"gemma4:31b\\\",\\\"prompt\\\":\\\"hi\\\",\\\"stream\\\":false}\" http://localhost:11434/api/generate'"
 ssh mac-mini "ssh mbp 'claude -p \"hi\"'"
 # agy は GUI 起源 tmux サーバ経由（Step 2 NOTE 参照）
 ssh mac-mini "ssh mbp 'tmux send-keys -t taka-ma-worker \"agy -p \\\"hi\\\" > /tmp/agy-v9.txt 2>&1\" Enter'"

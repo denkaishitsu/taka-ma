@@ -22,7 +22,7 @@ class WorkerPtyWrapper:
     Args:
         instance_id: tmux セッション名（一意な識別子）
         command:     起動する worker CLI コマンド（例: "claude", "gemini", "codex"）
-        model_flag:  起動コマンドに付加するフラグ（例: "--model sonnet-4.6"）
+        model_flag:  起動コマンドに付加するフラグ（例: "--model sonnet"）
         ssh_host:    SSH 接続先ホスト
         cwd:         worker を起動する作業ディレクトリ（タスク専用 workspace）
     """

@@ -40,6 +40,7 @@ def test_add_local_model(yata_file):
     model_store.add_model("llama", {
         "full_name": "llama-4-8b", "type": "local", "command": "ollama",
         "methods": ["subprocess"], "model_id": "llama4:8b",
+        "api_url": "http://localhost:11434/api/generate", "keep_alive_sec": 1800,
         "capabilities": ["light-task"], "description": "テスト追加",
     })
     models = model_store.load_models()
@@ -74,11 +75,11 @@ def test_add_missing_required_raises(yata_file):
 
 
 def test_update_existing_field(yata_file):
-    model_store.update_model("sonnet", {"model_flag": "--model sonnet-4.6-latest"})
+    model_store.update_model("sonnet", {"model_flag": "--model sonnet-latest"})
     models = model_store.load_models()
-    assert models["sonnet"]["model_flag"] == "--model sonnet-4.6-latest"
+    assert models["sonnet"]["model_flag"] == "--model sonnet-latest"
     # 他フィールドは保持
-    assert models["sonnet"]["full_name"] == "claude-sonnet-4.6"
+    assert models["sonnet"]["full_name"] == "claude-sonnet-5"
 
 
 def test_update_inserts_new_field(yata_file):
@@ -109,6 +110,7 @@ def test_comments_and_other_sections_preserved(yata_file):
     """add→remove 後も手書きコメント・他トップレベルセクションが無傷であること。"""
     model_store.add_model("tmp", {
         "full_name": "t", "type": "local", "command": "ollama",
+        "api_url": "http://localhost:11434/api/generate", "keep_alive_sec": 1800,
         "methods": ["subprocess"], "model_id": "t:1"})
     model_store.remove_model("tmp")
     text = yata_file.read_text()
@@ -153,6 +155,7 @@ def test_remove_last_model_keeps_comment_example(yata_file):
 def test_write_is_atomic_no_tmp_left(yata_file):
     model_store.add_model("x", {
         "full_name": "x", "type": "local", "command": "ollama",
+        "api_url": "http://localhost:11434/api/generate", "keep_alive_sec": 1800,
         "methods": ["subprocess"], "model_id": "x:1"})
     # 一時ファイル(.tmp)を残さない
     leftovers = [p for p in os.listdir(yata_file.parent) if p.endswith(".tmp")]
@@ -167,3 +170,23 @@ def test_load_models_broken_yaml_raises_valueerror(tmp_path, monkeypatch):
     monkeypatch.setenv("TAKA_MA_YATA_PATH", str(path))
     with pytest.raises(ValueError, match="解析に失敗"):
         model_store.load_models()
+
+
+def test_add_local_model_requires_api_url_and_keep_alive(yata_file):
+    """type=local は api_url / keep_alive_sec 無しでは登録できない（#135）。
+
+    ローカルモデルの実行は ollama HTTP API 呼び出しで、接続先と常駐時間の供給元は
+    ya-ta.yaml だけ。欠けたまま登録できてしまうと、登録は成功したのに inline 実行の
+    瞬間に KeyError で落ちる（失敗が Slack のユーザーから見えない位置へずれる）。
+    """
+    import pytest
+    base = {"full_name": "llama-4-8b", "type": "local", "command": "ollama",
+            "methods": ["subprocess"], "model_id": "llama4:8b"}
+    with pytest.raises(ValueError, match="api_url"):
+        model_store.add_model("llama", base)
+    with pytest.raises(ValueError, match="keep_alive_sec"):
+        model_store.add_model("llama", {**base, "api_url": "http://localhost:11434/api/generate"})
+    # 揃えば登録できる（必須化が local 以外や正常系を巻き込んでいないことの対照）
+    model_store.add_model("llama", {**base, "api_url": "http://localhost:11434/api/generate",
+                                    "keep_alive_sec": 1800})
+    assert model_store.load_models()["llama"]["keep_alive_sec"] == 1800

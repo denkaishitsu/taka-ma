@@ -19,6 +19,7 @@ def _orch():
     """__init__ を通さず、昇格分岐に必要な最小限だけ差し込んだ Orchestrator。"""
     o = Orchestrator.__new__(Orchestrator)
     o._notify = _noop_notify
+    o._cancelled_tasks = set()  # 中止済み集合（§8.10d）。worker 実行ガードが参照する
     o.enqueued = []
     async def _fake_enqueue(item):
         o.enqueued.append(dict(item))  # 再投入時点のスナップショットを残す
@@ -45,6 +46,8 @@ def _stub_run(o, behavior):
     """_run_candidate を model_name → 挙動（str=出力 / Exception=送出）で差し替える。
 
     呼ばれた model_name を o.ran に順に記録する。behavior は dict または callable。
+    #132 で _run_candidate の戻り値は (status, payload) 契約になったため、通常完了は
+    ("ok", 出力) を返す（保留 ("hold", 承認ID) の分岐は test_approval_hold_132.py が担当）。
     """
     o.ran = []
 
@@ -53,7 +56,7 @@ def _stub_run(o, behavior):
         result = behavior(model_name) if callable(behavior) else behavior[model_name]
         if isinstance(result, Exception):
             raise result
-        return result
+        return ("ok", result)
     o._run_candidate = _run
 
 

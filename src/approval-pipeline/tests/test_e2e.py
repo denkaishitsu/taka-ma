@@ -24,32 +24,40 @@ from approval_types import Decision, PendingApproval
 from interceptor import InterceptedPrompt, PromptType
 from main import ApprovalPipeline, DEFAULT_ALWAYS_DENY, DEFAULT_ALWAYS_ESCALATE, _normalize_command, _union
 
-# RiskClassifier.__init__ は config["ya-ta"]（model / llm_timeout_sec / llm_think）と
+# RiskClassifier.__init__ は config["ya-ta"]（risk_model / llm_timeout_sec / llm_think）と
 # config["sa-ru"]["ollama_host"] を読むだけ（ollama 実行は classify 時のみ）。本テストは
 # classifier を FakeClassifier に差し替えるため、モデル名・接続先・timeout はダミーで足りる。
-CONFIG = {"ya-ta": {"model": "dummy-model", "llm_timeout_sec": 300},
+# risk_model は #135 でリスク分類専用に分離したキー（分解用 model とは別モデルを選べる）。
+CONFIG = {"ya-ta": {"model": "dummy-model", "risk_model": "dummy-risk-model",
+                    "llm_timeout_sec": 300},
           "sa-ru": {"ollama_host": "http://localhost:11434"},
           # #103 yaml SSOT 化: Tier2/Tier3 運用値は sa-ru.yaml approval が唯一の源になり
-          # ApprovalPipeline 構築時の必須キーになった（実効値と同値を与える）
-          "approval": {"tier2_timeout_sec": 120, "tier3_timeout_sec": 300,
+          # ApprovalPipeline 構築時の必須キーになった（実効値と同値を与える）。
+          # #132 で tier3_timeout_sec（承認の期限）は hold_grace_sec（worker を待たせる上限）へ。
+          "approval": {"tier2_timeout_sec": 120, "hold_grace_sec": 60,
                        "poll_interval_sec": 1}}
 
 
 class FakePTY:
-    """WorkerPtyWrapper の approve()/deny() だけを観測するスタブ。
+    """WorkerPtyWrapper の approve()/deny()/close() を観測するスタブ。
 
     last_action は実際に PTY へ送られる文字（承認=y / 拒否=n）を記録する。
+    closed は保留時に worker を畳んだか（tmux セッション kill 相当）を記録する。
     """
     instance_id = "test-instance"
 
     def __init__(self):
         self.last_action = None
+        self.closed = False
 
     def approve(self, prompt_type=None):
         self.last_action = "y"
 
     def deny(self, prompt_type=None):
         self.last_action = "n"
+
+    def close(self):
+        self.closed = True
 
 
 class FakeNotifier:
@@ -116,10 +124,10 @@ def _pipeline(tier, notifier, approval_dir=None, tier2=None):
         pipeline.handlers[2] = tier2
     if approval_dir is not None:
         # Tier 3 は /opt 配下の既定ディレクトリではなく、テスト用 tmp へ承認ファイルを書かせる。
-        # timeout/poll は構築時注入（#103）のため、旧モジュール定数の差し替えではなく
-        # ここで短縮値を渡して高速化する（実効値は 300 秒 / 1 秒）。
+        # 猶予/poll は構築時注入（#103）のため、旧モジュール定数の差し替えではなく
+        # ここで短縮値を渡して高速化する（実効値は 60 秒 / 1 秒）。
         pipeline.handlers[3] = t3.Tier3Handler(slack_notifier=notifier, approval_dir=approval_dir,
-                                               timeout_sec=2.0, poll_interval_sec=0.05)
+                                               hold_grace_sec=2.0, poll_interval_sec=0.05)
     return pipeline
 
 
@@ -195,7 +203,7 @@ def test_interactive_undeterminable_escalates_to_human():
             request_id = notifier.sent["request_id"]
             path = os.path.join(approval_dir, f"{request_id}.json")
             t3.Tier3Handler(slack_notifier=notifier, approval_dir=approval_dir,
-                            timeout_sec=2.0, poll_interval_sec=0.05)._mark_status(
+                            hold_grace_sec=2.0, poll_interval_sec=0.05)._mark_status(
                 path, t3.STATUS_APPROVED)
         res, _ = await asyncio.gather(
             pipeline.process(prompt, pty, "test-undet", team_id="T1", channel="C1"),
@@ -238,7 +246,7 @@ def test_tier3_dangerous_command_escalates_to_human():
             request_id = notifier.sent["request_id"]
             path = os.path.join(approval_dir, f"{request_id}.json")
             t3.Tier3Handler(slack_notifier=notifier, approval_dir=approval_dir,
-                            timeout_sec=2.0, poll_interval_sec=0.05)._mark_status(
+                            hold_grace_sec=2.0, poll_interval_sec=0.05)._mark_status(
                 path, t3.STATUS_APPROVED)
         res, _ = await asyncio.gather(
             pipeline.process(prompt, pty, "test-3", team_id="T1", channel="C1"),
@@ -305,7 +313,7 @@ def test_safety_always_escalate_routes_to_human():
             request_id = notifier.sent["request_id"]
             path = os.path.join(approval_dir, f"{request_id}.json")
             t3.Tier3Handler(slack_notifier=notifier, approval_dir=approval_dir,
-                            timeout_sec=2.0, poll_interval_sec=0.05)._mark_status(
+                            hold_grace_sec=2.0, poll_interval_sec=0.05)._mark_status(
                 path, t3.STATUS_APPROVED)
         res, _ = await asyncio.gather(
             pipeline.process(prompt, pty, "test-esc", team_id="T1", channel="C1"),
@@ -489,3 +497,51 @@ def test_degraded_escalates_unmatched_to_human_not_llm():
     assert "degraded" in result.reason
     assert "degraded" in captured["risk_reason"]
     assert pipeline.logger.entries[-1]["tier"] == 3
+
+
+def test_interactive_hold_denies_and_folds_worker():
+    """interactive(pty) の保留は n 送信に加えて worker を畳む（§8.5 保留時のアダプタ責務）。
+
+    headless は worker が自ら終了するが、pty の worker は n を受け取ってもセッション内に
+    残りうる。畳まないと無音判定のタイムアウトまで heavy 枠を握り続ける。
+    """
+    class FakeTier3Hold:
+        async def handle(self, pending, ctx=None):
+            return Decision(allow=False, hold=True, handler="tier3_human", reason="hold: 承認待ち")
+
+    notifier = FakeNotifier()
+    pipeline = _pipeline(3, notifier)
+    pipeline.handlers[3] = FakeTier3Hold()
+    pty = FakePTY()
+    prompt = InterceptedPrompt(
+        prompt_type=PromptType.YN,
+        raw_text="Execute? [y/n]",
+        command="git push --force origin main",
+        context="Run: git push --force origin main",
+    )
+
+    result = asyncio.run(pipeline.process(prompt, pty, "test-hold"))
+
+    assert result.hold is True and not result.allow
+    assert pty.last_action == "n"              # ツールはブロックされる
+    assert pty.closed is True                  # worker の実行実体を畳む（枠を返す）
+    assert pipeline.logger.entries[-1]["decision"] == "held"   # deny と区別して記録
+
+
+def test_interactive_deny_does_not_fold_worker():
+    """通常の deny では worker を畳まない（拒否されただけで実行は続く。保留との差）。"""
+    notifier = FakeNotifier()
+    pipeline = _pipeline(1, notifier)
+    pty = FakePTY()
+    prompt = InterceptedPrompt(
+        prompt_type=PromptType.YN,
+        raw_text="Execute? [y/n]",
+        command="Run: rm -rf /",
+        context="Run: rm -rf /",
+    )
+
+    result = asyncio.run(pipeline.process(prompt, pty, "test-deny-nofold"))
+
+    assert not result.allow and not result.hold
+    assert pty.last_action == "n"
+    assert pty.closed is False

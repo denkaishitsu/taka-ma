@@ -11,15 +11,37 @@ import yaml
 from pyinfra.operations import files, server
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _env import ensure_brew_path  # noqa: E402
+from _guard import ensure_merged_head  # noqa: E402
 from _manifest import record  # noqa: E402
+
+# SSH 越し（非対話シェル）から起動されても brew 配下（ollama / brew / uv / npm）を
+# 解決できるようにする。ターミナルからの従来の実行は挙動が変わらない（_env.py 参照）。
+ensure_brew_path()
+
+# 配備元 HEAD が main（origin/main またはローカル main）に含まれることを検査する。
+# 未マージ worktree からの配備はマージ済み修正を巻き戻すため停止（#141・_guard.py 参照）。
+ensure_merged_head()
 
 # Step 1: DeepSeek-R1 32B ダウンロード（モデル名は ya-ta.yaml を単一ソースとして参照 — Task #26）
 # モデルは component="models" で記録（host グローバルな ollama rm のため、
 # 他デプロイが同一モデルを宣言しても upsert で 1 レコードに集約）。
-_model = yaml.safe_load(Path("src/ai_gateway/config/ya-ta.yaml").read_text())["ya-ta"]["model"]
+_ya_ta_conf = yaml.safe_load(Path("src/ai_gateway/config/ya-ta.yaml").read_text())["ya-ta"]
+_model = _ya_ta_conf["model"]
 server.shell(commands=[f"ollama pull {_model}"])
 record("models", f"ollama pull {_model}", _model,
        {"op": "ollama.rm", "model": _model})
+
+# Step 1a: リスク分類専用モデル（ya-ta.risk_model）も投入する。分解用 model と別値を選べる
+# 設定であるため（承認ゲートの応答速度優先・#135）、ここで pull しないと risk_model だけを
+# 差し替えたときに未 pull のまま判定が失敗する。既定値は sa-ru の会話脳と同一モデルで、
+# その場合は orchestrator デプロイの pull と重複するが、ollama pull は冪等で
+# record は upsert のため 1 レコードに集約される。
+_risk_model = _ya_ta_conf["risk_model"]
+if _risk_model != _model:
+    server.shell(commands=[f"ollama pull {_risk_model}"])
+    record("models", f"ollama pull {_risk_model}", _risk_model,
+           {"op": "ollama.rm", "model": _risk_model})
 
 # Step 1b: num_ctx を 32K に焼き込む（初期投入で自動・冪等）
 # WHY: ya-ta は Mac mini 64GB に sa-ru と同居する。DeepSeek を既定 128K で起動すると

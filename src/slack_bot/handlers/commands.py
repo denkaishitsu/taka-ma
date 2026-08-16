@@ -88,7 +88,8 @@ def _model_usage() -> str:
         "`/taka-ma-model add <名前> --full-name <full> --vendor <v> "
         "--methods <m1,m2> [--model-flag <f>] [--command <cli>] "
         "[--capabilities <c1,c2>] [--description <d>]`\n"
-        "`/taka-ma-model add <名前> --model-id <id> --methods <m> [--command ollama] ...`（ローカル）\n"
+        "`/taka-ma-model add <名前> --model-id <id> --methods <m> --api-url <url> "
+        "--keep-alive-sec <秒> [--command ollama] ...`（ローカル）\n"
         "`/taka-ma-model update <名前> --<field> <値> ...`\n"
         "`/taka-ma-model remove|install|uninstall <名前>` / `/taka-ma-model list`"
     )

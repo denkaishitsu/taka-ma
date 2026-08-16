@@ -123,7 +123,7 @@ class ApprovalPipeline:
         """
         # RiskClassifier は ya-ta を in-process 呼出（config から ya-ta モデルを参照）
         self.classifier = RiskClassifier(config)
-        # Tier2/Tier3 の運用値（審査タイムアウト・人間承認タイムアウト・ポーリング間隔）は
+        # Tier2/Tier3 の運用値（審査タイムアウト・人間承認の猶予・ポーリング間隔）は
         # sa-ru.yaml の approval ブロックを唯一の源にする（マージ済み config で受領。
         # コード側に既定値を置かず、欠落は構築時に即 KeyError で落として診断位置を揃える）。
         approval_conf = config["approval"]
@@ -132,7 +132,8 @@ class ApprovalPipeline:
             2: Tier2Handler(ssh_host=ssh_host,    # qu-e は SSH（§8.8）
                             timeout_sec=approval_conf["tier2_timeout_sec"]),
             3: Tier3Handler(slack_notifier,
-                            timeout_sec=approval_conf["tier3_timeout_sec"],
+                            # 承認の期限ではなく worker を待たせる上限（超過＝保留・§3.3 (4)）
+                            hold_grace_sec=approval_conf["hold_grace_sec"],
                             poll_interval_sec=approval_conf["poll_interval_sec"]),
         }
 
@@ -320,28 +321,48 @@ class ApprovalPipeline:
         """interactive(pty) アダプタ: 検出プロンプトを裁定し、結果を PTY に y/n で伝達する。
 
         中核 decide() は CLI 非依存で allow/deny を返すだけなので、pexpect 経由の worker
-        （agy 対話・将来 Codex 等の汎用対話 CLI）向けに、ここで PendingApproval への変換と
+        （将来 Codex 等の汎用対話 CLI）向けに、ここで PendingApproval への変換と
         y/n キー送信の伝達を担う（このメソッド＝interactive アダプタの変換層）。
+
+        保留（hold）のときは n 送信に加えて worker の実行実体を畳む（§8.5「保留時のアダプタ
+        責務」）。headless では worker が自ら終了するが、pty の worker は n を受け取っても
+        セッション内に残りうるため、ここで tmux セッションを落とさないと無音判定のタイムアウトまで
+        heavy 枠を握り続ける。
         """
         pending = to_pending(prompt)
         decision = await self.decide(
             pending, instance_id=instance_id, team_id=team_id,
             channel=channel, task_id=task_id, thread_ts=thread_ts)
+        # 保留（hold）も伝達としては deny と同じ n 送信＝当該ツールは実行させない。両者の違いは
+        # 承認レコードの生死とタスクの結末であり、y/n の伝達層では区別しない（§3.3 (4)）。
         if decision.allow:
             pty_wrapper.approve(prompt.prompt_type)
-        else:
-            pty_wrapper.deny(prompt.prompt_type)
+            return decision
+        pty_wrapper.deny(prompt.prompt_type)
+        if decision.hold:
+            # 畳む処理の失敗（tmux 不在・SSH 断）で保留の確定を覆さない。畳めなくても
+            # worker は n でブロックされており、最終的に無音判定と全体上限で回収される。
+            try:
+                pty_wrapper.close()
+            except Exception:
+                logger.exception("保留時の worker 停止に失敗（保留は確定）: %s", instance_id)
         return decision
 
     def _audit(self, decision: 'Decision', instance_id: str, command: str, *, tier: int, start: float):
-        """1 回の判定結果を監査ログ（jsonl）へ 1 行追記する（§3.5）。"""
+        """1 回の判定結果を監査ログ（jsonl）へ 1 行追記する（§3.5）。
+
+        保留（hold）は deny と区別して "held" で記録する。どちらも操作はブロックされるが、
+        deny は「実行してはならない」の確定、hold は「まだ決まっていない」であり、後から
+        監査を読む人がタスクの結末（failed か再投入か）を追えなくなるため同一視しない。
+        """
         duration_ms = int((time.monotonic() - start) * 1000)
         self.logger.log({
             "instance_id": instance_id,
             "command": command,
             "tier": tier,
             "handler": decision.handler,
-            "decision": "approved" if decision.allow else "denied",
+            "decision": ("approved" if decision.allow
+                         else "held" if decision.hold else "denied"),
             "reason": decision.reason,
             "duration_ms": duration_ms,
         })

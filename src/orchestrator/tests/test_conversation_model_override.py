@@ -46,9 +46,9 @@ class _FakeNotifier:
         self.notes.append({"text": text, "channel": channel, "team_id": team_id, "thread_ts": thread_ts})
 
     def send_exec_confirm_request(self, exec_request_id, summary, channel=None, team_id=None,
-                                  thread_ts=None, plan_text=None):
+                                  thread_ts=None, plan_text=None, workspace_text=None):
         self.notes.append({"exec_confirm": exec_request_id, "summary": summary,
-                           "plan_text": plan_text})
+                           "plan_text": plan_text, "workspace_text": workspace_text})
 
 
 CONFIG = {

@@ -89,6 +89,8 @@ pyinfra -y @local pyinfra/deploys/orchestrator.py
 
 > **NOTE**: sa-ru.yaml の設定項目は [`src/orchestrator/config/sa-ru.yaml`](../../src/orchestrator/config/sa-ru.yaml) 本体を参照（設計意図は設計書 §2.1 / §8.3 / §10）。
 
+> **NOTE（2026-08 追加キー）**: `preflight`（worker 起動前の SSH/git/Anthropic 認証プリフライト。各タイムアウトと PASS/FAIL の再検査省略 TTL。設計書 §8.14 相当・#taka-ma/139）と `task_context.worker_home`（worker ホストの HOME 絶対パス。`repo:` / 自然文リポジトリ指定の `~/` 展開の唯一の供給元・未設定なら `~` 指定は差し戻し。設計書 §8.13・#taka-ma/143）。いずれもコード側に既定値なし（yaml SSOT）のため、テンプレートから欠落させると起動時に落ちる。
+
 ### Step 3: PyInfra 実行後 （手動実行）
 
 `launchd` の `RunAtLoad` + `KeepAlive` により自動起動・自動再起動するため、手動実行は不要。

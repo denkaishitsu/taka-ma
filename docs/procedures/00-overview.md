@@ -49,15 +49,47 @@
 | **Gemma 4 12B** | ローカル常駐（マルチモーダル） | Mac mini | sa-ru | オーケストレーション（stdout 文脈抽出・stdin 制御）・人間との音声/画像/テキスト会話 |
 | **DeepSeek-R1 32B** | ローカル（差し替え可） | Mac mini | ya-ta | タスク難易度判定・最適モデル選択 |
 | **Gemma 4 31B** | ローカル | MBP | light worker | 軽量タスク（質問応答・フォーマット変換等） |
-| **Claude Opus 4.8** | API (ProMax) | MBP (Claude Code ×N) | heavy worker | 要件定義・設計・実装・テスト（最難関は Fable 5） |
-| **Gemini 3.5 Flash**（agy 既定） | API (Pro) | MBP | heavy worker | マルチモーダル・フォールバック・cross-review。**初期リリースは Flash 固定**（最上位 3.1 Pro は Phase2） |
+| **Claude Opus 5** | API (ProMax) | MBP (Claude Code ×N) | heavy worker | 要件定義・設計・実装・テスト（最難関は Fable 5 を `:fable` で明示指定） |
+| **Gemini 3.6 Flash**（agy 既定） | API (Pro) | MBP | heavy worker | マルチモーダル・フォールバック・cross-review。**初期リリースは Flash 固定** |
 | **Qwen3.6-35B-A3B** | ローカル | MBP | qu-e | コード検証・Tier 2 審査 |
 
 > 上記は**初期構成**。各役割のモデルは将来差し替え可能（モデル交換は [claims](../claims/) で管理）。
 
 ### マイルストーン: Phase2 での Gemini 上位モデル切替
 
-初期リリースの Gemini は既定（agy / Gemini 3.5 Flash）に固定する。Gemini の上位モデルへの切替は **Phase2** で対応する。前提として、agy の `-p`（非対話単発）モードで `--model` フラグが機能せず常に既定へフォールバックする不具合の解消が必要。切替先モデル名は一次ソースで確定してから着手する。
+初期リリースの Gemini は既定（agy / Gemini 3.6 Flash）に固定する。Gemini の上位モデルへの切替は **Phase2** で対応する。
+
+前提だった「agy の `-p` モードで `--model` が効かない」問題は **agy 1.1.7 実機（2026-07-26）で解消済み**。真因は 2 点で、いずれも回避策が確定した:
+
+1. 語順 — `--model <name>` は `-p` より**前**に置く。`-p` の後ろに置くと `--model` の文字列自体がプロンプトとして消費される。
+2. モデル名 — 括弧付きの**表示名**（例 `"Gemini 3.1 Pro (High)"`）でなければ切替わらない。旧値 `gemini-3.1-pro` は無効。
+
+⚠️ **`agy models` の出力を写経しないこと**。1.1.7 の `agy models` はスラッグ（`gemini-3.1-pro-high`）を出力するが、`--model` は **`-high` スラッグを解決できず、エラーにならず既定モデルへ落ちる**。
+
+本番経路（Mac mini → MBP → GUI 起源 tmux）での実測（2026-07-26）:
+
+| `--model` に渡す値 | 解決されたモデル | 判定 |
+|---|---|---|
+| （指定なし＝既定） | Gemini 3.6 Flash (High) | — |
+| `gemini-3.6-flash-low` | Gemini 3.6 Flash (Low) | ○ |
+| `gemini-3.1-pro-low` | Gemini 3.1 Pro (Low) | ○ |
+| `gemini-3.6-flash-high` | Gemini 3.6 Flash (High) | **判別不能** |
+| `gemini-3.1-pro-high` | Gemini 3.6 Flash (High) | ✗ 既定へ落下 |
+| `"Gemini 3.1 Pro (High)"` | Gemini 3.1 Pro (High) | ○ |
+| `"Gemini 3.6 Flash (High)"` | Gemini 3.6 Flash (High) | ○ |
+
+規則は 1 つ: **`-high` スラッグは解決されない。`-low` スラッグと括弧付き表示名は解決される。** `gemini-3.6-flash-high` が成功して見えるのは、落下先の既定がたまたま同じ Gemini 3.6 Flash (High) だからで、効いたのか落ちたのか区別できない。よって **ティア High を指定したいときは必ず表示名を使う**。
+
+**検証方法**（モデルの自己申告は実測で揺れるため使わない）:
+
+```bash
+agy --log-file /tmp/a.log --model "Gemini 3.1 Pro (High)" -p 'say ok'
+grep 'Propagating selected model override' /tmp/a.log   # → label="Gemini 3.1 Pro (High)"
+```
+
+`ya-ta.yaml` の `gemini-pro.model_flag` はこの形（`--model "Gemini 3.1 Pro (High)" -p`）へ更新済み。自動振り分けへの組み込み（写像テーブル/ラダー）は引き続き Phase2。
+
+**既知の良性ログ**: agy 実行時に `not logged into Antigravity`（`load code assist` / `ListExperiments` のポーリング失敗）が常時 20 件前後出るが、モデル選択・推論とは無関係。CLI 再ログイン後も消えないことを確認済み（2026-07-26）。認証障害と誤読して調査しないこと。
 
 ## 構築手順書の歩き方
 

@@ -92,7 +92,7 @@ Claude worker を非対話ヘッドレス 1 プロセスで実行し、各ツー
 完了: result イベントで自己終了。result 無し終了＝ハング → retry/fallback（§8）
 ```
 
-ハード制約（実機）: `stream-json`は`--verbose`必須／フック観測は`--include-hook-events`／フック注入は`--settings`／フック timeout は Tier3 の300秒超（例310秒）。
+ハード制約（実機）: `stream-json`は`--verbose`必須／フック観測は`--include-hook-events`／フック注入は`--settings`／フック timeout は「前段＋Tier3 猶予」を上回る値（既定 310 秒）。
 
 実装本体: `src/orchestrator/headless_runner.py`（`WorkerHeadlessRunner`＝stream-json 読取、`build_hook_settings`＝フック settings 生成）／`src/approval-pipeline/decide_daemon.py`（Mac mini 常駐の判定サーバ＝Claude 固有の変換器を含む。フック payload→`PendingApproval`、`Decision`→allow/deny 応答）／`src/approval-pipeline/decide_client.py`（フックの薄いクライアント。標準ライブラリのみ）。
 
@@ -130,7 +130,7 @@ claude -p …
 
 exit 0（allow）と exit 2（deny）以外でフックコマンドが終わる経路を持たない。判定不能＝deny を終了コード契約で保証し、fail-open の穴（上記欠陥 2）を閉じる。
 
-**タイムアウト設計（内側 < 外側）**: デーモンの 1 判定上限 305 秒（`asyncio.wait_for`。Tier3 人間待ち最大 300 秒＋ハンドラ処理の余裕）＜ クライアントの応答待ち 308 秒 ＜ フック timeout 310 秒。判定側のハング（ya-ta 障害等）もクライアント側で必ず exit 2 に確定させ、フック timeout 経路（挙動が Claude 側実装依存）に委ねない。
+**タイムアウト設計（内側 < 外側）**: デーモンの 1 判定上限 305 秒（`asyncio.wait_for`）＜ クライアントの応答待ち 308 秒 ＜ フック timeout 310 秒。判定側のハング（ya-ta 障害等）もクライアント側で必ず exit 2 に確定させ、フック timeout 経路（挙動が Claude 側実装依存）に委ねない。フックが実際に待つ最長は「前段（分類・qu-e 審査 `tier2_timeout_sec`）＋ Tier3 の猶予 `hold_grace_sec`」であり、人間承認そのものの待ちではない（猶予超過は deny ではなく保留＝本体 §3.3 (4) / §8.10）。既定値（qu-e 120 秒・猶予 60 秒）ではこの鎖に十分な余裕がある。
 
 **並行性**: デーモンは接続ごとに asyncio タスクで並行処理し、Tier3 待ち中も他 worker の判定は進む。`ApprovalPipeline` は 1 インスタンスを共有する（handlers / classifier は per-request の可変状態を持たず、Tier3 は request_id 別の承認ファイルで分離＝本体 §8.10）。
 
@@ -191,7 +191,7 @@ exit 0（allow）と exit 2（deny）以外でフックコマンドが終わる�
 
 - **温存**: `WorkerPtyWrapper`（起動/send_task/approve/deny の pty 制御）と interceptor の**レガシー y/n 検出**（`PATTERNS` = YN/YES_NO/ALLOW、`extract_command`、`strip_ansi`）。これは agy 対話・将来 Codex 等の汎用対話 CLI アダプタとして機能し続ける。approve/deny はこのアダプタ内で `Decision` → y/n キー送信に変換する。
 - **撤去**: interceptor の**Claude 固有 Ink 検出**（`classify_menu`/`MENU_CURSOR`/`_MENU_OPTION_RE`/`_TRUST_DIALOG_RE`/`_TOOL_PERMISSION_RE`/`PromptType.MENU`/`TRUST_DIALOG`）。Claude は headless アダプタへ移るため不要。
-- Claude は `methods: [pty]` → `methods: [headless]` に変更。agy の `methods: [pty, subprocess]` は維持。
+- Claude は `methods: [pty]` → `methods: [headless]` に変更。agy は当初 `methods: [pty, subprocess]` を維持したが、**2026-07-28 に `[subprocess]` へ縮小**（pty の承認配線が未検証のため。本体 §8.6）。
 
 ## 7. 非 Claude worker（subprocess アダプタ）のスコープ
 
@@ -263,8 +263,9 @@ ya-ta の `model_flag`（`--model`）・`command` を保持。headless アダプ
 ## 15. テストフェーズで確定する実機検証項目
 
 1. 本番 fresh workspace の trust 非ハング（「ハングなし」の担保）。
-2. フック timeout ≥310秒 で Tier3 300秒待ちが切れない。
+2. フック timeout が「前段＋Tier3 猶予」を包含し、猶予内の決着が切られない。
 3. フック → Tier3 §8.10 → approved→force-allow→実行、reject→exit2→未実行 の end-to-end。
+3a. 猶予超過 → 保留（承認は pending 存置・worker は畳まれ・タスク pending_approval・枠解放）→ 決着後に未了サブタスクから再投入、の end-to-end。sa-ru 再起動を跨いでも保留が生きること。
 4. SSH 経由 argv 配列＋フック settings パス解決。
 5. ハング時 grace kill → retry → fallback。
 6. cross_review の headless 化と heavy_limiter 占有実測。

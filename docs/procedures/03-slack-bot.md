@@ -171,6 +171,8 @@ ssh mac-mini "chmod 600 /opt/taka-ma/config/.env"
 1. Slack で Private Channel `#taka-ma` を作成
 2. Bot を招待: `/invite @taka-ma`
 
+> **NOTE**: 構築後にプロジェクトごとの Private Channel を追加する運用手順（チャンネル追加・`repo:` 指定）は [`docs/operations/u-zu/slack-bot.md`](../operations/u-zu/slack-bot.md) の「プロジェクト別チャンネル運用」を参照。
+
 #### 3-3. 初期 Owner の登録
 
 `/opt/taka-ma/config/users.yaml` にシステム構築者の Slack user ID を Owner として手動登録する。テンプレートは [`src/slack_bot/config/users.yaml.example`](../../src/slack_bot/config/users.yaml.example) を参照。

@@ -31,11 +31,17 @@ class Decision:
 
     アダプタがこれを自 CLI の伝達手段へ変換する（headless=permissionDecision:allow / exit 2、
     interactive=y/n 送信）。escalate は Tier2→Tier3 へ繋ぐ内部シグナル。
+
+    裁定は allow / deny / hold の 3 値（設計書 §3.3 (4)）。hold は「今は決まらない」であって
+    拒否ではない。ツールの伝達としては deny と同じ（実行させない）が、承認要求は pending の
+    まま生き続け、タスクは failed ではなく保留（pending_approval）へ落ちる。両者を取り違えると
+    「人が席を外しただけで作業が失われる」か「保留を成功として記録する」のどちらかが起きる。
     """
     allow: bool
     handler: str = ""         # 監査用のハンドラ名（tier1_auto / tier2_sentinel / tier3_human / safety_deny）
     reason: str = ""          # 監査・Slack 提示用の判定理由
     escalate: bool = False    # Tier2 が qu-e deny 時に Tier3 へ上げるための内部シグナル
+    hold: bool = False        # 猶予超過で保留（allow=False だが deny ではない・§3.3 (4)）
 
 
 def operation_str(pending: PendingApproval) -> str:

@@ -81,7 +81,15 @@ Mac mini 上で**ローカル実行**する（`@local`）。
 pyinfra -y @local pyinfra/deploys/ai_gateway.py
 ```
 
+MBP から遠隔で流す場合は、同じ deploy を SSH 越しに実行してもよい（`@local` は「pyinfra を動かしているマシン自身へ適用する」の意なので、Mac mini 上で動く限り適用先は変わらない）。
+
+```bash
+ssh mac-mini "cd ~/DevDev/taka-ma && /opt/taka-ma-env/bin/pyinfra -y @local pyinfra/deploys/ai_gateway.py"
+```
+
 > **NOTE（実行モデル）**: 旧版は `pyinfra mac-mini ...` と記載していたが、これはホストを定義した**インベントリ**が前提（本リポジトリに未整備）で、実行すると `mac-mini is neither an inventory file, ...` で失敗する（01 の NOTE と同一の欠陥）。本手順は Mac mini ローカルの `@local` 実行に統一する。
+
+> **NOTE（PATH）**: 非対話 SSH シェルには `/opt/homebrew/bin` が PATH に入らないため、素朴に実行すると `sh: ollama: command not found` → `--> pyinfra error: No hosts remaining!` で停止する。各 deploy は読み込み時に [`pyinfra/deploys/_env.py`](../../pyinfra/deploys/_env.py) の `ensure_brew_path()` で PATH を正規化するため、**呼び出し側で `PATH=...` を前置する必要はない**（ターミナルからの実行も従来どおり）。`pyinfra` 本体は venv 内にあるので絶対パス `/opt/taka-ma-env/bin/pyinfra` で呼ぶ。
 
 [`pyinfra/deploys/ai_gateway.py`](../../pyinfra/deploys/ai_gateway.py) が下記を冪等に実行する:
 

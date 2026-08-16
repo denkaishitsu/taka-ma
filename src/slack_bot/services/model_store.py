@@ -24,7 +24,7 @@ import yaml
 # 本番のデプロイ先（sa-ru / ya-ta が読む実体）。テストは TAKA_MA_YATA_PATH で差し替える。
 _DEFAULT_YATA_PATH = "/opt/taka-ma/ya-ta/config/ya-ta.yaml"
 
-# models 配下のモデルキー行（2 スペースインデント・コメント行ではない）。例: "  opus4.6:"
+# models 配下のモデルキー行（2 スペースインデント・コメント行ではない）。例: "  gemini-pro:"
 _ENTRY_RE = re.compile(r"^  ([^\s#:][^:]*):\s*$")
 # トップレベルキー（列 0 の非空白・非コメント）。models 領域の終端＝次のトップレベルキー。
 _TOPLEVEL_RE = re.compile(r"^[^\s#]")
@@ -36,11 +36,13 @@ _TOPLEVEL_RE = re.compile(r"^[^\s#]")
 _FIELD_KIND = {
     "full_name": "str", "type": "bare", "vendor": "bare", "methods": "list",
     "command": "bare", "model_flag": "str", "model_id": "str",
+    "api_url": "str", "keep_alive_sec": "bare",
     "capabilities": "list", "description": "str",
 }
 # 出力時のフィールド並び（既存エントリの記述順に合わせる）。
 _FIELD_ORDER = ["full_name", "type", "vendor", "methods", "command",
-                "model_flag", "model_id", "capabilities", "description"]
+                "model_flag", "model_id", "api_url", "keep_alive_sec",
+                "capabilities", "description"]
 
 
 def _yata_path() -> str:
@@ -189,8 +191,16 @@ def add_model(key: str, conf: dict) -> None:
     model_id / capabilities / description を任意で持つ（handler が組み立てる）。
     methods はルーティングの呼び出し方法（pty/subprocess）を決める核情報で、
     欠けるとモデルが登録できても起動経路が不定になるため必須にする（usage 表記と一致）。
+
+    type=local（ollama）は加えて api_url / keep_alive_sec を必須にする。ローカルモデルの
+    実行は ollama HTTP API 呼び出しで、接続先と常駐時間の供給元は yaml だけだからである
+    （設計書 §8.7）。欠けたまま登録すると、登録は通るのに inline 実行の瞬間に KeyError で
+    落ちる——登録時に弾いて、失敗をユーザーの目の前へ出す。
     """
-    for required in ("full_name", "type", "command", "methods"):
+    required_fields = ["full_name", "type", "command", "methods"]
+    if conf.get("type") == "local":
+        required_fields += ["api_url", "keep_alive_sec"]
+    for required in required_fields:
         if not conf.get(required):
             raise ValueError(f"必須項目が不足: {required}")
     lines = _read_lines()
