@@ -41,6 +41,8 @@ def make_manager(tmp_path):
         "conversation": {
             "session_ttl_sec": 3600,
             "sessions_dir": str(tmp_path / "sessions"),
+            "history_head_turns": 4,
+            "history_tail_turns": 16,
         },
     }
     return ConversationManager(config, SlackStub(), task_dir=str(tmp_path / "tasks"))

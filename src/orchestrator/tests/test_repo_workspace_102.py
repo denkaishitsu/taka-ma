@@ -70,7 +70,8 @@ def _manager(tmp_dir):
     config = {**CONFIG, "exec_confirm": {"dir": tmp_dir},
               "conversation": {"sessions_dir": tempfile.mkdtemp(prefix="sessions-"),
                                # session_ttl_sec も #103 で必須キー化（実効値と同値）
-                               "session_ttl_sec": 3600}}
+                               "session_ttl_sec": 3600,
+                               "history_head_turns": 4, "history_tail_turns": 16}}
     classifier = TaskClassifier(config)
     return ConversationManager(config, _FakeNotifier(), task_dir=tmp_dir, classifier=classifier)
 

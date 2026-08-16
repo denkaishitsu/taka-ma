@@ -34,12 +34,16 @@ def derive_conversation_id(*, team_id: str, channel_id: str,
 def enqueue_conversation_message(source: str, text: str, *, user_id: str,
                                  team_id: str, channel_id: str,
                                  thread_ts: str | None = None,
-                                 force_ready: bool = False) -> str:
+                                 force_ready: bool = False,
+                                 passive: bool = False) -> str:
     """会話メッセージを 1 件作成し、生成した message_id を返す。
 
-    source: 発生元（slack_mention / slack_dm / slack_command / slack_go）。
+    source: 発生元（slack_mention / slack_dm / slack_command / slack_go /
+      slack_thread_passive）。
     force_ready: `/taka-ma-go` 等で「LLM 判定を待たず締める」明示エスケープ。True なら
       sa-ru は意図判定をスキップし、直近会話を要約して着手確認へ進む（§8.3 (B)）。
+    passive: チャンネルスレッドの非メンション返信（§8.3 (C)）。True なら sa-ru は
+      既存セッションへの文脈追記のみ行い、脳 LLM 呼び出し・返信はしない。
     """
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     message_id = str(uuid.uuid4())
@@ -53,6 +57,7 @@ def enqueue_conversation_message(source: str, text: str, *, user_id: str,
         "source": source,
         "text": text,
         "force_ready": force_ready,
+        "passive": passive,
         "user_id": user_id,
         "team_id": team_id,
         "channel_id": channel_id,

@@ -6,14 +6,20 @@ pyinfra 本体に依存しないよう、判定は evaluate()（純粋関数）�
 実行例（リポジトリのルートから）:
   uv run --with pytest python -m pytest pyinfra/tests/test_deploy_guard.py -v
 """
+import importlib.util
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "deploys"))
-import _guard  # noqa: E402
+# _guard をファイルパス指定で直接ロードする。sys.path に pyinfra/deploys/ を
+# 載せると、全量収集時に後続テストの import ai_gateway / orchestrator が
+# 同名の配備スクリプトへ誤解決し、その import 時副作用（deploy-guard の
+# SystemExit・server.shell）が収集全体を壊すため（#taka-ma/148）。
+_GUARD_PATH = Path(__file__).resolve().parent.parent / "deploys" / "_guard.py"
+_spec = importlib.util.spec_from_file_location("deploy_guard_under_test", _GUARD_PATH)
+_guard = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_guard)
 
 
 # --- evaluate()（純粋関数）: 判定ロジックそのもの ---

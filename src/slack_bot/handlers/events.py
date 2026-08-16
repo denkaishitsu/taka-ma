@@ -11,7 +11,8 @@ import logging
 
 from services.conversation_queue import enqueue_conversation_message
 from services.event_dedup import seen_before
-from services.role_check import authorize
+from services.inbound_sanitize import load_sanitize_apps, strip_app_attribution
+from services.role_check import authorize, check_role
 
 logger = logging.getLogger("u-zu.events")
 
@@ -34,6 +35,9 @@ def _ack_received(client, channel: str, ts: str):
 
 def register_events(app):
     """app_mention / message イベントのハンドラを Bolt App に登録する。"""
+    # 正規化対象アプリの定義は起動時に 1 度だけ読む（発話ごとに yaml を開かない）。
+    # キー欠落はここで例外になり、正規化なしのまま常駐する偽正常を防ぐ（§8.3）。
+    sanitize_apps = load_sanitize_apps()
 
     @app.event("app_mention")
     def handle_mention(event, body, say, client):
@@ -45,7 +49,9 @@ def register_events(app):
             logger.info("再送メンションを無視: event_id=%s", event_id)
             return
         user = event.get("user", "unknown")
-        text = event.get("text", "")
+        # 搬送路が混ぜた情報はここで落とす。ログ・認可・受付リアクション・キュー投入の
+        # すべてより前に効かせ、以降の経路は原文だけを扱う（§8.3 上り発話の正規化）。
+        text = strip_app_attribution(event.get("text", ""), event.get("app_id"), sanitize_apps)
         logger.info("メンション受信 from %s: %s", user, text)
         # 認可: 未登録ユーザーの命令は会話キューへ流さず拒否する（設計書 §1.2）。
         if not authorize(user, "user", say):
@@ -73,7 +79,8 @@ def register_events(app):
 
         channel_type = event.get("channel_type", "")
         user = event.get("user", "unknown")
-        text = event.get("text", "")
+        # メンション経路と同じく、会話キューへ入る前に搬送路由来の混入を落とす（§8.3）。
+        text = strip_app_attribution(event.get("text", ""), event.get("app_id"), sanitize_apps)
 
         if channel_type == "im":
             # Slack の再送（同一 event_id）は無視する（§8.3 再送の冪等化）。DM の会話投入も
@@ -95,5 +102,32 @@ def register_events(app):
                 channel_id=event.get("channel", ""),
                 thread_ts=event.get("thread_ts") or event.get("ts"))
         else:
-            # チャンネルメッセージ: ログのみ
-            logger.debug("メッセージ受信: %s", text)
+            # チャンネルの非メンション発話: スレッド内の返信だけを文脈として会話キューへ
+            # passive 投入する（§8.3 (C)。sa-ru は既存セッションに限り履歴へ追記のみ行う）。
+            # スレッド外の通常発話は対象外（bot が関与しない雑談を収集しない）。
+            thread_ts = event.get("thread_ts")
+            if not thread_ts or event.get("bot_id"):
+                logger.debug("メッセージ受信: %s", text)
+                return
+            # メンション付きは app_mention ハンドラが能動ターンとして処理する（message
+            # イベントと二重配信されるため、ここで拾うと同一発話が二重投入される）
+            auths = body.get("authorizations") or [{}]
+            bot_user = auths[0].get("user_id", "")
+            if bot_user and f"<@{bot_user}>" in text:
+                return
+            # Slack の再送（同一 event_id）は無視する（§8.3 再送の冪等化）
+            event_id = body.get("event_id", "")
+            if seen_before(event_id):
+                return
+            # 未認可ユーザーは黙って捨てる（bot が呼ばれていない場で拒否メッセージを
+            # 自発しない・§8.3 (C)）。受付リアクションも付けない（応答しない発話のため）
+            if not check_role(user, "user"):
+                return
+            logger.info("スレッド内非メンション発話を文脈記録: channel=%s thread=%s",
+                        event.get("channel", ""), thread_ts)
+            enqueue_conversation_message(
+                "slack_thread_passive", text,
+                user_id=user,
+                team_id=event.get("team", ""),
+                channel_id=event.get("channel", ""),
+                thread_ts=thread_ts, passive=True)

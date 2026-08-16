@@ -103,6 +103,7 @@ grep 'Propagating selected model override' /tmp/a.log   # → label="Gemini 3.1 
 | 06 | [タスク実行モデル](06-task-models.md) | worker LLM 群 |
 | 07 | [qu-e（Sentinel）](07-sentinel.md) | 守護プロセス |
 | 08 | [承認パイプライン](08-approval-pipeline.md) | y/n 三段階審査 |
+| 09 | [G2 ターミナルリレー](09-g2-terminal-relay.md) | AR グラス入出力チャネル（任意・第 2 の人間インターフェース） |
 
 ## ゼロから構築の前提
 

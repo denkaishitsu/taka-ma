@@ -30,3 +30,6 @@ docs/exam/E2E-test-spec_results
 
 # claim
 docs/claims/
+
+# G2 リレーの事前許可設定は正本として管理する（設計 §8.16）
+!src/g2_relay/.claude/

@@ -451,7 +451,8 @@ def _manager(config, tmp, plan_service):
                     "converse_timeout_sec": 10}
     cfg["exec_confirm"] = {"dir": f"{tmp}/confirm", "poll_interval_sec": 1}
     cfg["conversation"] = {"dir": f"{tmp}/conv", "sessions_dir": f"{tmp}/sessions",
-                           "session_ttl_sec": 60, "poll_interval_sec": 1}
+                           "session_ttl_sec": 60, "poll_interval_sec": 1,
+                           "history_head_turns": 4, "history_tail_turns": 16}
     return ConversationManager(cfg, _FakeNotifier(), task_dir=f"{tmp}/tasks",
                                plan_service=plan_service)
 

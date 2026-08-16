@@ -77,7 +77,8 @@ def _config(tmp_dir, sessions_dir, worker_home=WORKER_HOME):
         "ya-ta": {"model": "dummy-classifier-model", "llm_timeout_sec": 180},
         "models": {"opus": {"model_flag": "--model opus"}},
         "exec_confirm": {"dir": tmp_dir},
-        "conversation": {"sessions_dir": sessions_dir, "session_ttl_sec": 3600},
+        "conversation": {"sessions_dir": sessions_dir, "session_ttl_sec": 3600,
+                         "history_head_turns": 4, "history_tail_turns": 16},
         "task_context": task_context,
     }
 

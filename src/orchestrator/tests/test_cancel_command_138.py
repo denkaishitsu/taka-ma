@@ -144,7 +144,8 @@ def _manager(tmp_path, *, classifier, canceller, plan_service=None):
                   "ollama_host": "http://localhost:11434"},
         "exec_confirm": {"dir": str(tmp_path / "confirm")},
         "conversation": {"session_ttl_sec": 3600,
-                         "sessions_dir": str(tmp_path / "sessions")},
+                         "sessions_dir": str(tmp_path / "sessions"),
+                         "history_head_turns": 4, "history_tail_turns": 16},
     }
     return ConversationManager(config, SlackStub(), task_dir=str(tmp_path / "tasks"),
                                classifier=classifier, plan_service=plan_service,

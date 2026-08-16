@@ -41,9 +41,6 @@ logger = logging.getLogger("sa-ru.conversation")
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
-# 脳 LLM へ渡す会話履歴の最大ターン数（プロンプト肥大と KV キャッシュ膨張を防ぐ）。
-MAX_HISTORY_TURNS = 20
-
 # 会話へ還流するタスク結果の最大文字数。会話文脈用の要約であり、全文は結果ファイル
 # （併記パス）が正本のため切っても情報は失われない（設計書 §8.9「会話への還流」）。
 RESULT_REFLOW_MAX_CHARS = 2000
@@ -143,6 +140,10 @@ class ConversationManager:
         # sa-ru.yaml を唯一の供給元とする（コード側に既定値を置くと供給元が二重になる）
         self.sessions_dir = config["conversation"]["sessions_dir"]
         os.makedirs(self.sessions_dir, exist_ok=True)
+        # 脳 LLM ビューの二窓幅（§8.3 (C) head+tail）。永続化ファイルは全履歴を保持し、
+        # プロンプトへ載せる分だけ「冒頭 + 直近」に丸める。sa-ru.yaml が唯一の供給元
+        self.history_head_turns = config["conversation"]["history_head_turns"]
+        self.history_tail_turns = config["conversation"]["history_tail_turns"]
         # worker ホスト（MBP）の HOME 絶対パス（sa-ru.yaml task_context.worker_home が唯一の
         # 供給元）。`~/` 前置きのリポジトリ指定をここで絶対パスへ展開する（§8.13 / #143。
         # sa-ru は MBP 側ホームを自力解決できない）。未設定なら ~ 指定は従来どおり差し戻す
@@ -155,6 +156,10 @@ class ConversationManager:
         # 後の発話で着手」という自然な流れで指定が落ちる。2026-08-14 Wave1-B 検証 2）。
         # セッション永続化ファイルにも保存し、再起動・TTL 経過後も失わない
         self.session_workspace: dict[str, str] = {}
+        # conversation_id → 同一会話から直前に生成した確定タスクの task_id（§8.3 (C)）。
+        # 次の確定タスクの parent_task_id になる。セッション永続化ファイルにも保存し、
+        # 再起動をまたいで親子チェーンを保つ
+        self._last_task_id: dict[str, str] = {}
         # conversation_id → 最終アクセス時刻（monotonic 秒）。エビクション判定に使う
         self._last_seen: dict[str, float] = {}
         # セッション辞書の排他。会話処理は to_thread（別スレッド）、タスク結果の還流
@@ -191,6 +196,10 @@ class ConversationManager:
                 # 再起動・TTL 経過で「冒頭のリポジトリ指定」を失わない）
                 if data.get("workspace"):
                     self.session_workspace[cid] = data["workspace"]
+                # 直近確定タスクも回復する（§8.3 (C)。再起動後の確定タスクにも
+                # parent_task_id を継がせる。メモリ上の値が新しい可能性があるため上書きしない）
+                if data.get("last_task_id") and cid not in self._last_task_id:
+                    self._last_task_id[cid] = data["last_task_id"]
             except (OSError, json.JSONDecodeError, AttributeError):
                 # 壊れた永続化ファイルで会話全体を止めない。新規セッションとして進める
                 logger.exception("会話セッションの読込失敗（新規で継続）: %s", path)
@@ -207,6 +216,8 @@ class ConversationManager:
                 "last_workspace": self._last_workspace.get(cid),  # §8.3 probe の実測対象
                 # 検証済み workspace 指定（§8.13 / #143）。会話ターンと同じ寿命で持続させる
                 "workspace": self.session_workspace.get(cid),
+                # 同一会話の直近確定タスク（§8.3 (C)。次のタスクの parent_task_id になる）
+                "last_task_id": self._last_task_id.get(cid),
                 "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             })
         except OSError:
@@ -280,6 +291,37 @@ class ConversationManager:
                 f"リポジトリ指定と思われる `{raw}` を workspace に設定できませんでした（{e}）。"
                 "`repo:/絶対パス` 記法で指定し直してください。")
 
+    def _history_view(self, history: list[dict]) -> list[dict]:
+        """脳 LLM プロンプト用の二窓ビュー（冒頭 + 直近）を返す（§8.3 (C) head+tail）。
+
+        永続化側は全ターン保持のまま、プロンプトへ載せる分だけをここで丸める。冒頭窓を
+        必ず含めるのは、スレッドがどれだけ伸びても依頼の前提（冒頭プロンプト）を回答・
+        確定要約の入力に残すため（2026-08-10 インシデント F3 の再発防止）。全量投入に
+        しないのは、num_ctx 超過分が古い側から暗黙に切り捨てられ、長大スレッドで冒頭が
+        消える＝F3 と同型の失敗に戻るため（二窓は上限サイズが決定的）。
+        """
+        head, tail = self.history_head_turns, self.history_tail_turns
+        if len(history) <= head + tail:
+            return list(history)
+        omitted = len(history) - head - tail
+        marker = {"role": "assistant", "text": f"（中略 {omitted} ターン）"}
+        return history[:head] + [marker] + history[-tail:]
+
+    def _record_passive_turn(self, msg: dict):
+        """非メンション発話（passive）を既存セッションに限り履歴へ追記する（§8.3 (C)）。
+
+        脳 LLM 呼び出し・Slack 返信はしない（bot が呼ばれていない発話に応答しない）。
+        セッションが無ければ捨てる（無関係スレッドの発話を収集しない）。
+        """
+        cid = msg["conversation_id"]
+        with self._sessions_lock:
+            if cid not in self.sessions and not os.path.exists(self._session_path(cid)):
+                return
+            self._last_seen[cid] = time.monotonic()
+            history = self._load_or_create_session(cid)
+            history.append({"role": "user", "text": msg["text"]})
+            self._persist_session(cid, history)
+
     def _evict_idle_sessions(self, now: float):
         """TTL を超えて使われていないセッションをメモリからアンロードする。
 
@@ -302,6 +344,12 @@ class ConversationManager:
         # 脳 LLM 呼び出し開始のタイミングを可視化する(投稿受信〜着手確認提示の所要時間を
         # 計測できるようにする。実運用フィードバックを受けて追加）。
         logger.info("会話メッセージ処理開始: conversation_id=%s", cid)
+
+        # 非メンション発話（チャンネルスレッドの人どうしの返信）は文脈としての追記のみ
+        # （§8.3 (C) passive）。制御判定・訂正解釈・脳 LLM のどれにも掛けない
+        if msg.get("passive"):
+            self._record_passive_turn(msg)
+            return
 
         # 停止命令（制御コマンド）は訂正解釈・脳 LLM より前に判定し、承認ゲートに掛けず
         # 即時実行する（設計書 §8.10d）。提示中の計画がある状態での「中止」は計画への訂正
@@ -347,13 +395,11 @@ class ConversationManager:
                 # 直後の _persist_session が turns と一緒に書く
                 self.session_workspace[cid] = workspace
             history.append({"role": "user", "text": msg["text"]})
-            # 履歴は直近 MAX_HISTORY_TURNS に丸める（プロンプト肥大・KV キャッシュ膨張防止）
-            if len(history) > MAX_HISTORY_TURNS:
-                del history[:-MAX_HISTORY_TURNS]
             self._persist_session(cid, history)
-            # 脳 LLM 呼び出し（数十秒）中はロックを持たない。以降 history はこのターンの
-            # スナップショットとして扱い、追記時に再ロックする
-            history_snapshot = list(history)
+            # 脳 LLM 呼び出し（数十秒）中はロックを持たない。以降このターンの入力は
+            # 二窓ビュー（冒頭 + 直近・§8.3 (C)）のスナップショットとして扱い、追記時に
+            # 再ロックする。永続化側は丸めない（全履歴保持）
+            history_snapshot = self._history_view(history)
 
         if msg.get("force_ready"):
             # /taka-ma-go: LLM 判定を待たず要約させて強制的に締める
@@ -502,12 +548,10 @@ class ConversationManager:
         return f"🛑 中止しました（{len(lines)} 件）\n" + "\n".join(lines)
 
     def _append_turn(self, cid: str, role: str, text: str):
-        """セッションへ 1 ターン追記し、丸め・永続化まで行う（排他付き）。"""
+        """セッションへ 1 ターン追記し、永続化まで行う（排他付き。丸めない・§8.3 (C)）。"""
         with self._sessions_lock:
             history = self._load_or_create_session(cid)
             history.append({"role": role, "text": text})
-            if len(history) > MAX_HISTORY_TURNS:
-                del history[:-MAX_HISTORY_TURNS]
             self._persist_session(cid, history)
 
     def append_task_result(self, task: dict, result_text: str, result_path: str,
@@ -521,13 +565,16 @@ class ConversationManager:
         会話脳が事実として引き継がない）。workspace は確認系質問（§8.3 probe）の実測対象
         として会話に紐付ける。
         """
-        tail = task.get("thread_ts") or task.get("user_id") or ""
-        if not tail:
-            return  # 会話由来でないタスク（file_audit 等）は還流先セッションを持たない
-        # u-zu の derive_conversation_id と同一規則で復元する（別パッケージ・別配備のため
-        # import 共有はできず、空要素の '-' 置換まで含めて式を一致させる。ズレると還流が
-        # 実セッションに届かず新規セッションへ落ちる）
-        cid = f"{task.get('team_id') or '-'}:{task.get('channel_id') or '-'}:{tail}"
+        # 還流先はタスク自身が持つ紐づけキーを最優先する（§8.3 (C)。導出規則の二重管理の解消）
+        cid = task.get("conversation_id")
+        if not cid:
+            # キーを持たない旧タスクへのフォールバック: u-zu の derive_conversation_id と
+            # 同一規則で復元する（別パッケージ・別配備のため import 共有はできず、空要素の
+            # '-' 置換まで含めて式を一致させる。ズレると還流が実セッションに届かない）
+            tail = task.get("thread_ts") or task.get("user_id") or ""
+            if not tail:
+                return  # 会話由来でないタスク（file_audit 等）は還流先セッションを持たない
+            cid = f"{task.get('team_id') or '-'}:{task.get('channel_id') or '-'}:{tail}"
         if workspace:
             self._set_last_workspace(cid, workspace)
         summary = result_text[:RESULT_REFLOW_MAX_CHARS]
@@ -841,9 +888,19 @@ class ConversationManager:
 
         u-zu の task_queue.enqueue_task と同じ §8.3 タスク形式。source="conversation"、
         command は生文ではなく sa-ru が固めた構造化要約（責任分界の移動）。
+        conversation_id / parent_task_id で発生元会話と直前タスクへの紐づけをタスク
+        ファイル自身に永続化する（§8.3 (C) 配管層）。
         """
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         task_id = str(uuid.uuid4())
+        cid = record.get("conversation_id") or ""
+        # 同一会話から直前に生成したタスクを親として継承する（§8.3 (C) 親子チェーン）。
+        # 永続化ファイルからの遅延回復を経るため、sa-ru 再起動をまたいでも途切れない
+        parent_task_id = None
+        if cid:
+            with self._sessions_lock:
+                self._load_or_create_session(cid)
+                parent_task_id = self._last_task_id.get(cid)
         # "_model" は _execute_worker_task が読む明示モデル指定キー（設計書「ユーザーモデル指定」）。
         # queue_item = {**task, ...} でサブタスクへそのまま伝播する（新規配線不要でこのキー名に揃える）。
         model_override = record.get("model_override") or []
@@ -856,6 +913,9 @@ class ConversationManager:
             "team_id": record.get("team_id", ""),
             "channel_id": record.get("channel_id", ""),
             "thread_ts": record.get("thread_ts"),
+            # 会話→タスクの継続紐づけ（§8.3 (C)）。完了還流・intent レコード（§8.10e）が使う
+            "conversation_id": cid or None,
+            "parent_task_id": parent_task_id,
             "_model": model_override or None,
             "created_at": now,
             "updated_at": now,
@@ -873,11 +933,15 @@ class ConversationManager:
         path = os.path.join(self.task_dir, f"{ts}_{task_id}.json")
         # 原子書込。dispatcher が部分書込の init タスクを拾う torn-read を防ぐ（§8.3 書込の原子性）。
         atomic_write_json(path, task)
+        # 直近確定タスクを更新する（§8.3 (C)。次のタスクの parent になる。永続化は直後の
+        # _set_last_workspace が last_task_id ごとセッションと一緒に書く）
+        if cid:
+            with self._sessions_lock:
+                self._last_task_id[cid] = task_id
         # 実行 workspace を会話に紐付ける（§8.3 probe。repo: 指定が無ければ既定の
         # {workspace_base}/{task_id} — Orchestrator._workspace_for と同じ解決規則）
         self._set_last_workspace(
-            record.get("conversation_id"),
-            record.get("workspace") or f"{self.workspace_base}/{task_id}")
+            cid, record.get("workspace") or f"{self.workspace_base}/{task_id}")
         self.slack.notify(
             "着手します。実行を開始しました。",
             record.get("channel_id"), team_id=record.get("team_id"),

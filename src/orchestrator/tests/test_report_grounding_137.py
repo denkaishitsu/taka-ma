@@ -296,6 +296,9 @@ def _cm(tmp_path, process_mgr=None):
     cm.process_mgr = process_mgr
     cm.workspace_base = "/opt/taka-ma/work"
     cm.session_ttl_sec = 3600
+    cm._last_task_id = {}       # §8.3 (C) / #71（_persist_session が参照）
+    cm.history_head_turns = 4   # §8.3 (C) / #71（head+tail ビュー）
+    cm.history_tail_turns = 16
     cm.classifier = None
     cm.plan_service = None
     return cm
