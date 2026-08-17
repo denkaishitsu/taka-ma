@@ -68,6 +68,7 @@ The full documentation below is written in Japanese. For details, use your brows
 <summary>Mermaid ソース（保守用。編集したら docs/assets/architecture.svg を再生成すること）</summary>
 
 ```mermaid
+%%{init: {'theme':'base', 'themeVariables': {'background':'#FAF9F6','lineColor':'#5F5E5A','edgeLabelBackground':'#FAF9F6','primaryTextColor':'#2B2A28','fontFamily':'Hiragino Sans, Noto Sans JP, sans-serif','clusterBkg':'#F1EFE8','clusterBorder':'#5F5E5A'}}}%%
 graph TD
     H{{人間 / Slack Private channel}}
 
@@ -96,14 +97,16 @@ graph TD
     Q -->|審査結果| S
     S -->|要約・承認依頼| U
 
-    style S fill:#E1F5EE,color:#000
-    style Y fill:#EEEDFE,color:#000
-    style WL fill:#E6F1FB,color:#000
-    style WH fill:#EEEDFE,color:#000
-    style Q fill:#FCEBEB,color:#000
-    style AP fill:#FAEEDA,color:#000
-    style U fill:#FAEEDA,color:#000
-    style H fill:#EAF3DE,color:#000
+    style S fill:#E1F5EE,color:#2B2A28,stroke:#5F5E5A
+    style Y fill:#EEEDFE,color:#2B2A28,stroke:#5F5E5A
+    style WL fill:#E6F1FB,color:#2B2A28,stroke:#5F5E5A
+    style WH fill:#EEEDFE,color:#2B2A28,stroke:#5F5E5A
+    style Q fill:#FCEBEB,color:#2B2A28,stroke:#5F5E5A
+    style AP fill:#FAEEDA,color:#2B2A28,stroke:#5F5E5A
+    style U fill:#FAEEDA,color:#2B2A28,stroke:#5F5E5A
+    style H fill:#EAF3DE,color:#2B2A28,stroke:#5F5E5A
+    style mini fill:#F1EFE8,color:#2B2A28,stroke:#5F5E5A
+    style mbp fill:#F1EFE8,color:#2B2A28,stroke:#5F5E5A
 ```
 
 </details>
