@@ -62,6 +62,11 @@ The full documentation below is written in Japanese. For details, use your brows
 
 ## アーキテクチャ
 
+![taka-ma アーキテクチャ図](docs/assets/architecture.svg)
+
+<details>
+<summary>Mermaid ソース（保守用。編集したら docs/assets/architecture.svg を再生成すること）</summary>
+
 ```mermaid
 graph TD
     H{{人間 / Slack Private channel}}
@@ -100,6 +105,8 @@ graph TD
     style U fill:#FAEEDA,color:#000
     style H fill:#EAF3DE,color:#000
 ```
+
+</details>
 
 > 命名規約: デプロイ先（pyinfraにより）は **コンポーネント名を使い**、ソース（`src/`）は **役割名**を使用する。
 
