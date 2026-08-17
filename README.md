@@ -4,9 +4,11 @@
 
 ## English (Summary)
 
-**An autonomous, parallel development platform where a human and multiple AIs collaborate to write software.**
+**An autonomous, parallel platform where a human and multiple AIs collaborate — on software development first, and on everyday work beyond it.**
 
-A human gives instructions and approvals from a chat interface (Slack initially), while a fleet of local and cloud AIs divides up task decomposition, execution, cross-review, and safety auditing. Instead of outsourcing everything to a SaaS, judgment and control stay on your own Macs.
+A human gives instructions and approvals from a chat interface (Slack initially), while a fleet of local and cloud AIs divides up task decomposition, execution, cross-review, and safety auditing. Software development is the primary use case, but the same pipeline handles research, writing, and other everyday requests and conversations. Instead of outsourcing everything to a SaaS, judgment and control stay on your own Macs.
+
+A defining trait: **the environment builds itself with AI.** Feed the build procedures (00–09) to an AI coding agent, and it constructs the whole environment from the bundled sources and pyinfra deploys — automatically (with a few explicit manual steps), or interactively in dialogue with you.
 
 > [!IMPORTANT]
 > **This is a personal, experimental project.** It assumes a specific hardware setup (two Macs) and is published AS-IS, with no warranty and no support. It is not intended for production use — use at your own risk (see [LICENSE](LICENSE)).
@@ -21,7 +23,8 @@ A human gives instructions and approvals from a chat interface (Slack initially)
 **Highlights**
 
 - **Human at the approval gate** — AIs summarize and propose; execution starts only after a person approves. Three tiers by risk (auto / AI review / human approval).
-- **Model selection by role** — routing across two classes (light / heavy); the model behind each role is swappable.
+- **AI-driven setup** — the build procedures are written to be executed by an AI agent, so the platform can bootstrap its own environment (a few steps remain manual by design: logins, sudo, GUI auth).
+- **Model selection by role** — requests are classified along orthogonal axes: execution form (inline / agent) × depth (shallow / deep) × confidence. A config-defined mapping table resolves the model, and an escalation ladder retries on harder-than-expected work. Every model is swappable.
 - **SSH-only transport** — machines talk over SSH with no open ports or REST APIs; external comms are limited to a private Slack channel.
 - **AI cross-review** — a separate guardian AI audits execution results and code changes.
 
@@ -31,9 +34,11 @@ The full documentation below is written in Japanese. For details, use your brows
 
 ## 日本語
 
-**人間と複数の AI が協調(AI Gateway)して開発を進める、自律型並行開発基盤。**
+**人間と複数の AI が協調(AI Gateway)して働く、自律型並行タスク実行基盤。**
 
-人がチャットなどから（初期は、Slackを使用）で指示・承認を行い、ローカル/外部の AI 群がタスクの分解・実行・相互レビュー・安全審査を分担します。外部 SaaS に丸投げせず、判断と制御を手元の Mac で完結させることを狙った構成です。
+人がチャットなどから（初期は、Slackを使用）で指示・承認を行い、ローカル/外部の AI 群がタスクの分解・実行・相互レビュー・安全審査を分担します。システム開発を第一の用途としつつ、同じ仕組みで調査・文書作成・日常の依頼や会話にも応えます。外部 SaaS に丸投げせず、判断と制御を手元の Mac で完結させることを狙った構成です。
+
+そして本プロジェクトの要は、**この環境自体を AI が構築する**ことです。構築手順書（00〜09）を AI コーディングエージェントに読み込ませると、同梱のソースコードと pyinfra デプロイを用いて、自動的に（ログイン・sudo・GUI 認証など一部はユーザー操作）、あるいは AI と対話しながら、開発環境そのものを組み上げられます。
 
 > [!IMPORTANT]
 > **これは個人による実験的プロジェクトです。** 特定のハードウェア構成（Mac 2 台）を前提とし、無保証・無サポートで公開しています。本番運用を保証するものではありません。利用は自己責任でお願いします（[LICENSE](LICENSE) の AS-IS 条項に従います）。
@@ -50,7 +55,8 @@ The full documentation below is written in Japanese. For details, use your brows
 ## 特徴
 
 - **人間が承認ゲートに立つ**: AI が要約・提案し、人が「着手」を押して初めて実行へ進む。リスクに応じた三段階（自動 / AI 審査 / 人間承認）。
-- **役割でモデルを選ぶ**: 「軽量（light）／重量（heavy）」の 2 区分でルーティング。各役割のモデルは差し替え可能。
+- **AI が環境を構築する**: 構築手順書は AI エージェントが実行することを前提に書かれており、自動＋一部ユーザー操作、または対話的に環境を組み上げられる（ログイン・sudo・GUI 認証は設計上ユーザーが実施）。
+- **役割でモデルを選ぶ**: 依頼を実行形態（inline／agent）×深さ（shallow／deep）×確信度の直交軸で分類し、設定ファイルの写像テーブルが担当モデルを決定。実行中に手に負えない場合は昇格ラダーで段階的に上位モデルへ引き上げ。各役割のモデルは差し替え可能。
 - **通信は SSH のみ**: マシン間はポート開放・REST API を使わず SSH。外部通信は Slack Private channel に限定。
 - **AI による相互レビュー**: 実行結果やコード変更を別の AI（守護プロセス）が審査。
 
@@ -68,8 +74,8 @@ graph TD
     end
 
     subgraph mbp["MacBook Pro — 実行機"]
-        WL[light worker — 軽量タスク]
-        WH[heavy worker — 設計・実装・テスト]
+        WL[inline worker — 即答・軽量生成]
+        WH[agent worker — 設計・実装・テスト]
         Q[qu-e / sentinel — コード審査・ファイル監査]
     end
 
@@ -119,11 +125,11 @@ graph TD
 
 | LLM | 区分 | 担当 | 用途 |
 |-----|------|------|------|
-| Gemma 4 12B | ローカル常駐（マルチモーダル） | sa-ru | オーケストレーション・人間との会話 |
-| DeepSeek-R1 32B | ローカル | ya-ta | 難易度判定・モデル選択 |
-| Gemma 4 31B | ローカル | light worker | 軽量タスク |
-| Claude（Claude Code） | API | heavy worker | 要件定義・設計・実装・テスト |
-| Gemini Pro | API | heavy worker | マルチモーダル・フォールバック・cross-review |
+| Qwen3.6-35B-A3B | ローカル常駐（vision 対応） | sa-ru | オーケストレーション・人間との会話 |
+| Qwen3.6-27B | ローカル | ya-ta | タスク分解・分類・リスク判定 |
+| Gemma 4 31B | ローカル | inline worker | その場で完結する生成・軽量タスク |
+| Claude（Claude Code: Opus 5 / Sonnet 5 / Haiku 4.5） | API | agent worker | 要件定義・設計・実装・テスト（写像テーブル＋昇格ラダーで選択） |
+| Gemini（3.6 Flash / 3.1 Pro） | API | agent worker | マルチモーダル・フォールバック・cross-review |
 | Qwen3.6-35B-A3B | ローカル | qu-e | コード検証・Tier2 審査 |
 
 > 上記は初期構成です。各役割のモデルは差し替え可能です。
@@ -162,7 +168,6 @@ graph TD
 - 参照している初期モデルのライセンス（**利用者が取得時に各自で確認・同意してください**。MIT の対象外です）:
   - Gemma 4 — [Apache-2.0](https://ai.google.dev/gemma/terms)
   - Qwen3 系 — [Apache-2.0](https://huggingface.co/Qwen/Qwen3-32B/blob/main/LICENSE)
-  - DeepSeek-R1（Distill-Qwen 32B）— [MIT](https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-32B)
   - Claude / Gemini — 各プロバイダの API 利用規約に従います（非配布）
 - Python 依存はすべて許容的ライセンス（MIT / BSD / ISC / Apache-2.0）です。
 
