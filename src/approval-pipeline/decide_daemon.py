@@ -25,12 +25,22 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 
 from approval_types import PendingApproval
 
 logger = logging.getLogger("decide-daemon")
+
+# タスク別 deny 規則の置き場（§8.10f。sa-ru の Orchestrator._write_task_deny が同じ
+# Mac mini 上に書く。供給元を config で共有できない別ツリー配備のため、承認ディレクトリ
+# TAKA_MA_APPROVAL_DIR と同じ「env で一元管理・既定値を両側で一致させる」方式を採る —
+# `grep -n "task-deny" src/orchestrator/config/sa-ru.yaml src/approval-pipeline/decide_daemon.py`
+# で両側一致を確認する）
+_TASK_DENY_DIR = os.environ.get("TAKA_MA_TASK_DENY_DIR", "/opt/taka-ma/data/task-deny")
+# deny ファイル名に使う task_id の受理形式（パス区切り・親参照でディレクトリ外を読まない）
+_TASK_ID_RE = re.compile(r"\A[A-Za-z0-9-]+\Z")
 
 # config パス（sa-ru の __main__ と同じ既定。テスト・別環境向けに env で上書き可）。
 _YA_TA_CONFIG = os.environ.get("YA_TA_CONFIG", "/opt/taka-ma/ya-ta/config/ya-ta.yaml")
@@ -143,6 +153,13 @@ class DecideDaemon:
         )
         # task_id はクライアント argv 優先。未指定なら cwd（=/opt/taka-ma/work/{task_id}）末尾から補う。
         task_id = req.get("task_id") or os.path.basename((payload.get("cwd") or "").rstrip("/"))
+        # タスク別 deny 規則（§8.10f 禁止型拘束の機械強制）。Tier 判定に入る前に照合し、
+        # 一致すれば即 deny する。deny は追加の防壁であり、規則が無い・読めないときは
+        # 従来どおり Tier1/2/3 判定へ進む
+        deny_reason = self._task_deny_reason(task_id, pending)
+        if deny_reason:
+            logger.info("タスク別 deny 規則で拒否: task_id=%s (%s)", task_id, deny_reason)
+            return {"allow": False, "reason": deny_reason}
         # deadline: 前段（リスク分類・qu-e 審査）の所要時間が Tier3 の人間待ちを圧迫しても、
         # 「内側（Tier3）が先に確定」を保つため、decide 全体の締切を中核へ渡す。5 秒の余白は
         # Tier3 確定後の監査記録・done/ 退避・応答書き込みが wait_for に切られないための猶予。
@@ -159,6 +176,37 @@ class DecideDaemon:
             timeout=self.decide_timeout,
         )
         return {"allow": bool(decision.allow), "reason": decision.reason or ""}
+
+    @staticmethod
+    def _task_deny_reason(task_id: str, pending: PendingApproval) -> str | None:
+        """タスク別 deny 規則（§8.10f）に一致すれば deny 理由を返す（無ければ None）。
+
+        規則は sa-ru がタスク着手時に `{_TASK_DENY_DIR}/{task_id}.json` へ書く
+        {"patterns": [部分文字列...], "sources": [拘束原文...]}。対象は Bash の command のみ
+        （禁止型拘束は操作コマンドの禁止であり、Read/Write 等は既存 Tier 判定が扱う）。
+        照合は大文字小文字を無視した部分文字列一致（LLM を使わない決定的判定）。
+        ファイル不在・破損は規則なしとして通常判定へ進む（deny は追加の防壁）。
+        """
+        if not task_id or not _TASK_ID_RE.match(task_id):
+            return None
+        if pending.tool_name != "Bash":
+            return None
+        command = str((pending.tool_input or {}).get("command") or "")
+        if not command:
+            return None
+        try:
+            with open(os.path.join(_TASK_DENY_DIR, f"{task_id}.json")) as f:
+                rule = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return None
+        patterns = rule.get("patterns") or []
+        sources = rule.get("sources") or []
+        lowered = command.lower()
+        for pat in patterns:
+            if isinstance(pat, str) and pat.strip() and pat.strip().lower() in lowered:
+                source = f"（拘束: {sources[0]}）" if sources else ""
+                return f"タスクの禁止型拘束に一致するため拒否: {pat.strip()} {source}".strip()
+        return None
 
     async def start(self):
         """UDS の待ち受けサーバを生成して返す（serve() とテストの共通経路）。"""

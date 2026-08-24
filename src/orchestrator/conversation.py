@@ -33,8 +33,11 @@ from ai_gateway.llm import (
     OllamaConnectionError,
     OllamaTimeoutError,
     extract_json,
+    repair_json_escapes,
     run_ollama,
 )
+from orchestrator import contract as contract_rules
+from orchestrator import intent_store
 from orchestrator.file_queue import atomic_write_json
 
 logger = logging.getLogger("sa-ru.conversation")
@@ -160,12 +163,31 @@ class ConversationManager:
         # 次の確定タスクの parent_task_id になる。セッション永続化ファイルにも保存し、
         # 再起動をまたいで親子チェーンを保つ
         self._last_task_id: dict[str, str] = {}
+        # 会話⇄実行の受け渡し契約（§8.10f）。`contract:` 設定ブロックの有無で有効化する
+        # （段階導入。未構成環境・既存テストでは従来動作のまま）。intents_dir は依頼の寿命
+        # （goal_status）を持つ intent レコードの保存先
+        contract_conf = config.get("contract") or {}
+        self._contract_enabled = bool(contract_conf)
+        self.intents_dir = contract_conf.get("intents_dir")
+        self._contract_template = (
+            (PROMPTS_DIR / "contract.md").read_text() if self._contract_enabled else None)
+        # conversation_id → 直近タスクの失敗原因コード列（連続分のみ・§8.10f 反復停止判定）。
+        # セッション永続化ファイルにも保存し、再起動をまたいで反復を見失わない
+        self._failure_causes: dict[str, list[str]] = {}
         # conversation_id → 最終アクセス時刻（monotonic 秒）。エビクション判定に使う
         self._last_seen: dict[str, float] = {}
         # セッション辞書の排他。会話処理は to_thread（別スレッド）、タスク結果の還流
         # （append_task_result）はイベントループ側スレッドから呼ばれ、同一セッションを
         # 同時に触り得るため（設計書 §8.9「会話への還流」）
         self._sessions_lock = threading.Lock()
+
+    def _causes(self) -> dict:
+        """失敗原因コード表（conversation_id → 連続コード列・§8.10f）を返す遅延アクセサ。
+
+        テストは __new__ で __init__ を跳ばして個体を作るため、属性の直接参照は
+        AttributeError になる。__dict__.setdefault で常に存在を保証する。
+        """
+        return self.__dict__.setdefault("_failure_causes", {})
 
     # ── セッション永続化（設計書 §8.3「会話セッション履歴の永続化」） ──
 
@@ -200,6 +222,9 @@ class ConversationManager:
                 # parent_task_id を継がせる。メモリ上の値が新しい可能性があるため上書きしない）
                 if data.get("last_task_id") and cid not in self._last_task_id:
                     self._last_task_id[cid] = data["last_task_id"]
+                # 失敗原因コード列も回復する（§8.10f 反復停止。再起動で反復を見失わない）
+                if data.get("failure_causes") and cid not in self._causes():
+                    self._causes()[cid] = list(data["failure_causes"])
             except (OSError, json.JSONDecodeError, AttributeError):
                 # 壊れた永続化ファイルで会話全体を止めない。新規セッションとして進める
                 logger.exception("会話セッションの読込失敗（新規で継続）: %s", path)
@@ -218,6 +243,8 @@ class ConversationManager:
                 "workspace": self.session_workspace.get(cid),
                 # 同一会話の直近確定タスク（§8.3 (C)。次のタスクの parent_task_id になる）
                 "last_task_id": self._last_task_id.get(cid),
+                # 直近タスクの失敗原因コード列（連続分・§8.10f 反復停止判定）
+                "failure_causes": self._causes().get(cid),
                 "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             })
         except OSError:
@@ -393,6 +420,10 @@ class ConversationManager:
             if workspace is not None:
                 # 最後に指定された値が勝つ（同一セッションで指定し直せる）。永続化は
                 # 直後の _persist_session が turns と一緒に書く
+                if self.session_workspace.get(cid) != workspace:
+                    # 場所の指定が変わった＝失敗の前提状況が変わった。反復停止判定
+                    # （§8.10f）の連続カウントをリセットし、新指定での再試行を塞がない
+                    self._causes().pop(cid, None)
                 self.session_workspace[cid] = workspace
             history.append({"role": "user", "text": msg["text"]})
             self._persist_session(cid, history)
@@ -433,7 +464,61 @@ class ConversationManager:
                         str(e), msg.get("channel_id"),
                         team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
                     return
-            self._present_summary(msg, summary, models, workspace, progress=progress)
+
+            # ── 会話⇄実行の受け渡し契約（§8.10f）。`contract:` 未構成なら従来動作 ──
+            contract_data = None
+            if getattr(self, "_contract_enabled", False):
+                # 反復停止ゲート: 同一原因コードで 2 回連続失敗している会話には再計画を
+                # 提示せず、原因と必要な入力を平文で返す。/taka-ma-go（force_ready）は
+                # 「解消済み・続行せよ」の明示エスケープとしてゲートを通す
+                with self._sessions_lock:
+                    causes = list(self._causes().get(cid) or [])
+                if not msg.get("force_ready") and contract_rules.is_repeated_cause(causes):
+                    cause = causes[-1]
+                    history_text = " → ".join(causes)
+                    self.slack.notify(
+                        f"連続 2 回失敗しているため、再計画を提示しません（原因: {history_text}）。\n"
+                        f"必要な入力: {contract_rules.required_input_for(cause)}\n"
+                        "解消済みで続行する場合は `/taka-ma-go` で明示してください。",
+                        msg.get("channel_id"),
+                        team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
+                    return
+                contract_data = self._build_contract(cid, summary, progress=progress)
+                if contract_data is None:
+                    # 契約が確定できない依頼は実行へ進めない（fail-closed・§8.10f）
+                    self.slack.notify(
+                        "実行契約を確定できませんでした（命令・拘束・完了条件の抽出に失敗）。"
+                        "作業リポジトリ（`repo:/絶対パス`）と、何ができたら完了かを明示して"
+                        "言い直してください。",
+                        msg.get("channel_id"),
+                        team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
+                    return
+                # workspace: 記法・自然文の明示指定（セッション持続値）が最優先。無ければ
+                # 契約化パスの脳判定（会話全文脈からの特定・§8.13）を同一の検証・~ 展開に通す
+                if workspace is None and contract_data.get("workspace"):
+                    try:
+                        _, proposed = self.parse_workspace(
+                            f"repo:{contract_data['workspace']}",
+                            worker_home=self.worker_home)
+                        workspace = proposed
+                        with self._sessions_lock:
+                            self.session_workspace[cid] = workspace
+                            history = self._load_or_create_session(cid)
+                            self._persist_session(cid, history)
+                    except InvalidWorkspaceError:
+                        pass  # 提案が検証を通らなければ未解決のまま（下の fail-closed へ）
+                if contract_data.get("needs_repo") and workspace is None:
+                    # 着手前ブロック（§8.10f）: 実リポジトリを要するのに場所が未解決の
+                    # 依頼に着手ボタンを出さない。空作業場で走ってから気づく構造を廃する
+                    self.slack.notify(
+                        "この依頼は実リポジトリでの作業が必要ですが、作業場所が未解決です。"
+                        "`repo:/絶対パス` で指定してください"
+                        "（使い捨ての空作業場でよい場合はその旨を発話してください）。",
+                        msg.get("channel_id"),
+                        team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
+                    return
+            self._present_summary(msg, summary, models, workspace,
+                                  contract=contract_data, progress=progress)
         else:
             reply = result.get("reply") or "（応答を生成できませんでした。もう一度お願いします）"
             # エラー由来の返信（タイムアウト・接続失敗等）はシステムメッセージであり会話では
@@ -657,7 +742,12 @@ class ConversationManager:
             # 脳モデルは json.loads が失敗する ```json フェンス付きで出力することがある
             # （gemma4:12b の実機検証で再現・2026-07-04）。ai_gateway 側 classifier/decomposer
             # と同じ extract_json でフェンス除去してからパースする（同根の欠陥・§9.2 と同一パターン）。
-            parsed = json.loads(extract_json(stdout))
+            # markdown 癖の不正エスケープ（\` 等）はパース失敗時のみ機械修復を 1 度試す
+            # （2026-08-24 E2E で実測。正しい出力には触れない）
+            try:
+                parsed = json.loads(extract_json(stdout))
+            except json.JSONDecodeError:
+                parsed = json.loads(extract_json(repair_json_escapes(stdout)))
             # probe は許可値のみ通す（コマンドはコード側 _PROBE_COMMANDS で固定。脳 LLM の
             # 出力を任意コマンド実行に接続しない・§8.3「確認系質問への実測応答」）
             probe = parsed.get("probe")
@@ -704,6 +794,48 @@ class ConversationManager:
                 "reply": f"応答を生成できませんでした（{type(e).__name__}: {e}）",
                 "ready": False, "summary": None, "error": True,
             }
+
+    # ── 契約化パス（設計書 §8.10f。ready=true 後の第 2 の構造化呼び出し） ──
+
+    def _build_contract(self, cid: str, summary: str, progress=None) -> dict | None:
+        """会話から実行契約 {directive, constraints, acceptance, workspace, needs_repo} を得る。
+
+        会話出口契約 {reply, ready, summary} にはキーを足さず、契約化専用のプロンプト
+        （contract.md）で脳モデルをもう 1 回呼ぶ（§8.10f。逸脱実績のある契約の対象面を
+        広げない）。出力はコード側（contract_rules.validate_contract）で検証し、directive /
+        constraints は**ユーザー発話の逐語引用**のみ受理する。逸脱・パース不能は 1 回
+        リトライし、それでも確定しなければ None（呼び出し側が fail-closed で人へ差し戻す）。
+        """
+        with self._sessions_lock:
+            history = self._load_or_create_session(cid)
+            snapshot = self._history_view(history)
+            # 逐語照合の出典はユーザー発話のみ（summary は脳の言い換えであり出典にしない）
+            source_text = "\n".join(t["text"] for t in history if t.get("role") == "user")
+        history_text = "\n".join(
+            f"{'ユーザー' if t['role'] == 'user' else 'sa-ru'}: {t['text']}" for t in snapshot)
+        prompt = (self._contract_template
+                  .replace("{history}", history_text)
+                  .replace("{summary}", summary))
+        for attempt in (1, 2):
+            try:
+                stdout = run_ollama(self.model, prompt, timeout=self.timeout,
+                                    host=self.ollama_host, think=self.think,
+                                    progress=progress)
+                try:
+                    parsed = json.loads(extract_json(stdout))
+                except json.JSONDecodeError:
+                    # 不正エスケープの機械修復（_invoke_llm と同じ規律・2026-08-24 実測）
+                    parsed = json.loads(extract_json(repair_json_escapes(stdout)))
+            except (json.JSONDecodeError, OllamaTimeoutError, OllamaConnectionError) as e:
+                logger.warning("契約化パス失敗（%d 回目）: %s", attempt, e)
+                continue
+            validated, problems = contract_rules.validate_contract(parsed, source_text)
+            if validated is not None:
+                # push を含む依頼で完了条件が空なら既定検査を付与する（§8.10f。脳の
+                # 立て損ねで「push の実測検査なしに完了」と言える状態を作らない）
+                return contract_rules.apply_default_acceptance(validated, summary)
+            logger.warning("契約化パスの出力が逸脱（%d 回目）: %s", attempt, problems)
+        return None
 
     # ── 計画プレビューの訂正（設計書 §8.10b / §10.2.1） ──
 
@@ -832,17 +964,27 @@ class ConversationManager:
             return None
 
     def _present_summary(self, msg: dict, summary: str, models: list[str] | None = None,
-                         workspace: str | None = None, progress=None):
-        """計画確認レコード（status=pending）を作り、要約 + 計画 + ボタンを Slack に提示する。
+                         workspace: str | None = None, contract: dict | None = None,
+                         progress=None):
+        """計画確認レコード（status=pending）を作り、要約 + 契約 + 計画 + ボタンを Slack に提示する。
 
         models: `:opus` 等で明示指定されたモデル名（handle_message が生文から抽出済み）。
-        workspace: `repo:` で明示指定された実開発リポジトリの絶対パス（§8.13。検証済み）。
-        いずれも確定タスク生成（create_exec_task）まで運ぶため record に保持する。
+        workspace: 実開発リポジトリの絶対パス（§8.13。記法指定または契約化パス。検証済み）。
+        contract: 契約化パスの検証済み出力（§8.10f）。directive / constraints / acceptance を
+        確定タスクまで運ぶため record に保持し、提示文に**常に**明示する（空なら「なし」。
+        見えていない契約は承認されない）。None は契約未構成（従来動作）。
         分解はここで済ませ、承認されたプランを凍結して実行へ渡す（§8.10b。dispatcher は再分解しない）。
         """
         exec_request_id = str(uuid.uuid4())
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        plan = self._build_plan(summary, progress=progress)
+        # 逐語命令（directive）は分解しない（§10.2。原文を command とする 1 件のプラン）。
+        # ya-ta の言い換えを通すと変換のたびに劣化する
+        directive = (contract or {}).get("directive")
+        if directive:
+            plan = [{"step": 1, "command": directive, "execution": "agent",
+                     "depth": None, "confidence": 1.0, "depends_on": []}]
+        else:
+            plan = self._build_plan(summary, progress=progress)
         record = {
             "exec_request_id": exec_request_id,
             "conversation_id": msg["conversation_id"],
@@ -855,6 +997,10 @@ class ConversationManager:
             "thread_ts": msg.get("thread_ts"),
             "model_override": models or [],
             "workspace": workspace,
+            "directive": directive,
+            "constraints": (contract or {}).get("constraints") or [],
+            "acceptance": (contract or {}).get("acceptance") or [],
+            "needs_repo": bool((contract or {}).get("needs_repo")),
             "created_at": now,
             "decided_at": None,
             "decided_by": None,
@@ -875,11 +1021,35 @@ class ConversationManager:
         workspace_text = workspace or (
             "未指定（既定の空作業場）— 実リポジトリで作業させるには"
             " `repo:/絶対パス` を指定してください")
-        self.slack.send_exec_confirm_request(
-            exec_request_id, summary,
-            channel=msg.get("channel_id"), team_id=msg.get("team_id"),
-            thread_ts=msg.get("thread_ts"), plan_text=plan_text,
-            workspace_text=workspace_text)
+        kwargs = {"channel": msg.get("channel_id"), "team_id": msg.get("team_id"),
+                  "thread_ts": msg.get("thread_ts"), "plan_text": plan_text,
+                  "workspace_text": workspace_text}
+        if contract is not None:
+            # 契約は空でも「なし」を明示する（§8.10f。見えていない契約は承認されない）
+            kwargs["contract_text"] = self._format_contract(contract)
+        self.slack.send_exec_confirm_request(exec_request_id, summary, **kwargs)
+
+    @staticmethod
+    def _format_contract(contract: dict) -> str:
+        """着手確認へ載せる契約の提示文（§8.10f。空欄も「なし」と明示する）。"""
+        lines = [f"命令（逐語実行）: {contract.get('directive') or 'なし'}"]
+        constraints = contract.get("constraints") or []
+        if constraints:
+            lines.append("拘束条件:")
+            for c in constraints:
+                prefix = "（禁止）" if c.get("forbid") else ""
+                lines.append(f"- {prefix}{c.get('text', '')}")
+        else:
+            lines.append("拘束条件: なし")
+        acceptance = contract.get("acceptance") or []
+        if acceptance:
+            lines.append("完了条件（完了時に sa-ru が実測検査）:")
+            for a in acceptance:
+                params = " ".join(f"{k}={v}" for k, v in (a.get("params") or {}).items())
+                lines.append(f"- {a.get('kind')} {params}".rstrip())
+        else:
+            lines.append("完了条件: なし（完了検査は行われません）")
+        return "\n".join(lines)
 
     # ── 着手確認の決着（確認ループから呼ばれる） ──
 
@@ -928,6 +1098,10 @@ class ConversationManager:
         # 再分解しない（提示した計画と実際に走る計画を一致させる・設計書 §10.2「凍結プランの実行」）
         if record.get("plan"):
             task["_plan"] = record["plan"]
+        # 会話⇄実行の受け渡し契約（§8.10f）。着手確認で人が承認した値だけを実行・検証へ運ぶ
+        for key in ("directive", "constraints", "acceptance"):
+            if record.get(key):
+                task[key] = record[key]
         os.makedirs(self.task_dir, exist_ok=True)
         ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S%f")
         path = os.path.join(self.task_dir, f"{ts}_{task_id}.json")
@@ -942,11 +1116,45 @@ class ConversationManager:
         # {workspace_base}/{task_id} — Orchestrator._workspace_for と同じ解決規則）
         self._set_last_workspace(
             cid, record.get("workspace") or f"{self.workspace_base}/{task_id}")
+        # intent レコード（§8.10e / §8.10f 依頼の寿命）。完了条件が PASS するまで open で
+        # 閉じない台帳。作成失敗はタスク実行を止めない（記録の欠落は goal 更新のスキップに
+        # 閉じ、実行自体は従来経路で進む）
+        intents_dir = getattr(self, "intents_dir", None)
+        if intents_dir:
+            try:
+                intent_store.create(
+                    intents_dir, task_id=task_id, conversation_id=cid or None,
+                    summary=record["summary"],
+                    acceptance=record.get("acceptance") or [],
+                    workspace=record.get("workspace") or f"{self.workspace_base}/{task_id}",
+                    user_id=record.get("decided_by") or record.get("user_id", ""))
+            except OSError:
+                logger.exception("intent レコード作成失敗（タスク実行は継続）: %s", task_id)
         self.slack.notify(
             "着手します。実行を開始しました。",
             record.get("channel_id"), team_id=record.get("team_id"),
             thread_ts=record.get("thread_ts"))
         return task_id
+
+    def record_task_outcome(self, task: dict, cause: str | None):
+        """タスク終端の失敗原因コードを会話セッションへ記録する（§8.10f 反復停止判定の材料）。
+
+        cause=None は成功（連続カウントをリセット）。会話由来でないタスクは対象外。
+        orchestrator がタスク終端時に to_thread で呼ぶ（append_task_result と同じ規律）。
+        """
+        cid = task.get("conversation_id")
+        if not cid:
+            return
+        with self._sessions_lock:
+            history = self._load_or_create_session(cid)
+            if cause:
+                causes = self._causes().setdefault(cid, [])
+                causes.append(cause)
+                # 判定（直近 2 件の一致）に要る分だけ保持する（無限成長の防止）
+                del causes[:-4]
+            else:
+                self._causes().pop(cid, None)
+            self._persist_session(cid, history)
 
     def notify_rejected(self, record: dict):
         """やり直し選択時。実行はせず会話継続を促す（履歴は維持される）。"""

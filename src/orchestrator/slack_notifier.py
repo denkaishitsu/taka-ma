@@ -133,7 +133,8 @@ class SlackNotifier:
                                   team_id: str | None = None,
                                   thread_ts: str | None = None,
                                   plan_text: str | None = None,
-                                  workspace_text: str | None = None):
+                                  workspace_text: str | None = None,
+                                  contract_text: str | None = None):
         """会話から固まった意図の要約 + 計画プレビュー + 着手/やり直すボタンを送信する（§8.3 (B)）。
 
         plan_text は分解結果のプレビュー本文（§10.2.1。wave 段組み・重さ・モデル）。分解に
@@ -157,6 +158,11 @@ class SlackNotifier:
         if workspace_text is not None:
             blocks.append({"type": "section",
                            "text": {"type": "mrkdwn", "text": f"*workspace:* {workspace_text}"}})
+        if contract_text is not None:
+            # 受け渡し契約（§8.10f）。空欄も「なし」を明示した本文が渡ってくる
+            # （見えていない契約は承認されない）
+            blocks.append({"type": "section",
+                           "text": {"type": "mrkdwn", "text": f"*契約:*\n{contract_text}"}})
         blocks += self._plan_blocks(plan_text, exec_request_id)
         blocks.append(self._confirm_buttons(exec_request_id))
         self._client_for(team_id).chat_postMessage(

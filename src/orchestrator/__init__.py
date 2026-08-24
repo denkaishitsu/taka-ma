@@ -40,6 +40,8 @@ from orchestrator.slack_notifier import SlackNotifier
 from orchestrator.pty_wrapper import WorkerPtyWrapper
 from orchestrator.headless_runner import WorkerHeadlessRunner, build_hook_settings
 from orchestrator.preflight import AuthPreflight, PreflightFailure
+from orchestrator import contract as contract_rules
+from orchestrator import intent_store
 from orchestrator.concurrency import DynamicConcurrencyLimiter
 from orchestrator.conversation import ConversationManager
 from orchestrator.grounding import GroundingReport, GroundingVerifier
@@ -401,6 +403,16 @@ class Orchestrator:
                                                  process_mgr=self.process_mgr,
                                                  canceller=self.request_cancel)
 
+        # 会話⇄実行の受け渡し契約（§8.10f）。`contract:` ブロック未構成なら従来動作（段階導入）。
+        # intents_dir = 依頼の寿命（goal_status）台帳／ task_deny_dir = 禁止型拘束のタスク別
+        # deny 規則（decide デーモンが読む。両者とも Mac mini ローカル）
+        contract_conf = config.get("contract") or {}
+        self.intents_dir = contract_conf.get("intents_dir")
+        self.task_deny_dir = contract_conf.get("task_deny_dir")
+        # task_id → worker が実行した Bash コマンド列（headless の stream-json から採取。
+        # 逐語命令の遵守照合 §8.10f に使い、タスク終端で必ず破棄する）
+        self._executed_commands: dict[str, list[str]] = {}
+
         # 停止命令の実行台帳（§8.10d）。task_id → {"chain": 連鎖実行の asyncio.Task,
         # "workers": worker の asyncio.Task 集合}。dispatcher が連鎖起動時に登録し、完了時に
         # done_callback で自動削除する。中止はこの台帳を引いて cancel する。
@@ -459,6 +471,14 @@ class Orchestrator:
         if reclaimed:
             logger.warning(
                 "起動時の予約回収: accepted/in_progress の %d 件を init へ戻して再処理する", reclaimed)
+        # 会話キューにも同じ回収を行う（§8.3 と同じ reserve-then-crash 対策）。processing の
+        # まま前プロセスが落ちた発話は claim("init") に拾われず無言で滞留する（2026-08-24
+        # E2E で実測: 処理中の再起動で発話が processing のまま取り残された）。会話処理も
+        # at-least-once（クラッシュ位置によっては返信が重複しうるが、無言ドロップより回復を優先）
+        reclaimed_msgs = self.conversation_q.reclaim({"processing"}, "init")
+        if reclaimed_msgs:
+            logger.warning(
+                "起動時の会話回収: processing の %d 件を init へ戻して再処理する", reclaimed_msgs)
 
         alert_dir = self.config["file_audit"]["alert_dir"]
         os.makedirs(alert_dir, exist_ok=True)
@@ -544,6 +564,13 @@ class Orchestrator:
                 frozen_plan = task.get("_plan")
                 if frozen_plan:
                     subtasks = frozen_plan
+                elif task.get("directive"):
+                    # 逐語命令は分解しない（§10.2 / §8.10f。原文を command とする 1 件の
+                    # プラン。ya-ta の言い換えを通すと変換のたびに劣化する）。会話由来は
+                    # 通常 _plan で来るため、これは会話を経ない directive タスクの保険
+                    subtasks = [{"step": 1, "command": task["directive"],
+                                 "execution": "agent", "depth": None,
+                                 "confidence": 1.0, "depends_on": []}]
                 else:
                     # ya-ta モデルでタスクを分解（設計書 §8.4, §10.2）。分解 LLM の無応答区間は
                     # ハートビートで進捗を同スレッドへ返す（§10.8）
@@ -579,6 +606,10 @@ class Orchestrator:
                     task.get("channel_id"),
                     team_id=task.get("team_id"),
                     thread_ts=task.get("thread_ts"))
+
+                # 禁止型拘束をタスク別 deny 規則として登録する（§8.10f。decide デーモンが
+                # ツール実行前に機械ブロックする。終端時に _update_status が掃除する）
+                self._write_task_deny(task)
 
                 # 連鎖実行を非同期タスクとして起動（dispatcher はブロックしない）。
                 # 起動と同時に実行台帳へ登録し、中止命令（§8.10d）が cancel できるようにする。
@@ -970,7 +1001,14 @@ class Orchestrator:
             reason = f"承認レコードが想定外の status です: {status} (ID: {request_id})"
             message = f"承認の状態を解釈できないため中止しました（status={status}）。"
         await asyncio.to_thread(self._archive_held_records, task_id, request_id)
-        result_path = await self._update_status(path, "failed", result=reason)
+        # 却下は機械可読の原因コードで記録する（§8.10f。却下された操作の自動再試行を
+        # 反復停止ゲートが塞ぐ材料になる）
+        cause = "approval_rejected" if status == STATUS_APPROVAL_REJECTED else None
+        result_path = await self._update_status(
+            path, "failed", result=reason,
+            extra=({"failure_cause": cause} if cause else None))
+        if cause:
+            await self._record_outcome(task, cause)
         await self._notify(f"{message}\n結果ファイル: {result_path}", channel,
                            team_id=team_id, thread_ts=thread_ts)
 
@@ -1139,17 +1177,36 @@ class Orchestrator:
             failed_steps = [s["step"] for s in subtasks if s["step"] not in results]
             if not failed_steps:
                 final_result = results[subtasks[-1]["step"]]
-                # 完了報告の実出力グラウンディング（§8.9）。worker の自己申告（push/コミット
-                # 主張）を workspace の実状態と突き合わせ、判定・証跡を実出力から機械導出する。
-                # 主張の検出は最終出力だけでなく全 step の出力を対象にする（push が途中 step の
-                # こともある）。SSH の同期実行を含むため to_thread でループから切り離す（§10.7）。
+                # 完了検証（§8.9 / §8.10f）。承認された完了条件（acceptance）があればそれが
+                # 主判定 — 実世界に対する検査の全 PASS が「完了」の必要条件。無ければ従来の
+                # 主張検出（worker 出力の push/コミット主張の裏取り）へ落ちる（補助・§8.10f）。
+                # SSH の同期実行を含むため to_thread でループから切り離す（§10.7）。
                 all_outputs = "\n".join(str(v) for v in results.values())
-                grounding = await asyncio.to_thread(
-                    self._ground_result, task, all_outputs)
-                # 証跡は正本（結果ファイル）にも残す（§8.9。Slack 表示と独立に全文へ到達できる）
+                if task.get("acceptance"):
+                    grounding = await asyncio.to_thread(self._ground_acceptance, task)
+                else:
+                    grounding = await asyncio.to_thread(
+                        self._ground_result, task, all_outputs)
+                # 遵守照合（§8.10f）: 逐語命令タスクは「命令されたコマンド ⇄ 実行された
+                # コマンド」の機械照合を判定に含める。不一致は完了にしない
+                if task.get("directive"):
+                    executed = self._executed().pop(task["task_id"], [])
+                    comp_ok, comp_text = contract_rules.compare_directive(
+                        task["directive"], executed)
+                    grounding.text += "\n\n" + comp_text
+                    if not comp_ok:
+                        grounding.ok = False
+                        grounding.note = ((grounding.note + "・") if grounding.note else "") \
+                            + "命令どおりのコマンドが実行されていない"
+                        grounding.cause = grounding.cause or "directive_not_followed"
+                        grounding.summary = f"（未達: {grounding.note}）"
+                # 証跡は正本（結果ファイル）にも残す（§8.9。Slack 表示と独立に全文へ到達できる）。
+                # 未達なら機械可読の失敗原因コードも正本へ刻む（§8.10f 反復停止の材料）
                 result_record = f"{final_result}\n\n{grounding.text}"
-                result_path = await self._update_status(task_file, "completed",
-                                                        result=result_record)
+                cause = None if grounding.ok else (grounding.cause or "grounding_unverified")
+                result_path = await self._update_status(
+                    task_file, "completed", result=result_record,
+                    extra=({"failure_cause": cause} if cause else None))
                 # 完了/未完了の文言は検証結果から機械導出する（worker 出力は「worker の報告」
                 # として区別して送る）。結果は切り詰めず分割送信し、正本パスを必ず併記する（§8.9）
                 if grounding.ok:
@@ -1170,15 +1227,28 @@ class Orchestrator:
                     self.conversation.append_task_result, task,
                     f"{grounding.summary}\n{final_result}", result_path,
                     grounding.workspace)
+                # 依頼の寿命の更新（§8.10f）: 当該 goal の決着・失敗原因の会話記録・
+                # 同一会話の open 目標の再検査。SSH を含むため to_thread（§10.7）
+                await asyncio.to_thread(self._finalize_goal, task, grounding)
             else:
-                result_path = await self._update_status(task_file, "failed")
+                cause = self._chain_failure_cause(futures)
+                result_path = await self._update_status(
+                    task_file, "failed",
+                    extra=({"failure_cause": cause} if cause else None))
                 await self._notify_failure(task, subtasks, results, failed_steps, channel,
                                            team_id, thread_ts, result_path=result_path)
+                await self._record_outcome(task, cause or "worker_error")
 
         except Exception as e:
-            result_path = await self._update_status(task_file, "failed", result=str(e))
+            result_path = await self._update_status(
+                task_file, "failed", result=str(e),
+                extra={"failure_cause": self._failure_cause_from_error(e)})
             await self._notify(f"タスク失敗: {e}\n結果ファイル: {result_path}",
                                channel, team_id=team_id, thread_ts=thread_ts)
+            await self._record_outcome(task, self._failure_cause_from_error(e))
+        finally:
+            # 遵守照合用の実行コマンド記録はタスク終端で必ず破棄する（肥大防止・§8.10f）
+            self._executed().pop(task.get("task_id", ""), None)
 
     def _ground_result(self, task: dict, worker_outputs: str) -> GroundingReport:
         """完了報告のグラウンディング検証を実行する（同期・to_thread で呼ぶこと。§8.9）。
@@ -1202,6 +1272,139 @@ class Orchestrator:
                 text=f"【実測確認】workspace: {workspace or '（未解決）'}\n{note}",
                 summary=f"（実測確認の結果、未完了: {note}）",
                 workspace=workspace)
+
+    def _executed(self) -> dict:
+        """実行コマンド記録（task_id → Bash コマンド列・遵守照合 §8.10f）の遅延アクセサ。
+
+        テストは __new__ で __init__ を跳ばして個体を作るため、属性の直接参照は
+        AttributeError になる。__dict__.setdefault で常に存在を保証する。
+        """
+        return self.__dict__.setdefault("_executed_commands", {})
+
+    async def _record_outcome(self, task: dict, cause: str | None):
+        """失敗原因コードを会話へ記録する（§8.10f）。ファイル I/O を含むため to_thread。
+
+        テストの偽 ConversationManager は record_task_outcome を持たないことがあるため
+        存在確認して呼ぶ（無ければ記録なしで続行。実個体では常に存在する）。
+        """
+        record = getattr(getattr(self, "conversation", None), "record_task_outcome", None)
+        if record is None:
+            return
+        await asyncio.to_thread(record, task, cause)
+
+    def _ground_acceptance(self, task: dict) -> GroundingReport:
+        """承認された完了条件（§8.10f acceptance）を実世界に対して検査する（同期・to_thread で呼ぶ）。
+
+        検証自体の想定外の失敗で完了通知は止めないが fail-open にはしない（_ground_result と
+        同じ規律）: 検査を実行できなかったことを ok=False・原因コード付きで返す。
+        """
+        workspace = None
+        try:
+            workspace = self._resolve_workspace(task)
+            verifier = GroundingVerifier(self.process_mgr.run_ssh_probe)
+            report = verifier.verify_acceptance(workspace, task.get("acceptance") or [])
+            report.workspace = workspace
+            return report
+        except Exception as e:
+            logger.exception("完了条件の検査で想定外の失敗: task_id=%s", task.get("task_id"))
+            note = f"完了条件の検査を実行できませんでした（{type(e).__name__}: {e}）"
+            return GroundingReport(
+                ok=False, note=note,
+                text=f"【完了条件の検査】workspace: {workspace or '（未解決）'}\n{note}",
+                summary=f"（完了条件の検査の結果、未達: {note}）",
+                workspace=workspace, cause="grounding_unverified")
+
+    def _finalize_goal(self, task: dict, grounding: GroundingReport):
+        """依頼の寿命の更新（§8.10f・同期・to_thread で呼ぶ）。
+
+        (a) 失敗原因コードを会話セッションへ記録（反復停止判定の材料）、(b) 当該 intent の
+        goal_status を検査結果で更新（PASS のときだけ achieved。宣言では閉じない）、
+        (c) 同一会話の open 目標を世界に対して再検査し、満たされたものだけ閉じる（後続
+        タスクによる達成の機械検出）。intent 側の失敗は実行結果へ波及させない。
+        """
+        cause = None if grounding.ok else (grounding.cause or "grounding_unverified")
+        record = getattr(getattr(self, "conversation", None), "record_task_outcome", None)
+        if record is not None:
+            try:
+                record(task, cause)
+            except Exception:
+                logger.exception("失敗原因コードの会話記録に失敗: task_id=%s", task.get("task_id"))
+        intents_dir = getattr(self, "intents_dir", None)
+        if not intents_dir:
+            return
+        task_id = task.get("task_id", "")
+        try:
+            if task.get("acceptance"):
+                intent_store.set_goal_status(
+                    intents_dir, task_id,
+                    intent_store.GOAL_ACHIEVED if grounding.ok else intent_store.GOAL_OPEN)
+            for record in intent_store.list_open(intents_dir,
+                                                 task.get("conversation_id")):
+                if record.get("task_id") == task_id:
+                    continue
+                verifier = GroundingVerifier(self.process_mgr.run_ssh_probe)
+                report = verifier.verify_acceptance(
+                    record["workspace"], record["acceptance"])
+                if report.ok:
+                    intent_store.set_goal_status(
+                        intents_dir, record["task_id"], intent_store.GOAL_ACHIEVED)
+                    # イベントループ外（to_thread）のため直接送る（§10.7 の watchdog と同じ扱い）
+                    self.slack.notify(
+                        "過去の未達依頼が現在は完了条件を満たしています（達成として閉じます）: "
+                        f"{(record.get('summary') or '')[:60]}",
+                        task.get("channel_id"), team_id=task.get("team_id"),
+                        thread_ts=task.get("thread_ts"))
+        except Exception:
+            logger.exception("goal 更新・再検査に失敗（実行結果へは波及させない）: %s", task_id)
+
+    @staticmethod
+    def _failure_cause_from_error(exc: BaseException) -> str:
+        """例外から機械可読の失敗原因コードを導出する（§8.10f。LLM を使わない）。"""
+        if isinstance(exc, PreflightFailure):
+            return {"ssh": "ssh_unreachable", "git": "git_remote_unreachable",
+                    "anthropic": "anthropic_auth"}.get(exc.kind, "worker_error")
+        if "timeout" in str(exc).lower():
+            return "worker_timeout"
+        return "worker_error"
+
+    def _chain_failure_cause(self, futures: dict) -> str | None:
+        """失敗した連鎖の代表原因コードを、サブタスク future の例外から導出する（§8.10f）。"""
+        for fut in futures.values():
+            if not fut.done() or fut.cancelled():
+                continue
+            exc = fut.exception()
+            if exc is None or isinstance(exc, ApprovalHold):
+                continue
+            return self._failure_cause_from_error(exc)
+        return None
+
+    def _write_task_deny(self, task: dict):
+        """禁止型拘束（§8.10f constraints forbid=true）をタスク別 deny 規則として登録する。
+
+        decide デーモン（同じ Mac mini 上）が各ツール判定の前にこのファイルを読み、
+        パターン一致の Bash コマンドを Tier 判定に入る前に deny する。書込失敗は実行を
+        止めない（deny は追加の防壁であり、既存の Tier1/2/3 判定は常に効いている）。
+        """
+        deny_dir = getattr(self, "task_deny_dir", None)
+        if not deny_dir:
+            return
+        task_id = task.get("task_id", "")
+        if not _APPROVAL_ID_RE.fullmatch(task_id):
+            return
+        forbids = [c for c in (task.get("constraints") or []) if c.get("forbid")]
+        patterns = [p for c in forbids for p in (c.get("patterns") or [])]
+        if not patterns:
+            return
+        try:
+            os.makedirs(deny_dir, exist_ok=True)
+            atomic_write_json(
+                os.path.join(deny_dir, f"{task_id}.json"),
+                {"task_id": task_id, "patterns": patterns,
+                 "sources": [c.get("text", "") for c in forbids]})
+            logger.info("タスク別 deny 規則を登録: task_id=%s patterns=%d",
+                        task_id, len(patterns))
+        except OSError:
+            logger.exception("タスク別 deny 規則の書込失敗（Tier 判定は継続有効）: %s", task_id)
 
     @staticmethod
     def _first_hold(futures: dict) -> str | None:
@@ -1377,6 +1580,17 @@ class Orchestrator:
             if dep_results:
                 context = "\n".join(dep_results)
                 command = f"前のステップの結果:\n{context}\n\n上記を踏まえて: {command}"
+
+            # 逐語命令（§8.10f directive）は定型の逐語実行指示で包む（言い換え・別手順の禁止）。
+            # 分解されない 1 件プランのため dep_results は常に空で、原文が無傷で届く
+            if task.get("directive"):
+                command = contract_rules.directive_command(task["directive"])
+            # 拘束条件（§8.10f 配布規則）: 全 step 共通の境界として短い定型を前置する。
+            # 禁止型は decide デーモンの deny 規則としても機械強制される（_write_task_deny）
+            constraints_block = contract_rules.build_constraints_block(
+                task.get("constraints") or [])
+            if constraints_block:
+                command = constraints_block + command
 
             await self._notify(f"  サブタスク {step}: {_axis_label(subtask)}", channel,
                               team_id=task.get("team_id"), thread_ts=task.get("thread_ts"))
@@ -1961,6 +2175,11 @@ class Orchestrator:
             instance_id, command=cli_command, model_flag=model_flag,
             ssh_host=self._mbp_host, cwd=workspace, hook_settings_path=settings_path)
         result = await runner.run(command, timeout=hcfg["run_timeout_sec"])
+        # 実行された Bash コマンドを遵守照合（§8.10f）用に記録する。タスク終端
+        # （_execute_chain の finally）で必ず破棄されるため肥大しない
+        commands = getattr(result, "commands", None)  # 偽 result（テスト）は持たないことがある
+        if commands and task_id:
+            self._executed().setdefault(task_id, []).extend(commands)
         # 終了コードによる成功判定の機械化（§8.9）。result イベントを受信していても
         # 非 0 終了は成功として扱わず、失敗経路（retry / 昇格ラダー）へ回す。
         if result.returncode not in (0, None):
@@ -2080,6 +2299,14 @@ class Orchestrator:
 
         # completed/failed のファイルを done/{日付}/ に移動（ディレクトリ走査の肥大化防止）
         if status in ("completed", "failed"):
+            # タスク別 deny 規則（§8.10f）は終端で掃除する（残すと無関係な後続に効かないが
+            # ゴミとして蓄積する。掃除失敗は無害なため黙って続行）
+            deny_dir = getattr(self, "task_deny_dir", None)
+            if deny_dir and _APPROVAL_ID_RE.fullmatch(task.get("task_id") or ""):
+                try:
+                    os.remove(os.path.join(deny_dir, f"{task['task_id']}.json"))
+                except OSError:
+                    pass
             today = datetime.date.today().isoformat()
             done_dir = f"{self.task_dir}/done/{today}"
             os.makedirs(done_dir, exist_ok=True)

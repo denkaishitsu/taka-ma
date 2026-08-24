@@ -169,6 +169,22 @@ def run_ollama(model: str, prompt: str, timeout: int, host: str,
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 
 
+# JSON 仕様で許されないエスケープ（\` \. 等。有効なのは \" \\ \/ \b \f \n \r \t \u のみ）。
+# 脳モデルは markdown の癖で文字列内のバッククォートを `\`` と書くことがあり（2026-08-24
+# E2E で実測・再現）、1 箇所でも混じると json.loads が全体を落とし会話が縮退する。
+_INVALID_ESCAPE_RE = re.compile(r'\\(?!["\\/bfnrtu])')
+
+
+def repair_json_escapes(text: str) -> str:
+    """JSON として不正なエスケープからバックスラッシュを除去する（決定的修復）。
+
+    パース失敗時の一次修復として使う（成功パースには適用しない — 正しい出力を書き換えない）。
+    不正エスケープの除去は JSON 仕様上、常に「モデルが意図した文字そのもの」に戻る方向で、
+    有効なエスケープ（\\n \\" \\u 等）には触れない。
+    """
+    return _INVALID_ESCAPE_RE.sub("", text)
+
+
 def extract_json(text: str) -> str:
     """LLM 出力から JSON 本体（オブジェクト or 配列）を取り出して返す。
 
@@ -186,7 +202,17 @@ def extract_json(text: str) -> str:
     """
     m = _FENCE_RE.search(text)
     if m:
-        return m.group(1).strip()
+        candidate = m.group(1).strip()
+        # フェンス内が JSON として妥当なときだけ採用する。JSON 文字列値の**中に**
+        # ```bash 等のコードフェンスが含まれる正しい JSON 出力で、フェンス優先が
+        # コードブロックの中身を「JSON 本体」と誤認しパース不能に落ちる誤爆を実測
+        # （2026-08-24 E2E: summary に手順のコードブロックを含む会話応答）。妥当で
+        # なければ括弧走査（json.loads で検証済みの範囲のみ採用）へ落とす
+        try:
+            json.loads(candidate)
+            return candidate
+        except json.JSONDecodeError:
+            pass
     for start, opener in enumerate(text):
         if opener not in _OPEN_TO_CLOSE:
             continue

@@ -54,24 +54,32 @@ LS_REMOTE_TIMEOUT_SEC = 60
 # 報告へ載せる 1 コマンド出力の上限文字数（証跡として十分な範囲で通知の肥大を防ぐ）
 _PROBE_OUTPUT_MAX_CHARS = 1500
 
+# 完了条件検査（verify_acceptance）のパラメータ受理形式。上流（contract.validate_contract）で
+# 検証済みだが、SSH コマンド文字列に乗る値のため防御的に再検証する（規則は contract.py の
+# _SAFE_PARAM_RE と同一。本モジュールはテストがファイル直ロードするため import で共有しない —
+# `grep -n "A-Za-z0-9._/" src/orchestrator/contract.py src/orchestrator/grounding.py` で一致を確認する）
+_ACCEPT_PARAM_RE = re.compile(r"\A[A-Za-z0-9._/\-]+\Z")
+
 
 class GroundingReport:
     """グラウンディング検証 1 回分の結果。
 
-    ok:      検出した主張がすべて実出力で裏付けられたか（主張が無ければ True）。
+    ok:      検出した主張／承認された完了条件がすべて実出力で裏付けられたか。
     note:    ok=False のときの短い理由（通知ヘッダに載せる。例「push 未確認」）。
     text:    実行した検証コマンドと rc・実出力を列挙した証跡ブロック（通知・結果ファイルに併記）。
     summary: 会話還流の先頭に置く 1 行判定（worker 自己申告の上書き用）。
     workspace: 検証対象の workspace（呼び出し側が設定。会話への紐付けに使う）。
+    cause:   ok=False のときの機械可読な失敗原因コード（§8.10f。None は原因なし＝ok）。
     """
 
     def __init__(self, ok: bool, note: str, text: str, summary: str,
-                 workspace: str | None = None):
+                 workspace: str | None = None, cause: str | None = None):
         self.ok = ok
         self.note = note
         self.text = text
         self.summary = summary
         self.workspace = workspace
+        self.cause = cause
 
 
 def detect_claims(worker_text: str) -> dict:
@@ -170,6 +178,16 @@ class GroundingVerifier:
 
         ok = not problems
         note = "・".join(problems)
+        # 機械可読な失敗原因コード（§8.10f）。最初の問題から代表 1 コードを導出する
+        cause = None
+        if problems:
+            first = problems[0]
+            if "git リポジトリでない" in first:
+                cause = "workspace_not_repo"
+            elif "push は未完了" in first:
+                cause = "push_unverified"
+            else:
+                cause = "grounding_unverified"
         if ok:
             confirmed = []
             if claims["commit"] and head_hash:
@@ -183,4 +201,112 @@ class GroundingVerifier:
         else:
             summary = f"（実測確認の結果、未完了: {note}）"
             lines.append(f"判定: {note}")
-        return GroundingReport(ok=ok, note=note, text="\n".join(lines), summary=summary)
+        return GroundingReport(ok=ok, note=note, text="\n".join(lines), summary=summary,
+                               cause=cause)
+
+    def verify_acceptance(self, workspace: str, acceptance: list[dict]) -> GroundingReport:
+        """承認された完了条件（§8.10f `acceptance`）を実世界に対して検査する。
+
+        検査カタログ（pushed / remote_file / file / head_touches）のコマンド組立はここ
+        （コード側）が行い、LLM 出力はどの検査を行うかの選択にしか使われていない（上流
+        contract.validate_contract で検証済み）。パラメータは防御的に再検証し、不正は
+        当該検査 FAIL に倒す（fail-closed。コマンドには乗せない）。
+
+        全 kind PASS のときのみ ok=True。「完了」の語は ok=True のときにしか使えない
+        （§8.10f。判定は検査コマンドの rc・実出力のみから機械導出する）。
+        """
+        ws = shlex.quote(workspace)
+        lines = [f"【完了条件の検査】sa-ru が実行（workspace: {workspace}）"]
+        problems: list[str] = []
+        causes: list[str] = []
+
+        # リポジトリ系検査の前提（git リポジトリであること）を 1 回だけ確認する
+        repo_kinds = {"pushed", "remote_file", "head_touches"}
+        is_repo = None
+        if any(a.get("kind") in repo_kinds for a in acceptance):
+            rc, _ = self._probe(lines, f"git -C {ws} rev-parse --is-inside-work-tree")
+            is_repo = (rc == 0)
+            if not is_repo:
+                problems.append("workspace が git リポジトリでない")
+                causes.append("workspace_not_repo")
+
+        for check in acceptance:
+            kind = check.get("kind")
+            params = check.get("params") or {}
+            bad = [v for v in params.values()
+                   if not isinstance(v, str) or not _ACCEPT_PARAM_RE.match(v)
+                   or ".." in v.split("/")]
+            if bad:
+                problems.append(f"検査 {kind} のパラメータが不正（検査を実行できない）")
+                causes.append(f"acceptance_failed:{kind}")
+                continue
+            if kind in repo_kinds and not is_repo:
+                continue  # 前提不成立は上で計上済み（同じ原因を検査数ぶん重ねない）
+
+            if kind == "pushed":
+                branch = params.get("branch")
+                if not branch:
+                    rc, out = self._probe(lines, f"git -C {ws} rev-parse --abbrev-ref HEAD")
+                    branch = out if rc == 0 and out else None
+                head = ""
+                rc, out = self._probe(lines, f"git -C {ws} rev-parse HEAD")
+                if rc == 0 and out:
+                    head = out.split()[0]
+                remote = ""
+                if branch:
+                    rc, out = self._probe(
+                        lines, f"git -C {ws} ls-remote origin {shlex.quote(branch)}",
+                        timeout=LS_REMOTE_TIMEOUT_SEC)
+                    if rc == 0 and out:
+                        remote = out.split()[0]
+                if not (head and remote and head == remote):
+                    problems.append(
+                        f"pushed 未達（remote={remote[:12] or '取得不能'} "
+                        f"local={head[:12] or '取得不能'}）")
+                    causes.append("acceptance_failed:pushed")
+
+            elif kind == "remote_file":
+                branch = shlex.quote(params["branch"])
+                path = shlex.quote(params["path"])
+                rc, _ = self._probe(
+                    lines, f"git -C {ws} fetch origin {branch}",
+                    timeout=LS_REMOTE_TIMEOUT_SEC)
+                ok_fetch = (rc == 0)
+                rc = -1
+                if ok_fetch:
+                    rc, _ = self._probe(
+                        lines, f"git -C {ws} cat-file -e FETCH_HEAD:{path}")
+                if rc != 0:
+                    problems.append(
+                        f"remote_file 未達（{params['branch']} 上に {params['path']} を確認できない）")
+                    causes.append("acceptance_failed:remote_file")
+
+            elif kind == "file":
+                rc, _ = self._probe(lines, f"ls -la {ws}/{shlex.quote(params['path'])}")
+                if rc != 0:
+                    problems.append(f"file 未達（{params['path']} が存在しない）")
+                    causes.append("acceptance_failed:file")
+
+            elif kind == "head_touches":
+                rc, out = self._probe(
+                    lines, f"git -C {ws} diff-tree --no-commit-id --name-only -r HEAD")
+                touched = out.splitlines() if rc == 0 else []
+                if params["path"] not in touched:
+                    problems.append(
+                        f"head_touches 未達（HEAD は {params['path']} を変更していない）")
+                    causes.append(f"acceptance_failed:head_touches")
+
+            else:
+                problems.append(f"未知の検査 kind: {kind}")
+                causes.append(f"acceptance_failed:{kind}")
+
+        ok = not problems
+        note = "・".join(problems)
+        if ok:
+            summary = "（完了条件の検査: 全項目 PASS）"
+            lines.append(f"判定: 完了条件 {len(acceptance)} 項目すべて PASS")
+        else:
+            summary = f"（完了条件の検査の結果、未達: {note}）"
+            lines.append(f"判定: 未達 — {note}")
+        return GroundingReport(ok=ok, note=note, text="\n".join(lines), summary=summary,
+                               cause=(causes[0] if causes else None))

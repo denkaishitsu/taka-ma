@@ -89,13 +89,18 @@ class HeadlessResult:
     returncode: worker プロセスの終了コード（ssh -tt がリモート claude -p の exit code を
         伝播する）。成功文言の機械導出に使う（設計 §8.9: 非 0 は result イベントの有無に
         依らず成功として扱わない）。run() が proc.wait 後に設定する。
+    commands: worker が実行した Bash コマンド列（stream-json の tool_use イベントから採取）。
+        逐語命令の遵守照合（設計 §8.10f: 命令されたコマンド ⇄ 実行されたコマンドの機械照合）
+        に使う。
     """
 
     def __init__(self, text: str, session_id: str | None,
-                 returncode: int | None = None):
+                 returncode: int | None = None,
+                 commands: list[str] | None = None):
         self.text = text
         self.session_id = session_id
         self.returncode = returncode
+        self.commands = commands or []
 
 
 class WorkerHeadlessRunner:
@@ -205,6 +210,7 @@ class WorkerHeadlessRunner:
 
         session_id = None       # system/init から採取（後続で追跡・--resume 等の将来利用向け）
         texts: list[str] = []   # assistant の text ブロックを蓄積（result が空だった場合の出力に使う）
+        commands: list[str] = []  # 実行された Bash コマンド（遵守照合用・設計 §8.10f）
 
         # worker の stdout（SSH 越し）には stream-json が 1 行 1 イベントで流れてくる。
         # 1 行ずつ読み、イベント種別（system/init・assistant・result）ごとに必要な値を取り出す。
@@ -226,14 +232,21 @@ class WorkerHeadlessRunner:
                 # セッション開始イベント。session_id はここでしか得られない。
                 session_id = event.get("session_id")
             elif etype == "assistant":
-                # モデルの発話イベント。content 配列のうち text ブロックだけを拾って蓄積する
-                # （tool_use ブロックは承認フックが別途処理するため、ここでは出力に含めない）。
+                # モデルの発話イベント。content 配列のうち text ブロックを蓄積し、Bash の
+                # tool_use は実行コマンドとして採取する（遵守照合・設計 §8.10f。承認判定は
+                # フックが別途行うため、ここは記録のみで出力には含めない）。
                 for block in event.get("message", {}).get("content", []):
-                    if isinstance(block, dict) and block.get("type") == "text":
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "text":
                         # text が JSON null だと .get の既定は効かず None が渡るため
                         # `or ""` でガードする（result 経路と対称。strip_ansi(None) の
                         # TypeError で _consume_stream ごと worker が落ちるのを防ぐ）。
                         texts.append(strip_ansi(block.get("text") or ""))
+                    elif block.get("type") == "tool_use" and block.get("name") == "Bash":
+                        cmd = (block.get("input") or {}).get("command")
+                        if isinstance(cmd, str) and cmd.strip():
+                            commands.append(cmd)
             elif etype == "result":
                 # 完了イベント。出力は result フィールドを優先し、空なら蓄積 assistant テキストで
                 # 補う（簡潔な応答で result が空になったときに出力を取りこぼさないため）。
@@ -241,7 +254,7 @@ class WorkerHeadlessRunner:
                 text = strip_ansi(event.get("result") or "")
                 if not text:
                     text = "\n".join(t for t in texts if t)
-                return HeadlessResult(text=text, session_id=session_id)
+                return HeadlessResult(text=text, session_id=session_id, commands=commands)
         # stream が result を出さずに尽きた＝ハング（v2.1.163+ の 5 秒 grace kill 等）。
         # 呼び出し側で retry/fallback の土台にする（設計 §8・無応答検知の統合）。
         stderr = (await proc.stderr.read()).decode("utf-8", errors="replace").strip()

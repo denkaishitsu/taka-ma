@@ -64,6 +64,19 @@ for _ in $(seq 1 "$rounds"); do
   if grep -qE 'タスク完了（結果ファイル:|タスク失敗' <<<"$body"; then
     echo "DONE $body"; exit 0
   fi
+  # ボタン付きメッセージ（計画確認・Tier 3 承認依頼）を検出したら回数を待たず即返す。
+  # 承認依頼には保留猶予（60 秒）内の決着で worker がその場で再開できるという時間制約があり、
+  # 回数上限まで握ると G2 への到達が猶予を超え「承認 → 保留 → 再投入 → 再承認依頼」の
+  # ループに落ちる（実機で発生）。
+  has_buttons=$(jq -r --arg own "$after_ts" --arg owner "$OWNER_USER_ID" '
+    [ .messages[]
+      | select((.ts|tonumber) > ($own|tonumber))
+      | select(.user != $owner)
+      | (.blocks // []) | map(select(.type == "actions")) | length
+    ] | add // 0' <<<"$rep")
+  if [[ "$has_buttons" != "0" ]]; then
+    echo "PROGRESS $body"; exit 0
+  fi
 done
 
 if [[ -n "$body" ]]; then

@@ -8,6 +8,8 @@
 """
 
 import asyncio
+import glob
+import json
 import logging
 import os
 import re
@@ -233,6 +235,19 @@ class ApprovalPipeline:
             self._audit(decision, instance_id, command, tier=3, start=start)
             return decision
 
+        # 承認の引き継ぎ（§8.10）: 同一タスク内で人間が承認済みの同一操作は再承認を求めない。
+        # 保留 → 決着 → 再投入で worker が承認済み操作へ再到達したとき、ここで通さないと
+        # 「承認 → 保留 → 再投入 → 同一操作で再依頼」が循環し、応答が猶予より遅い環境
+        # （G2 グラス等）では人間が何度承認しても実行に反映されない（2026-08-17 T09-B8 実機）。
+        # 位置は always_deny の後・always_escalate の前 — 決定論の deny は引き継ぎでも覆せず、
+        # escalate 対象でも人間決定済みなら再度聞かない。
+        carry_from = self._find_carryover(task_id, pending)
+        if carry_from:
+            decision = Decision(allow=True, handler="approval_carryover",
+                                reason=f"carryover: {carry_from}")
+            self._audit(decision, instance_id, command, tier=3, start=start)
+            return decision
+
         escalate_rule = self._match_rule(command, self.always_escalate)
         if escalate_rule:
             # スコープ・Tier 判定をスキップして人間承認（Tier 3）へ直行する。
@@ -366,6 +381,36 @@ class ApprovalPipeline:
             "reason": decision.reason,
             "duration_ms": duration_ms,
         })
+
+    def _find_carryover(self, task_id: str, pending: 'PendingApproval') -> str | None:
+        """同一タスク内で承認済みの同一操作を approvals/done/ から探す（§8.10 承認の引き継ぎ）。
+
+        照合は task_id・tool_name・tool_input の**完全一致のみ**。正規化・類似一致はしない
+        （内容が変わった操作は別の操作。緩い一致は人間が承認した意図を越えて許可が広がる）。
+        スコープを同一 task_id に限るのは、別タスク・別会話への承認の越境を防ぐため。
+        interactive の判定不能プロンプト（tool_name 空）は対象外 — 操作の同一性を主張できない。
+        戻り値は一致した元レコードの request_id（監査ログで人間決定へ遡るために使う）。
+        """
+        if not task_id or not pending.tool_name:
+            return None
+        done_dir = os.path.join(self.handlers[3].approval_dir, "done")
+        try:
+            paths = glob.glob(os.path.join(done_dir, "*.json"))
+        except OSError:
+            return None
+        for path in paths:
+            try:
+                with open(path) as f:
+                    record = json.load(f)
+            except (OSError, ValueError):
+                continue  # 壊れたレコードは引き継ぎの根拠にしない（読める approved のみ）
+            if (isinstance(record, dict)
+                    and record.get("status") == "approved"
+                    and record.get("task_id") == task_id
+                    and record.get("tool_name") == pending.tool_name
+                    and record.get("tool_input") == pending.tool_input):
+                return record.get("request_id") or os.path.basename(path)[:-len(".json")]
+        return None
 
     @staticmethod
     def _match_rule(command: str, rules: list[str]) -> str | None:

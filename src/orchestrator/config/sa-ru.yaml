@@ -87,6 +87,14 @@ approval:
                                       # failed へ倒し、収束しなかったことを Slack へ明示する（§8.10）
   poll_interval_sec: 1                # 承認待ち中のポーリング間隔／保留レコードの決着監視間隔
 
+# §8.10f 会話⇄実行の受け渡し契約 — ConversationManager（契約化パス）/ Orchestrator が参照。
+# このブロックの有無で契約機能が有効化される（未構成なら従来動作＝段階導入）
+contract:
+  intents_dir: "/opt/taka-ma/data/intents"      # intent レコード（依頼の寿命 goal_status）の保存先
+  task_deny_dir: "/opt/taka-ma/data/task-deny"  # 禁止型拘束のタスク別 deny 規則。decide デーモンは
+                                                # 環境変数 TAKA_MA_TASK_DENY_DIR（既定値は同パス）で
+                                                # 同じ場所を読む（grep で両側一致を確認する）
+
 # モデル関連設定（routing / fallback / concurrency / models）は ya-ta.yaml に集約。
 # Orchestrator 起動時に ya-ta.yaml と当ファイルをマージして単一 config を構築する。
 

@@ -43,22 +43,18 @@ for _ in $(seq 1 20); do
   [[ -z "$cursor" ]] && break
 done
 
-# 「taka-ma 側の最後のメッセージがボタン付き（type=actions のブロックを持つ）」を未決着の条件とする。
-# 決着するとレコード側が動くだけで Slack のメッセージは残るため、ボタンの有無だけでは判定できない。
-# 一方 taka-ma は決着後に必ず別の発言（着手します／やり直します／進捗）を投稿するので、
-# ボタン付きが taka-ma の発言の末尾に残っていることを未決着の代理指標にできる。
-# オーナー自身の発言を除くのは relay.sh/watch.sh と同じ理由 — 提示の後にユーザーが Slack から
-# 直接発話しても提示は pending のままであり、それで NONE に化けてはならない。
+# 会話面で最後に現れた「ボタン付き（type=actions のブロックを持つ）」メッセージを提示として返す。
+# 「末尾のメッセージがボタン付きか」では判定できない — taka-ma はボタンの後にも通知を投稿する
+# （Tier 3 承認依頼の後に保留通知が続く。実機で発生し、末尾判定では NONE に化けて詰んだ）。
+# 提示が既に決着済みかどうかの真の判定は decide.sh 側（Mac mini 上の pending 検査）が担う。
+# 既決の提示を PRESENT で返しても、選択後の decide.sh が NG（not pending）で止めるため安全。
+# オーナー自身の発言を除くのは relay.sh/watch.sh と同じ理由（割込み発話を提示と取り違えない）。
 last=$(jq -c --arg owner "$OWNER_USER_ID" \
-  '[ .[] | select(.user != $owner) ] | last // empty' <<<"$msgs")
+  '[ .[] | select(.user != $owner)
+        | select((.blocks // []) | map(select(.type == "actions")) | length > 0) ]
+   | last // empty' <<<"$msgs")
 
 if [[ -z "$last" ]]; then echo "NONE"; exit 0; fi
-
-last_has_buttons=$(jq -r '(.blocks // []) | map(select(.type == "actions")) | length > 0' <<<"$last")
-
-if [[ "$last_has_buttons" != "true" ]]; then
-  echo "NONE"; exit 0
-fi
 
 # 本文は blocks の header / section から組み立てる（relay.sh と同じ規則）。
 body=$(jq -r '
