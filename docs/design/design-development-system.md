@@ -766,26 +766,40 @@ sa-ruのオーケストレーション対象にマシンを追加するだけで
 
 | 枠 | 役割モデル例 | 稼働機 | 容量制約 | 入替の実体 |
 |----|------------|--------|---------|----------|
-| ローカル | ya-ta 分解脳（Qwen3.6-27B）/ sa-ru 会話脳（Qwen3.6-35B-A3B）/ inline（Gemma）/ qu-e（Qwen3.6） | Mac mini（ya-ta・sa-ru）/ MBP（inline・qu-e） | あり（**実常駐=重み+KV** ＋同居モデル合計 ≤ ホスト RAM 予算） | config 更新 ＋ モデル pull ＋ サービス reload |
+| ローカル | ya-ta 分解脳（Qwen3.6-27B）/ sa-ru 会話脳（Qwen3.6-35B-A3B）/ inline（Gemma）/ qu-e（Qwen3.6） | Mac mini（ya-ta・sa-ru）/ MBP（inline・qu-e） | あり（**実常駐=重み+KV** ＋同居モデル合計 ≤ ホスト RAM 予算 − **最小余裕 `min_headroom_gb`**。「入れば良い」ではなく常用余裕の確保を合格条件とする） | config 更新 ＋ モデル pull ＋ サービス reload |
 | API | agent（haiku / sonnet / opus / Gemini） | MBP（API 呼出） | なし | config 更新のみ（full_name / version） |
 
 空きメモリ量は §4.2 / `ResourceOptimizer` の値を流用する。
 
 **フロー（半自動 = 人間ゲート）**
 
-| 段階 | 内容 |
-|------|------|
-| 監視 | トリガ起点（Slack 手動コマンド or 定期）。**自動スクレイピングはしない**。候補はキュレートした一次ソース（HuggingFace 等）から取得 |
-| 検証 | 候補の量子化サイズ・コンテキスト長・ライセンスを `docs/claims/` で検証（モデル更新の評価プロセスを再利用） |
-| 適合判定 | ローカル枠: 候補の**実常駐（重み+KV、同 context で実測）**＋同居モデル合計が稼働機 RAM 予算に収まるか。API 枠: 容量不問（契約・可用性のみ） |
-| 提示 | Slack へ「役割 / 現行 → 候補 / サイズ / 容量適合 / 根拠（ベンチ・claims リンク）」を **Approve / Reject ボタン**付きで提示（§8.9 / §8.10 の既存承認経路を再利用） |
-| 入替 | 承認後、`ya-ta.yaml` の該当枠を更新 → モデル pull（pyinfra の yaml 駆動）→ サービス reload → `docs/claims/` と判定ログに記録 |
+候補の**登録**と最終**承認**だけが人間で、間の検証〜提示は `model_watch.py` が無人で行う（コード昇格済み）。
 
-**判定主体**: 候補抽出・容量適合判定はシステム、最終採用判断は人間（半自動）。
+| 段階 | 内容 | 実装主体 |
+|------|------|---------|
+| 監視 | トリガ起点（定期 or 手動 CLI）。**自動スクレイピングはしない**。候補は人間がキュレートしてウォッチリスト（`config/model_watch.yaml`）へ登録し、以降を無人化する | コード（`model_watch.py`） |
+| 検証 | 候補の量子化サイズ・コンテキスト長・ライセンス・モダリティを**機械可読な一次ソース**（HuggingFace API / ollama レジストリ manifest）から取得・照合する。LLM を介さない（AI 出力の混入を構造的に排除） | コード（`model_watch.py`） |
+| 実測 | 候補の実常駐（重み+KV）を対象役割と同じ num_ctx で稼働機上で実測（下記プロトコル） | コード（`model_watch.py`） |
+| 適合判定 | ローカル枠: 実測常駐＋同居合計 ≤ RAM 予算 − 最小余裕 `min_headroom_gb`。API 枠: 容量不問（契約・可用性のみ） | コード（`evaluate_swap`） |
+| 提示 | Slack へ「役割 / 現行 → 候補 / サイズ / 容量適合 / 根拠」を **Approve / Reject ボタン**付きで提示（§8.9 / §8.10 の既存承認経路を再利用）。提案 JSON も記録 | コード（`model_watch.py`） |
+| 承認 | 最終採用判断（Approve / Reject） | **人間** |
+| 入替 | 承認後、`ya-ta.yaml` の該当枠を更新 → モデル pull（pyinfra の yaml 駆動）→ サービス reload → `docs/claims/` と判定ログに記録。却下時は候補を `ollama rm` で撤去 | ランブック |
+
+**判定主体**: 候補登録・最終採用判断は人間、検証・実測・適合判定・提示はシステム（半自動）。
+
+**候補の実測プロトコル（本番メモリ保護）**
+
+実測は稼働機に候補モデルを一時ロードするため、通常運転を圧迫しない手順をコードで固定する:
+
+1. **誤実機ガード**: ローカル実行（SSH 未設定の host）は実行機の明示宣言（`--on-host`）と一致しない限り拒否する（別マシン役割の候補を実行機上で誤実測・誤 pull しない。fail-closed）
+2. 対象役割の現行モデルを `ollama stop` で一時解放してから候補をロードする（同時常駐させない）
+3. **実測ガード**: 解放後の常駐合計＋候補の予測常駐（検証済み重み × KV 上乗せ係数）が予算を超える見込みなら、ロード自体を中止する
+4. 候補は対象役割と同じ num_ctx（HTTP API options）でロードし、`ollama ps` の SIZE / CONTEXT を取得したら**即 `ollama stop`**、さらに**解放完了（ps から消える）を待つ**（解放中の再ロードはメモリ二重計上となり、keep_alive=-1 の同居モデルまで追い出される — 実機観測）
+5. 現行モデルを再ロード（keep_alive 復元）し、**実測前に常駐していた全モデル**を ps(before) と照合、脱落があれば元の context で再ロードして復帰を確認する。手順 4〜5 は異常時も必ず実行する（try/finally）
 
 **容量データの維持（deploy 時の実測記録・ランブック駆動）**
 
-容量適合判定の入力 `model_capacity.yaml` の `size_gb` は **実常駐（重み＋KV キャッシュ）** であり、推測値を入れない（本リポジトリの開発方針）。値は実機測定で維持する。実測・記入・入替は「決定論だが進化する操作」のため**コード固定せずランブック化**（[`docs/sa-runbooks/model-capacity-and-swap.md`](../sa-runbooks/model-capacity-and-swap.md)）し、エージェントが deploy のたびに **Do→Check→Record** で更新する。コードに固定する不変条件は**容量不等式 `evaluate_swap` のみ**。
+容量適合判定の入力 `model_capacity.yaml` の `size_gb` は **実常駐（重み＋KV キャッシュ）** であり、推測値を入れない（本リポジトリの開発方針）。値は実機測定で維持する。実測・記入・入替は「決定論だが進化する操作」のため**コード固定せずランブック化**（[`docs/sa-runbooks/model-capacity-and-swap.md`](../sa-runbooks/model-capacity-and-swap.md)）し、エージェントが deploy のたびに **Do→Check→Record** で更新する。コードに固定する不変条件は**容量不等式 `evaluate_swap`**と、無人化を要するため昇格した**候補評価パイプライン `model_watch.py`**（上表の監視〜提示）。承認後の入替と deploy 時の現行構成実測はランブックのまま。
 
 | 項目 | 内容 |
 |------|------|
@@ -793,7 +807,7 @@ sa-ruのオーケストレーション対象にマシンを追加するだけで
 | 測定 | 当該 host で `ollama run <model>` でロード → `ollama ps` の SIZE 列（実常駐）と CONTEXT を取得 → `ollama stop` で解放 |
 | 書込 | `model_capacity.yaml` の該当 role に `context` / `size_gb`（必要に応じ `kv_gb` = size − weights）を **upsert**（既存値を実測で上書き、無ければ追加） |
 | 効果 | モデル変更・`num_ctx` 変更・再デプロイのたびに容量データが実機と同期。`evaluate_swap` が正しい実常駐で判定でき、Mac mini 等の OOM 見逃しを防ぐ |
-| 実装方針 | **コード（不変条件のみ固定）**: `model_monitor.py` の `evaluate_swap`（同居実常駐合計 ≤ 予算 の検算）。**ランブック（可変・操作本体）**: 実測（host で `ollama ps`）→ `model_capacity.yaml` 記入 → `evaluate_swap` で検算（Check）→ 記録（Record）。スロップ対策は **Do→Check→Record ＋ verify-after-act**。`ollama ps` は当該 host のみのため MBP / Mac mini 各々で実施。将来「無人化が要る操作」だけ個別にコード昇格する（big-bang 改修はしない） |
+| 実装方針 | **コード（不変条件・無人化済みの操作）**: `model_monitor.py` の `evaluate_swap`（同居実常駐合計 ≤ 予算 − 最小余裕 の検算）と、候補評価パイプライン `model_watch.py`（無人化のため昇格）。**ランブック（可変・操作本体）**: deploy 時の実測（host で `ollama ps`）→ `model_capacity.yaml` 記入 → `evaluate_swap` で検算（Check）→ 記録（Record）、および承認後の入替。スロップ対策は **Do→Check→Record ＋ verify-after-act**。`ollama ps` は当該 host のみのため MBP / Mac mini 各々で実施。「無人化が要る操作」だけ個別にコード昇格する方針は維持（big-bang 改修はしない） |
 | 注意 | プロダクション command center（Mac mini）でのロードは一時的にメモリを占有するため、測定は deploy の単発・直後 `ollama stop` で最小化する |
 
 ---

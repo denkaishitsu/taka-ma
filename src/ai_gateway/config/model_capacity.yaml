@@ -20,13 +20,19 @@
 #   新候補のサイズもスワップ提案時に「同じ context での実常駐」を claims で実測して与える。
 
 # 稼働機ごとの RAM 予算。ram_gb は実装メモリ、reserve_gb は OS・その他常駐に残す分（実機で調整）。
+# min_headroom_gb は「モデルを全部載せた後にさらに残すべき常用余裕」。容量適合は
+#   同居合計 ≤ (ram_gb − reserve_gb) − min_headroom_gb
+# で判定する（§7.4。「入れば良い」ではなく、マシンが余裕を持って作業できることを合格条件にする）。
+# 値は暫定。KV の伸び・同時 worker 数の実測で較正する。
 hosts:
   mac-mini:
     ram_gb: 64
     reserve_gb: 8
+    min_headroom_gb: 8       # command center。ロード時スパイク・ollama ランタイムのゆらぎ分
   mbp:
     ram_gb: 128
     reserve_gb: 12
+    min_headroom_gb: 16      # worker（Claude Code 複数）と同居するため余裕を大きく取る
 
 # 役割ごとの現行モデルと稼働機・サイズ。host が同じ役割同士は同一機で同居＝size_gb 合計が予算に収まる必要がある。
 # heavy（opus / gemini）は API 実行のためローカル RAM を消費せず、容量管理の対象外（ここに載せない）。
@@ -34,18 +40,19 @@ hosts:
 roles:
   ya-ta:                       # タスク分解・分類・リスク判定（ya-ta 分解脳）
     host: mac-mini
-    model: qwen3.6:27b-q4_K_M
+    model: qwen3.8:27b         # qwen3.6:27b-q4_K_M から入替（2026-08-26。公式ベンチ全項目優位・速度同等の実測）
     context: 32768             # num_ctx 32K（Modelfile PARAMETER で焼込・OOM 回避。ollama ps CONTEXT で確認）
-    weights_gb: 17             # Q4_K_M 重み（mac-mini ollama list 実測 2026-07-14）
-    kv_gb: 0                   # KV 実測（常駐 17 − 重み 17。ollama ps 表示粒度では KV 増分検出されず）
-    size_gb: 17                # 実常駐 実測（重み+KV、容量判定に使用。mac-mini `ollama ps` 2026-07-14）
+    weights_gb: 16.8           # 量子化重み（ollama レジストリ manifest 実測 2026-08-26・model_watch verify）
+    kv_gb: 1.2                 # KV 実測（常駐 18 − 重み 16.8）
+    size_gb: 18                # 実常駐 実測（重み+KV、容量判定に使用。mac-mini `ollama ps` 2026-08-26・32K）
   sa-ru:                       # オーケストレーション（stdout 文脈抽出）+ 人間とのテキスト/画像会話
     host: mac-mini
     model: qwen3.6:35b-a3b-q4_K_M
     context: 32768             # num_ctx 32K（Modelfile PARAMETER で焼込。既定 262K だと KV 膨張のため制限）
     weights_gb: 23             # Q4_K_M 重み（mac-mini ollama list 実測 2026-07-14。MoE 35B総 / active 3B）
-    kv_gb: 0                   # KV 実測（常駐 23 − 重み 23。ollama ps 表示粒度では KV 増分検出されず）
-    size_gb: 23                # 実常駐 実測（重み+KV、容量判定に使用。mac-mini `ollama ps` 2026-07-14）
+    kv_gb: 0                   # KV 実測（ollama ps 表示粒度では KV 増分検出されず）
+    size_gb: 23                # 実常駐 実測（mac-mini `ollama ps` 2026-08-26・ollama 0.33.0。ロードの
+                               # たびに 22〜23GB で揺れるため安全側の 23 を採用＝容量判定を甘くしない）
   light:                       # 軽量タスク処理
     host: mbp
     model: gemma4:31b

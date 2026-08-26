@@ -1,0 +1,37 @@
+# モデル自動監視のウォッチリスト（設計書 §7.4 監視段の入力）
+#
+# 位置づけ:
+#   「自動スクレイピングはしない」原則のため、候補の**発見**は人間が本リストへ登録する。
+#   登録以降（一次ソース検証 → 実測 → 適合判定 → Slack 提示）は model_watch.py が無人で行う。
+#   最終採用判断は人間（Approve / Reject。§8.9/§8.10 の承認経路）。
+
+watch:
+  # 実測時の各稼働機への到達方法。ssh は SSH エイリアス（null = model_watch を実行している
+  # 本機で直接実行）。本番配置は mac-mini（sa-ru 同居）を想定し mac-mini は null。
+  # ollama_bin は非対話 SSH では PATH に /opt/homebrew/bin が無いため絶対パスで指定する。
+  hosts:
+    mac-mini:
+      ssh: null
+      ollama_bin: /opt/homebrew/bin/ollama
+    mbp:
+      ssh: null                # mac-mini から MBP への SSH エイリアスを配備時に設定する
+      ollama_bin: /opt/homebrew/bin/ollama
+
+  # 実測ガード: 候補ロード前の空き見積りに使う「予測常駐 = 検証済み重み × kv_margin」。
+  # KV は実測するまで不明のため、重みに対する上乗せ係数で安全側に見積もる
+  # （32K 常駐の実績: qwen3.6:27b で KV ≒ 0、gemma4:31b 256K で KV 16GB/重み20GB）。
+  kv_margin: 1.3
+
+  # 提案 JSON の記録先（承認ファイルとは別に、提示内容の正本を残す）
+  record_dir: /opt/taka-ma/data/model_watch
+
+# 候補リスト。1 エントリ = 1 候補 × 1 対象役割。
+#   model:     ollama タグ（レジストリ manifest 照合・pull・実測のキー）
+#   role:      入替対象の役割（model_capacity.yaml の roles キー）
+#   hf_repo:   HuggingFace リポ ID（一次ソース検証のキー）
+#   rationale: 候補に挙げた理由（提案メッセージに載せる。スペック値はここに書かず検証段で取得する）
+candidates:
+  - model: qwen3.8:27b
+    role: ya-ta
+    hf_repo: Qwen/Qwen3.8-27B
+    rationale: "ya-ta 分解脳 27B dense の後継候補。長コンテキスト・vision 対応の報（一次ソース検証は verify 段で実施）"
