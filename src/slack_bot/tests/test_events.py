@@ -241,6 +241,143 @@ def test_resent_passive_not_enqueued_twice(monkeypatch):
     assert calls["n"] == 1
 
 
+def test_b_id_mention_in_thread_enqueued_active(monkeypatch):
+    """B-ID メンション（app_mention 非発火）は message ハンドラで能動受理する（§8.3 (A)）。"""
+    import services.event_dedup as dedup
+    monkeypatch.setattr(dedup, "_seen", {})
+    captured = {}
+    monkeypatch.setattr(events, "authorize", lambda user, role, say: True)
+
+    def fake_enqueue(source, text, *, user_id, team_id, channel_id,
+                     thread_ts=None, force_ready=False, passive=False):
+        captured.update({"source": source, "thread_ts": thread_ts, "passive": passive})
+        return "msg-id"
+
+    monkeypatch.setattr(events, "enqueue_conversation_message", fake_enqueue)
+    app = _FakeApp()
+    events.register_events(app)
+    client = _FakeClient()
+    app.handlers["message"](
+        event=_channel_event(text="<@B99> 直して"),
+        body={"event_id": "ev-bid-1"},
+        say=lambda *a, **kw: None,
+        logger=__import__("logging").getLogger("test"),
+        client=client,
+        context={"bot_id": "B99"})
+    assert captured == {"source": "slack_mention", "thread_ts": "111.222",
+                        "passive": False}
+    # 受付リアクションも通常メンションと同一に付く
+    assert client.calls == [{"channel": "C1", "timestamp": "222.333", "name": "eyes"}]
+
+
+def test_b_id_mention_flat_anchors_thread_on_own_ts(monkeypatch):
+    """スレッド外の B-ID メンションは自身の ts をスレッド起点にする（メンションと同一規則）。"""
+    import services.event_dedup as dedup
+    monkeypatch.setattr(dedup, "_seen", {})
+    captured = {}
+    monkeypatch.setattr(events, "authorize", lambda user, role, say: True)
+
+    def fake_enqueue(source, text, *, user_id, team_id, channel_id,
+                     thread_ts=None, force_ready=False, passive=False):
+        captured.update({"source": source, "thread_ts": thread_ts})
+        return "msg-id"
+
+    monkeypatch.setattr(events, "enqueue_conversation_message", fake_enqueue)
+    app = _FakeApp()
+    events.register_events(app)
+    ev = _channel_event(text="<@B99> お願いします")
+    del ev["thread_ts"]
+    app.handlers["message"](
+        event=ev, body={"event_id": "ev-bid-2"},
+        say=lambda *a, **kw: None,
+        logger=__import__("logging").getLogger("test"),
+        client=_FakeClient(),
+        context={"bot_id": "B99"})
+    assert captured == {"source": "slack_mention", "thread_ts": "222.333"}
+
+
+def test_other_b_id_mention_stays_passive(monkeypatch):
+    """他アプリの B-ID メンションは能動受理しない（スレッド内なら従来どおり passive）。"""
+    captured = {}
+    app = _register_passive(monkeypatch, captured)
+    monkeypatch.setattr(events, "is_awaiting_reply", lambda cid: False)
+    app.handlers["message"](
+        event=_channel_event(text="<@B77> こっちは別アプリ"),
+        body={"event_id": "ev-bid-3"},
+        say=lambda *a, **kw: None,
+        logger=__import__("logging").getLogger("test"),
+        client=_FakeClient(),
+        context={"bot_id": "B99"})
+    assert captured["source"] == "slack_thread_passive"
+    assert captured["passive"] is True
+
+
+def test_thread_reply_promoted_active_when_awaiting(monkeypatch):
+    """taka-ma が返答待ちのスレッドでは非メンション返信を能動投入する（§8.3 (C) 能動昇格）。"""
+    captured = {}
+    app = _register_passive(monkeypatch, captured)
+    seen_cids = []
+
+    def fake_awaiting(cid):
+        seen_cids.append(cid)
+        return True
+
+    monkeypatch.setattr(events, "is_awaiting_reply", fake_awaiting)
+    client = _FakeClient()
+    app.handlers["message"](
+        event=_channel_event(text="はい、その方針で進めてください"),
+        body={"event_id": "ev-awaiting-1"},
+        say=lambda *a, **kw: None,
+        logger=__import__("logging").getLogger("test"),
+        client=client,
+        context={"bot_id": "B99"})
+    assert captured == {"source": "slack_thread_reply", "thread_ts": "111.222",
+                        "passive": False}
+    # conversation_id は u-zu の採番規則（team:channel:thread_ts）で照合される
+    assert seen_cids == ["T1:C1:111.222"]
+    # 能動受理なので受付リアクションが付く
+    assert client.calls == [{"channel": "C1", "timestamp": "222.333", "name": "eyes"}]
+
+
+def test_thread_reply_stays_passive_when_not_awaiting(monkeypatch):
+    """返答待ちでないスレッドの非メンション返信は従来どおり passive（§8.3 (C)）。"""
+    captured = {}
+    app = _register_passive(monkeypatch, captured)
+    monkeypatch.setattr(events, "is_awaiting_reply", lambda cid: False)
+    app.handlers["message"](
+        event=_channel_event(),
+        body={"event_id": "ev-awaiting-2"},
+        say=lambda *a, **kw: None,
+        logger=__import__("logging").getLogger("test"),
+        client=_FakeClient(),
+        context={"bot_id": "B99"})
+    assert captured == {"source": "slack_thread_passive", "thread_ts": "111.222",
+                        "passive": True}
+
+
+def test_awaiting_lookup_reads_saru_session_file(monkeypatch, tmp_path):
+    """is_awaiting_reply は sa-ru セッション永続化ファイルの awaiting_reply を読む。
+
+    ファイル名変換（非英数 → _）は sa-ru 側 _session_path と同一規則であること。
+    不在・壊れ JSON・キー不在は False（安全側 = passive のまま）。
+    """
+    import json as _json
+
+    import services.session_lookup as lookup
+    monkeypatch.setattr(lookup, "SESSIONS_DIR", str(tmp_path))
+    cid = "T1:C1:111.222"
+    path = tmp_path / "T1_C1_111.222.json"
+    path.write_text(_json.dumps({"awaiting_reply": True}))
+    assert lookup.is_awaiting_reply(cid) is True
+    path.write_text(_json.dumps({"awaiting_reply": False}))
+    assert lookup.is_awaiting_reply(cid) is False
+    path.write_text(_json.dumps({"turns": []}))          # キー不在
+    assert lookup.is_awaiting_reply(cid) is False
+    path.write_text("{broken")                            # 壊れ JSON
+    assert lookup.is_awaiting_reply(cid) is False
+    assert lookup.is_awaiting_reply("T9:C9:999") is False  # ファイル不在
+
+
 def test_resent_mention_not_enqueued_twice(monkeypatch):
     """Task #89 H13: 同一 event_id の再送メンションは会話キューへ二重投入されない。"""
     import services.event_dedup as dedup

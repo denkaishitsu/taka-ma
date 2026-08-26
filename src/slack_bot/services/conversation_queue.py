@@ -39,7 +39,7 @@ def enqueue_conversation_message(source: str, text: str, *, user_id: str,
     """会話メッセージを 1 件作成し、生成した message_id を返す。
 
     source: 発生元（slack_mention / slack_dm / slack_command / slack_go /
-      slack_thread_passive）。
+      slack_thread_reply / slack_thread_passive）。
     force_ready: `/taka-ma-go` 等で「LLM 判定を待たず締める」明示エスケープ。True なら
       sa-ru は意図判定をスキップし、直近会話を要約して着手確認へ進む（§8.3 (B)）。
     passive: チャンネルスレッドの非メンション返信（§8.3 (C)）。True なら sa-ru は

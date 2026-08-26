@@ -9,10 +9,14 @@
 
 import logging
 
-from services.conversation_queue import enqueue_conversation_message
+from services.conversation_queue import (
+    derive_conversation_id,
+    enqueue_conversation_message,
+)
 from services.event_dedup import seen_before
 from services.inbound_sanitize import load_sanitize_apps, strip_app_attribution
 from services.role_check import authorize, check_role
+from services.session_lookup import is_awaiting_reply
 
 logger = logging.getLogger("u-zu.events")
 
@@ -70,8 +74,9 @@ def register_events(app):
             thread_ts=event.get("thread_ts") or event.get("ts"))
 
     @app.event("message")
-    def handle_message(event, body, say, logger, client):
-        """メッセージ受信 — DM は会話キューへ、それ以外のチャンネル発話はログのみ。"""
+    def handle_message(event, body, say, logger, client, context=None):
+        """メッセージ受信 — DM は会話キューへ、チャンネルは B-ID メンション/返答待ち
+        スレッド返信を能動受理し、それ以外のスレッド返信は passive 記録する（§8.3）。"""
         # bot 自身の投稿・編集・参加通知など subtype 付きは人間の発話ではないので無視する。
         subtype = event.get("subtype")
         if subtype is not None:
@@ -102,18 +107,42 @@ def register_events(app):
                 channel_id=event.get("channel", ""),
                 thread_ts=event.get("thread_ts") or event.get("ts"))
         else:
-            # チャンネルの非メンション発話: スレッド内の返信だけを文脈として会話キューへ
-            # passive 投入する（§8.3 (C)。sa-ru は既存セッションに限り履歴へ追記のみ行う）。
-            # スレッド外の通常発話は対象外（bot が関与しない雑談を収集しない）。
+            # チャンネル発話。bot 投稿（bot_id 付き）は能動・passive とも対象外
+            # （bot どうしの応答ループ・自己記録を作らない）
             thread_ts = event.get("thread_ts")
-            if not thread_ts or event.get("bot_id"):
-                logger.debug("メッセージ受信: %s", text)
+            if event.get("bot_id"):
+                logger.debug("bot 投稿を無視: %s", text)
                 return
-            # メンション付きは app_mention ハンドラが能動ターンとして処理する（message
-            # イベントと二重配信されるため、ここで拾うと同一発話が二重投入される）
+            # ユーザー ID（<@U…>）メンションは app_mention ハンドラが能動ターンとして
+            # 処理する（message イベントと二重配信されるため、ここで拾うと二重投入される）
             auths = body.get("authorizations") or [{}]
             bot_user = auths[0].get("user_id", "")
             if bot_user and f"<@{bot_user}>" in text:
+                return
+            # アプリ ID（<@B…>）メンションの能動受理（§8.3 (A)）。B-ID メンションでは
+            # app_mention イベントが発火せず message しか届かないため、ここで通常メンション
+            # と同一の経路（冪等化 → 認可 → 受付リアクション → slack_mention 投入）に乗せる。
+            # 従来は passive 記録へ落ちて黙殺されていた（2026-08-25 実障害）
+            bot_id = (context or {}).get("bot_id", "")
+            if bot_id and f"<@{bot_id}>" in text:
+                event_id = body.get("event_id", "")
+                if seen_before(event_id):
+                    logger.info("再送 B-ID メンションを無視: event_id=%s", event_id)
+                    return
+                logger.info("B-ID メンション受信 from %s: %s", user, text)
+                if not authorize(user, "user", say):
+                    return
+                _ack_received(client, event.get("channel", ""), event.get("ts", ""))
+                enqueue_conversation_message(
+                    "slack_mention", text,
+                    user_id=user,
+                    team_id=event.get("team", ""),
+                    channel_id=event.get("channel", ""),
+                    thread_ts=thread_ts or event.get("ts"))
+                return
+            # スレッド外の非メンション発話は対象外（bot が関与しない雑談を収集しない）
+            if not thread_ts:
+                logger.debug("メッセージ受信: %s", text)
                 return
             # Slack の再送（同一 event_id）は無視する（§8.3 再送の冪等化）
             event_id = body.get("event_id", "")
@@ -122,6 +151,24 @@ def register_events(app):
             # 未認可ユーザーは黙って捨てる（bot が呼ばれていない場で拒否メッセージを
             # 自発しない・§8.3 (C)）。受付リアクションも付けない（応答しない発話のため）
             if not check_role(user, "user"):
+                return
+            # 返答待ちスレッドの能動昇格（§8.3 (C)）: taka-ma が質問・確認を出して返答を
+            # 待っている会話では、メンション無しの返信も能動ターンとして受理する
+            # （メンションを強いると返答が passive へ落ちて黙殺される・2026-08-25 実障害）。
+            # awaiting_reply は sa-ru がセッション永続化ファイルへ書く（u-zu は読むだけ）
+            cid = derive_conversation_id(
+                team_id=event.get("team", ""), channel_id=event.get("channel", ""),
+                thread_ts=thread_ts, user_id=user)
+            if is_awaiting_reply(cid):
+                logger.info("返答待ちスレッドの返信を能動受理: channel=%s thread=%s",
+                            event.get("channel", ""), thread_ts)
+                _ack_received(client, event.get("channel", ""), event.get("ts", ""))
+                enqueue_conversation_message(
+                    "slack_thread_reply", text,
+                    user_id=user,
+                    team_id=event.get("team", ""),
+                    channel_id=event.get("channel", ""),
+                    thread_ts=thread_ts)
                 return
             logger.info("スレッド内非メンション発話を文脈記録: channel=%s thread=%s",
                         event.get("channel", ""), thread_ts)

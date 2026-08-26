@@ -15,10 +15,23 @@ ACCEPTANCE_KINDS = {
     "remote_file": {"required": {"branch", "path"}, "optional": set()},
     "file": {"required": {"path"}, "optional": set()},
     "head_touches": {"required": {"path"}, "optional": set()},
+    "diff_limit": {"required": {"max_lines"}, "optional": {"path"}},
 }
 
 # リポジトリ系の検査（§8.10f needs_repo の機械補助: これを含む契約は実リポジトリを要する）
-REPO_KINDS = {"pushed", "remote_file", "head_touches"}
+REPO_KINDS = {"pushed", "remote_file", "head_touches", "diff_limit"}
+
+# 整数パラメータ（検査コマンド文字列には乗せず比較にのみ使う）。上限は暴走値の拒否
+_INT_PARAMS = {"max_lines"}
+_MAX_INT_PARAM = 100000
+
+# 環境改変コマンドの既定 deny（§8.10f 事前予防）。worker の勝手な環境改変（push 不能への
+# git init 等）は失敗原因コードをズラし反復停止の検出を撹乱するため、decide デーモンが
+# 全タスクで既定 deny する。契約 directive（人が着手確認で承認した逐語命令）に逐語で
+# 含まれる場合のみタスク別 allow（env_mutation_allows）が優先する。
+# decide_daemon.py の _ENV_MUTATION_DENY と同一リストであること（grep で両端一致を確認する）
+ENV_MUTATION_COMMANDS = ("git init", "git remote add", "git remote set-url",
+                         "git remote remove", "git config")
 
 # 検査パラメータ（branch / path）の受理形式。SSH コマンド文字列に乗るため安全文字のみに
 # 制限する（workspace の _SAFE_WORKSPACE_RE と同じ発想。`..` 成分も拒否）
@@ -58,6 +71,20 @@ def is_verbatim(candidate: str, source_text: str) -> bool:
     if not candidate or not candidate.strip():
         return False
     return _norm_ws(candidate) in _norm_ws(source_text)
+
+
+def env_mutation_allows(directive: str | None) -> list[str]:
+    """契約 directive に逐語で含まれる環境改変コマンドを返す（§8.10f 既定 deny の許可経路）。
+
+    directive は着手確認で人が承認した逐語命令のみ（validate_contract が逐語性を保証済み）。
+    ここに現れた環境改変コマンドは「人間が明示して承認した」ものなので、decide デーモンの
+    既定 deny より優先するタスク別 allow として task-deny 規則へ刻む。照合は大文字小文字を
+    無視した空白正規化ずみ部分一致（decide 側の deny 照合と同じ決定的判定・LLM 不使用）。
+    """
+    if not directive:
+        return []
+    normalized = _norm_ws(directive).lower()
+    return [cmd for cmd in ENV_MUTATION_COMMANDS if cmd in normalized]
 
 
 def validate_contract(raw, source_text: str) -> tuple[dict | None, list[str]]:
@@ -120,9 +147,21 @@ def validate_contract(raw, source_text: str) -> tuple[dict | None, list[str]]:
             continue
         missing = spec["required"] - set(params)
         unknown = set(params) - spec["required"] - spec["optional"]
-        bad = [k for k, v in params.items()
-               if not isinstance(v, str) or not _SAFE_PARAM_RE.match(v)
-               or ".." in v.split("/")]
+        # 整数パラメータ（max_lines）は正の bool でない int のみ受理（数字文字列は int へ
+        # 正規化）。文字列パラメータは従来どおり安全文字のみ（コマンド文字列に乗るため）
+        bad = []
+        for k, v in params.items():
+            if k in _INT_PARAMS:
+                # isascii を併課する: 上付き数字「²」等は isdigit=True だが int() が
+                # ValueError になる（未捕捉例外で契約化パスを落とさない・fail-closed）
+                if isinstance(v, str) and v.isascii() and v.isdigit():
+                    v = params[k] = int(v)
+                if (not isinstance(v, int) or isinstance(v, bool)
+                        or not 0 < v <= _MAX_INT_PARAM):
+                    bad.append(k)
+            elif (not isinstance(v, str) or not _SAFE_PARAM_RE.match(v)
+                    or ".." in v.split("/")):
+                bad.append(k)
         if missing or unknown or bad:
             problems.append(
                 f"検査 {kind} のパラメータ不正"
@@ -158,19 +197,86 @@ def validate_contract(raw, source_text: str) -> tuple[dict | None, list[str]]:
 # _PUSH_CLAIM_RE と同一に保つ（`grep -n "プッシュ" src/orchestrator/*.py` で一致を確認する）
 _PUSH_WORD_RE = re.compile(r"push(?:ed)?|プッシュ", re.IGNORECASE)
 
+# 編集系の語の検出（成果物 file 既定・§8.10f）。削除系（削除 / delete / remove）は
+# 含めない — 削除依頼へ file 検査を課すと成功したほど誤未達になる
+_EDIT_WORD_RE = re.compile(
+    r"作成|作って|生成|追記|追加|編集|修正|更新|書い|書き|保存|反映|直し|直す|"
+    r"create|write|edit|update|append", re.IGNORECASE)
+
+# 成果物パスのトークン検出（成果物 file 既定・§8.10f）。英字始まりの拡張子を持つ
+# 相対パスのみを拾う。前後の ASCII 語文字・`/` を境界で拒否することで、絶対パス
+# （`/opt/...` の内側）や URL 埋め込み（`https://.../a.md`）を対象外にする。拡張子の
+# 先頭を英字に限ることでバージョン番号（0.6.0 等）を対象外にする。文字集合は
+# _SAFE_PARAM_RE の受理形式に閉じる（検出即 file 検査のパラメータになるため）
+_DELIVERABLE_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9._/\-])"
+    r"((?:[A-Za-z0-9._\-]+/)*[A-Za-z0-9._\-]+\.[A-Za-z][A-Za-z0-9]{0,7})"
+    r"(?![A-Za-z0-9_/])")
+
+# 成果物 file 既定の付与上限（列挙の暴走で契約を肥大させない）
+_MAX_DEFAULT_FILE_CHECKS = 5
+
+# 量指定の検出（diff_limit 既定・§8.10f）。「一行だけ追記しろ」等の明示の行数指定を拾う。
+# 「行目」（位置参照）・「改行」（文字の話）は量指定でないため除外する
+_LINE_LIMIT_RE = re.compile(r"(?<!改)([0-9０-９]+|[一二三四五六七八九十])\s*行(?!目)")
+_KANJI_DIGITS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+                 "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+_ZEN2HAN = str.maketrans("０１２３４５６７８９", "0123456789")
+# これを超える行数指定は拘束の意図が薄い（規模の説明）ため既定付与しない
+_MAX_DEFAULT_LINE_LIMIT = 20
+# 指示 N 行への余白（末尾改行・体裁差を誤未達にしない。contract.md の N+2 と同値）
+_LINE_LIMIT_MARGIN = 2
+
 
 def apply_default_acceptance(contract: dict, summary: str) -> dict:
-    """git push を含む依頼で acceptance が空なら既定検査（push 整合）を付与する（§8.10f）。
+    """脳が完了条件を立て損ねた契約へ既定検査を付与する（§8.10f 既定完了検査の自動付与）。
 
-    脳が完了条件を立て損ねても「push の実測検査なしに完了と言える」状態を作らないための
-    機械補助。判定は決定的（push 語の検出のみ・LLM 不要）。push を含まない依頼には
-    付与しない（編集のみのタスクに pushed 検査を課すと誤未達になる）。
+    「実測検査なしに完了と言える」契約を成立させないための機械補助。判定は決定的
+    （語・パスの検出のみ・LLM 不要）で、脳が立てた検査は上書きしない:
+
+    - push 既定: push 語を含み acceptance が空なら pushed 検査を付与（push を含まない
+      依頼には付与しない — 編集のみのタスクに pushed を課すと誤未達になる）
+    - 成果物 file 既定: 編集系の語と成果物パス（相対・拡張子付き）を含む依頼には、
+      当該パスの file 検査を必ず載せる（既存 acceptance に同一パスの検査があれば重複
+      させない。#153 — 2026-08-25 実障害: 編集タスクが完了検査なしで「完了」と報告）
     """
-    if contract.get("acceptance"):
-        return contract
     text = f"{summary}\n{contract.get('directive') or ''}"
-    if _PUSH_WORD_RE.search(text):
-        contract["acceptance"] = [{"kind": "pushed", "params": {}}]
+    acceptance = contract.get("acceptance") or []
+    if not acceptance and _PUSH_WORD_RE.search(text):
+        acceptance = [{"kind": "pushed", "params": {}}]
+    if _EDIT_WORD_RE.search(text):
+        covered = {(a.get("params") or {}).get("path") for a in acceptance}
+        added = 0
+        for m in _DELIVERABLE_PATH_RE.finditer(text):
+            path = m.group(1)
+            if path in covered:
+                continue
+            # 防御的再検証（検出文字集合は受理形式に閉じているが、規則の独立変更に耐える）
+            if not _SAFE_PARAM_RE.match(path) or ".." in path.split("/"):
+                continue
+            acceptance.append({"kind": "file", "params": {"path": path}})
+            covered.add(path)
+            added += 1
+            if added >= _MAX_DEFAULT_FILE_CHECKS:
+                break
+    # 量指定既定（diff_limit・§8.10f）: 明示の行数指定がある編集依頼には変更量の上限を
+    # 必ず載せる。脳（contract.md）の抽出は分離実測 3/5 と不安定（2026-08-26）なため、
+    # 決定的な検出で立て損ねを補う。脳が立てた diff_limit は上書きしない
+    if (_EDIT_WORD_RE.search(text)
+            and not any(a.get("kind") == "diff_limit" for a in acceptance)):
+        m = _LINE_LIMIT_RE.search(text)
+        if m:
+            raw = m.group(1)
+            n = _KANJI_DIGITS.get(raw)
+            if n is None:
+                try:
+                    n = int(raw.translate(_ZEN2HAN))
+                except ValueError:
+                    n = None
+            if n and 0 < n <= _MAX_DEFAULT_LINE_LIMIT:
+                acceptance.append({"kind": "diff_limit",
+                                   "params": {"max_lines": n + _LINE_LIMIT_MARGIN}})
+    contract["acceptance"] = acceptance
     return contract
 
 

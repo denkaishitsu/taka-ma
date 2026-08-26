@@ -1393,16 +1393,21 @@ class Orchestrator:
             return
         forbids = [c for c in (task.get("constraints") or []) if c.get("forbid")]
         patterns = [p for c in forbids for p in (c.get("patterns") or [])]
-        if not patterns:
+        # 環境改変コマンドの既定 deny への許可経路（§8.10f 事前予防）: 契約 directive
+        # （人が着手確認で承認した逐語命令）に含まれる環境改変コマンドだけを allow_env に
+        # 刻む。decide デーモンは allow_env に無い環境改変（git init 等）を既定 deny する
+        allow_env = contract_rules.env_mutation_allows(task.get("directive"))
+        if not patterns and not allow_env:
             return
         try:
             os.makedirs(deny_dir, exist_ok=True)
             atomic_write_json(
                 os.path.join(deny_dir, f"{task_id}.json"),
                 {"task_id": task_id, "patterns": patterns,
-                 "sources": [c.get("text", "") for c in forbids]})
-            logger.info("タスク別 deny 規則を登録: task_id=%s patterns=%d",
-                        task_id, len(patterns))
+                 "sources": [c.get("text", "") for c in forbids],
+                 "allow_env": allow_env})
+            logger.info("タスク別 deny 規則を登録: task_id=%s patterns=%d allow_env=%d",
+                        task_id, len(patterns), len(allow_env))
         except OSError:
             logger.exception("タスク別 deny 規則の書込失敗（Tier 判定は継続有効）: %s", task_id)
 

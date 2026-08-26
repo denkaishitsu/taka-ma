@@ -91,7 +91,9 @@ def test_llm_prompt_contains_head_and_marker(tmp_path, monkeypatch):
     m = make_manager(tmp_path, head=2, tail=4)
     for i in range(10):
         m.handle_message(msg(f"発話{i}"))
-    last = prompts[-1]
+    # run_ollama には会話プロンプト以外（進行主張の選別・§8.3 安全網）も流れるため、
+    # 会話プロンプト（判定指示を含むもの）だけを対象に取る
+    last = [p for p in prompts if "毎ターン行う判定" in p][-1]
     assert "発話0" in last, "冒頭プロンプトが LLM 入力に残っていない（F3 再発）"
     assert "中略" in last, "省略が明示されていない"
     assert "発話4" not in last, "中間ターンが丸められていない"

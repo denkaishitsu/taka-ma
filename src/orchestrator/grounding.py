@@ -221,7 +221,7 @@ class GroundingVerifier:
         causes: list[str] = []
 
         # リポジトリ系検査の前提（git リポジトリであること）を 1 回だけ確認する
-        repo_kinds = {"pushed", "remote_file", "head_touches"}
+        repo_kinds = {"pushed", "remote_file", "head_touches", "diff_limit"}
         is_repo = None
         if any(a.get("kind") in repo_kinds for a in acceptance):
             rc, _ = self._probe(lines, f"git -C {ws} rev-parse --is-inside-work-tree")
@@ -233,13 +233,31 @@ class GroundingVerifier:
         for check in acceptance:
             kind = check.get("kind")
             params = check.get("params") or {}
-            bad = [v for v in params.values()
-                   if not isinstance(v, str) or not _ACCEPT_PARAM_RE.match(v)
-                   or ".." in v.split("/")]
+            # max_lines は整数（比較にのみ使いコマンド文字列に乗せない）。他は従来どおり
+            # 安全文字の文字列のみ（SSH コマンドに乗るため・fail-closed）
+            bad = [v for k, v in params.items()
+                   if (not (isinstance(v, int) and not isinstance(v, bool) and v > 0)
+                       if k == "max_lines"
+                       else (not isinstance(v, str) or not _ACCEPT_PARAM_RE.match(v)
+                             or ".." in v.split("/")))]
             if bad:
                 problems.append(f"検査 {kind} のパラメータが不正（検査を実行できない）")
                 causes.append(f"acceptance_failed:{kind}")
                 continue
+            # path は workspace 相対へ正規化する。脳 LLM は絶対パスで提案することがあり
+            # （2026-08-26 実機 E2E で実測）、素通しすると file/remote_file は誤未達、
+            # head_touches / diff_limit は相対名との不一致で**常に PASS（検査の空洞化）**
+            # になる。workspace 配下の絶対パスは相対へ剥がし、配下でない絶対パスは
+            # 検査 FAIL（fail-closed。空振り PASS より安全側）
+            if isinstance(params.get("path"), str) and params["path"].startswith("/"):
+                ws_prefix = workspace.rstrip("/") + "/"
+                if params["path"].startswith(ws_prefix):
+                    params = {**params, "path": params["path"][len(ws_prefix):]}
+                else:
+                    problems.append(
+                        f"検査 {kind} の path が workspace 外の絶対パス（検査を実行できない）")
+                    causes.append(f"acceptance_failed:{kind}")
+                    continue
             if kind in repo_kinds and not is_repo:
                 continue  # 前提不成立は上で計上済み（同じ原因を検査数ぶん重ねない）
 
@@ -295,6 +313,34 @@ class GroundingVerifier:
                     problems.append(
                         f"head_touches 未達（HEAD は {params['path']} を変更していない）")
                     causes.append(f"acceptance_failed:head_touches")
+
+            elif kind == "diff_limit":
+                # 指示規模の逸脱検出（§8.10f。実測 2026-08-24: 一行追記指示に README 全面
+                # 書き下ろし・pushed / head_touches は素通し）。HEAD コミットの numstat
+                # 実測値のみで判定し、worker の報告文・自然文は使わない
+                rc, out = self._probe(
+                    lines, f"git -C {ws} diff-tree --no-commit-id --numstat -r HEAD")
+                if rc != 0:
+                    problems.append("diff_limit 未達（HEAD の変更量を取得できない）")
+                    causes.append("acceptance_failed:diff_limit")
+                else:
+                    path_filter = params.get("path")
+                    total = 0
+                    for row in out.splitlines():
+                        cols = row.split("\t")
+                        if len(cols) != 3:
+                            continue
+                        added, deleted, path = cols
+                        if path_filter and path != path_filter:
+                            continue
+                        # バイナリ（"-"）は行数を持たないため 0 として数える
+                        total += (int(added) if added.isdigit() else 0)
+                        total += (int(deleted) if deleted.isdigit() else 0)
+                    if total > params["max_lines"]:
+                        problems.append(
+                            f"diff_limit 未達（変更 {total} 行 > 上限 {params['max_lines']} 行"
+                            f"{'・対象 ' + path_filter if path_filter else ''}）")
+                        causes.append("acceptance_failed:diff_limit")
 
             else:
                 problems.append(f"未知の検査 kind: {kind}")

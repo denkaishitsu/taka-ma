@@ -75,6 +75,17 @@ _REPO_MENTION_RE = re.compile(
     re.IGNORECASE)
 
 
+# probe の許可値（§8.3。LLM が選べるのは種別のみ・応答本文はコードが実レコード/実出力から
+# 組み立てる。許可リスト外の値は無効＝LLM 出力を任意動作へ接続しない）
+_PROBE_KINDS = ("repo_status", "task_status")
+
+# 「実行系」とみなすタスク status（§8.3 進行状況発言のグラウンディング。orchestrator の
+# 遷移 init→accepted→in_progress と承認保留 STATUS_PENDING_APPROVAL に一致させる —
+# `grep -n "pending_approval" src/orchestrator/__init__.py src/orchestrator/conversation.py`
+# で両側の一致を確認する。__init__ からの import は循環になるため値を重ねて持つ）
+_ACTIVE_TASK_STATUSES = {"init", "accepted", "in_progress", "pending_approval"}
+
+
 class InvalidWorkspaceError(ValueError):
     """`repo:` 指定が検証を通らない（相対パス・危険文字・`..` 等）ときのエラー。"""
 
@@ -135,6 +146,12 @@ class ConversationManager:
         os.makedirs(self.confirm_dir, exist_ok=True)
         # 会話プロンプトは静的なので起動時に 1 度だけ読む（毎ターンの disk I/O を避ける）
         self._prompt_template = (PROMPTS_DIR / "converse.md").read_text()
+        # 進行主張の選別プロンプト（§8.3 グラウンディングの安全網。言語理解は LLM が担い、
+        # 語列挙の正規表現を使わない — 2026-08-25 E2E FAIL の是正）
+        self._progress_claim_template = (PROMPTS_DIR / "progress_claim.md").read_text()
+        # ready 再検査の選別プロンプト（§8.3 細部質問の検品。対象・動作が特定できる依頼に
+        # 「何を書くか」等の細部を聞き返して止まる取りこぼし — 2026-08-24 E2E 実測 — の安全網）
+        self._ready_recheck_template = (PROMPTS_DIR / "ready_recheck.md").read_text()
         # TTL はセッションの「メモリからのアンロード」期限。永続化ファイルは残るため
         # TTL 経過・再起動後も次の発話時に文脈を回復できる（設計書 §8.3 永続化）。
         # sa-ru.yaml を唯一の供給元とする（コード既定値なし。sessions_dir と流儀を揃える）
@@ -189,6 +206,28 @@ class ConversationManager:
         """
         return self.__dict__.setdefault("_failure_causes", {})
 
+    def _awaiting_map(self) -> dict:
+        """返答待ちフラグ表（conversation_id → bool・§8.3 (C) 能動昇格）の遅延アクセサ。
+
+        _causes と同じ理由（__new__ で作られるテスト個体）で __dict__.setdefault を使う。
+        """
+        return self.__dict__.setdefault("_awaiting_reply", {})
+
+    def _set_awaiting(self, cid: str, awaiting: bool):
+        """「taka-ma がユーザーの返答を待っているか」を更新し、セッションと一緒に永続化する。
+
+        §8.3 (C) 返答待ちスレッドの能動昇格。u-zu がセッション永続化ファイルの
+        awaiting_reply を読み、true のスレッドではメンション無しの返信を能動投入する。
+        会話面へ質問・確認を送るたび true、待ちが解けた遷移（着手・完了還流・中止決着）で
+        false にする。ここは書く側の唯一の口（判定の権威は sa-ru の会話状態）。
+        """
+        if not cid:
+            return
+        with self._sessions_lock:
+            history = self._load_or_create_session(cid)
+            self._awaiting_map()[cid] = awaiting
+            self._persist_session(cid, history)
+
     # ── セッション永続化（設計書 §8.3「会話セッション履歴の永続化」） ──
 
     def _session_path(self, cid: str) -> str:
@@ -225,6 +264,10 @@ class ConversationManager:
                 # 失敗原因コード列も回復する（§8.10f 反復停止。再起動で反復を見失わない）
                 if data.get("failure_causes") and cid not in self._causes():
                     self._causes()[cid] = list(data["failure_causes"])
+                # 返答待ちフラグも回復する（§8.3 (C) 能動昇格。回復しないと次の永続化で
+                # 既定 False に巻き戻り、再起動を跨いだ返答待ちが passive へ落ちる）
+                if "awaiting_reply" in data and cid not in self._awaiting_map():
+                    self._awaiting_map()[cid] = bool(data["awaiting_reply"])
             except (OSError, json.JSONDecodeError, AttributeError):
                 # 壊れた永続化ファイルで会話全体を止めない。新規セッションとして進める
                 logger.exception("会話セッションの読込失敗（新規で継続）: %s", path)
@@ -245,6 +288,9 @@ class ConversationManager:
                 "last_task_id": self._last_task_id.get(cid),
                 # 直近タスクの失敗原因コード列（連続分・§8.10f 反復停止判定）
                 "failure_causes": self._causes().get(cid),
+                # taka-ma がユーザーの返答を待っているか（§8.3 (C)。u-zu が読み、true の
+                # スレッドではメンション無しの返信を能動投入する）
+                "awaiting_reply": bool(self._awaiting_map().get(cid)),
                 "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             })
         except OSError:
@@ -403,6 +449,8 @@ class ConversationManager:
         try:
             text_wo_repo, workspace, guidance = self._extract_workspace(msg["text"])
         except InvalidWorkspaceError as e:
+            # 差し戻し = 指定し直しの返答を待つ（§8.3 (C) 能動昇格）
+            self._set_awaiting(cid, True)
             self.slack.notify(
                 str(e), msg.get("channel_id"),
                 team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
@@ -438,12 +486,32 @@ class ConversationManager:
             result["ready"] = True
         else:
             result = self._invoke_llm(history_snapshot, force=False, progress=progress)
+            # ready 再検査（§8.3 細部質問の検品）: 会話継続の返信が「細部への質問」なら
+            # 1 回だけ再判定する。対象・動作が特定できる依頼に「何を書くか」を聞き返して
+            # 止まる取りこぼし（2026-08-24 E2E 実測。プロンプト規則のみでは残存 11%）の
+            # コード側安全網。再判定が ready=true+summary を返したときだけ差し替え、
+            # それ以外（依然質問・エラー）は元の応答を使う（二重生成のブレを持ち込まない）
+            if (not result.get("ready") and not result.get("probe")
+                    and not result.get("error") and result.get("reply")):
+                verdict = self._recheck_detail_question(
+                    msg["text"], result["reply"], progress=progress)
+                if verdict == "detail":
+                    logger.warning(
+                        "ready 再検査: 細部質問を検出し再判定します（reply=%.80s）",
+                        result["reply"])
+                    retry = self._invoke_llm(history_snapshot, force=False,
+                                             progress=progress, detail_retry=True)
+                    if retry.get("ready") and retry.get("summary"):
+                        result = retry
 
-        # 確認系質問（リポジトリ・ブランチ・ファイル名等の実状態）には宣言でなく実行結果を
-        # 返す（§8.3 probe）。脳 LLM は「どの実測が要るか」の選別のみを担い、返信本文は
-        # コマンド実出力から機械的に組み立てる（§8.9 と同じ規律）
+        # 確認系質問（リポジトリ実状態・進行状況）には宣言でなく実測を返す（§8.3 probe）。
+        # 脳 LLM は「どの実測が要るか」の選別のみを担い、返信本文はコマンド実出力・
+        # 実レコードから機械的に組み立てる（§8.9 と同じ規律）
         if not result.get("ready") and result.get("probe"):
-            self._answer_probe(msg)
+            if result["probe"] == "task_status":
+                self._answer_task_status(msg)
+            else:
+                self._answer_probe(msg)
             return
 
         if result.get("ready") and result.get("summary"):
@@ -460,6 +528,8 @@ class ConversationManager:
                 try:
                     _, models = self.classifier.parse_model(text_wo_repo)
                 except InvalidModelError as e:
+                    # モデル指定の差し戻し = 指定し直しの返答を待つ（§8.3 (C) 能動昇格）
+                    self._set_awaiting(cid, True)
                     self.slack.notify(
                         str(e), msg.get("channel_id"),
                         team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
@@ -476,6 +546,8 @@ class ConversationManager:
                 if not msg.get("force_ready") and contract_rules.is_repeated_cause(causes):
                     cause = causes[-1]
                     history_text = " → ".join(causes)
+                    # 不足入力の質問 = 返答待ち（§8.3 (C) 能動昇格）
+                    self._set_awaiting(cid, True)
                     self.slack.notify(
                         f"連続 2 回失敗しているため、再計画を提示しません（原因: {history_text}）。\n"
                         f"必要な入力: {contract_rules.required_input_for(cause)}\n"
@@ -485,7 +557,9 @@ class ConversationManager:
                     return
                 contract_data = self._build_contract(cid, summary, progress=progress)
                 if contract_data is None:
-                    # 契約が確定できない依頼は実行へ進めない（fail-closed・§8.10f）
+                    # 契約が確定できない依頼は実行へ進めない（fail-closed・§8.10f）。
+                    # 言い直しの返答を待つ（§8.3 (C) 能動昇格）
+                    self._set_awaiting(cid, True)
                     self.slack.notify(
                         "実行契約を確定できませんでした（命令・拘束・完了条件の抽出に失敗）。"
                         "作業リポジトリ（`repo:/絶対パス`）と、何ができたら完了かを明示して"
@@ -509,7 +583,9 @@ class ConversationManager:
                         pass  # 提案が検証を通らなければ未解決のまま（下の fail-closed へ）
                 if contract_data.get("needs_repo") and workspace is None:
                     # 着手前ブロック（§8.10f）: 実リポジトリを要するのに場所が未解決の
-                    # 依頼に着手ボタンを出さない。空作業場で走ってから気づく構造を廃する
+                    # 依頼に着手ボタンを出さない。空作業場で走ってから気づく構造を廃する。
+                    # リポジトリ指定の返答を待つ（§8.3 (C) 能動昇格）
+                    self._set_awaiting(cid, True)
                     self.slack.notify(
                         "この依頼は実リポジトリでの作業が必要ですが、作業場所が未解決です。"
                         "`repo:/絶対パス` で指定してください"
@@ -521,14 +597,33 @@ class ConversationManager:
                                   contract=contract_data, progress=progress)
         else:
             reply = result.get("reply") or "（応答を生成できませんでした。もう一度お願いします）"
+            # 進行状態の主張（「作業中です」等）は宣言のまま返さない（§8.3 グラウンディングの
+            # 安全網）。主張の有無の理解は LLM の 1 問選別（_claims_progress・言語非依存）が
+            # 担い、判定はタスクキューの実レコードのみ。主張ありで実行系タスクが無ければ
+            # 脳の返信は使わず実測文言へ差し替え、あれば実測を併記する。エラー由来の定型文は
+            # 対象外（主張を含まない・選別呼び出しのコストも掛けない）
+            grounded_replaced = False
+            if not result.get("error") and self._claims_progress(reply, progress=progress):
+                running = self._running_tasks(cid)
+                if running:
+                    reply = reply + "\n\n" + self._task_status_text(msg)
+                else:
+                    reply = self._task_status_text(msg)
+                    grounded_replaced = True
             # エラー由来の返信（タイムアウト・接続失敗等）はシステムメッセージであり会話では
             # ないため履歴に残さない。残すと後続ターンで脳がエラー文言を会話文脈として
             # オウム返しする（実機で再現・2026-07-14）。
             if not result.get("error"):
                 self._append_turn(cid, "assistant", reply)
+            # 会話継続 = ユーザーの次の発話を待つ（§8.3 (C) 能動昇格。エラー由来も
+            # 言い直しを求めており返答待ち）
+            self._set_awaiting(cid, True)
             self.slack.notify(
                 reply, msg.get("channel_id"),
                 team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
+            # 実測差し替え時は着手待ちの計画をボタン付きで再提示する（probe 経路と同じ規律）
+            if grounded_replaced:
+                self._represent_pending_plan(msg)
 
     # probe で実行する読み取り専用コマンド（§8.3「確認系質問への実測応答」で固定列挙）。
     # 任意コマンド実行の入り口にしない（脳 LLM が選べるのは probe 種別のみ・コマンドはコード固定）
@@ -571,9 +666,149 @@ class ConversationManager:
             text = "\n".join(lines)
         # 実測結果を会話履歴にも残す（後続ターンで脳が事実として参照できるようにする）
         self._append_turn(cid, "assistant", text)
+        # 実測応答後もユーザーの続きの発話を待つ（§8.3 (C) 能動昇格）
+        self._set_awaiting(cid, True)
         self.slack.notify(
             text, msg.get("channel_id"),
             team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
+
+    # ── 進行状況発言のグラウンディング（§8.3。宣言では返さず実測で返す） ──
+
+    def _running_tasks(self, cid: str) -> list[dict]:
+        """当該会話の実行系タスク（init/accepted/in_progress/pending_approval）を返す。
+
+        タスクキュー（task_dir 直下）の実レコードだけを根拠にする（LLM 不使用・§8.3）。
+        done/ failed/ へ退避済みの終端タスクは走査対象外（サブディレクトリは見ない）。
+        読めないファイルはスキップする（進行確認のために会話を止めない）。
+        """
+        tasks: list[dict] = []
+        try:
+            names = os.listdir(self.task_dir)
+        except OSError:
+            return tasks
+        for name in sorted(names):
+            if not name.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(self.task_dir, name)) as f:
+                    task = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if (task.get("conversation_id") == cid
+                    and task.get("status") in _ACTIVE_TASK_STATUSES):
+                tasks.append(task)
+        return tasks
+
+    def _task_status_text(self, msg: dict) -> str:
+        """当該会話の実行系タスクの実測テキストを組み立てる（§8.3。LLM 不使用）。
+
+        根拠はタスクキューの実レコードと着手待ちの計画（pending の確認レコード）のみ。
+        task_status probe の応答本文と、進行主張の差し替え/併記の両方で使う。
+        """
+        running = self._running_tasks(msg["conversation_id"])
+        if running:
+            lines = [f"（実測）この会話の実行系タスク {len(running)} 件:"]
+            lines += [f"- {t.get('task_id', '')[:8]}: {t.get('status')}" for t in running[:5]]
+            return "\n".join(lines)
+        text = "タスクは走っていません（実測: この会話の実行系タスク 0 件）。"
+        pendings = self._pending_confirms(msg)
+        if pendings:
+            # 件数は実数（固定文言「1 件」が実態と食い違った 2026-08-26 E2E 検出の是正）。
+            # ボタンは呼び出し側が _represent_pending_plan で手元に再提示する（文言だけの
+            # 案内で上に流れたボタンを探させない・§8.10b と同じ規律）
+            text += (f"\n着手待ちの計画が {len(pendings)} 件あります。"
+                     "最新の計画を着手ボタン付きで再提示します。")
+        return text
+
+    def _represent_pending_plan(self, msg: dict):
+        """最新の着手待ち計画を着手ボタン付きでその場に再提示する（§8.10b の再利用）。
+
+        進行状況の実測応答が「着手待ちの計画あり」と告げるとき、ボタンの実体を同じ場所へ
+        出す（提示済みメッセージはスレッド上方に流れており、文言だけの案内はボタンを
+        探させる欠陥になる — 2026-08-26 E2E 検出）。exec_request_id は変えないため、
+        どのメッセージのボタンを押しても同じ確認レコードを決着させる（訂正の再提示と同一）。
+        """
+        pending = self._pending_confirm(msg)
+        if not pending:
+            return
+        _path, record = pending
+        body = record.get("summary") or ""
+        plan = record.get("plan")
+        if plan and self.plan_service:
+            body += "\n\n" + self.plan_service.render(plan)
+        self.slack.send_plan_update(
+            record["exec_request_id"], body,
+            channel=msg.get("channel_id"), team_id=msg.get("team_id"),
+            thread_ts=msg.get("thread_ts"))
+
+    def _answer_task_status(self, msg: dict):
+        """進行状況の質問に実測で答える（§8.3 probe="task_status"。宣言は返さない）。
+
+        返信本文は _task_status_text（実レコードのみ）で組み立て、脳 LLM の生成テキストは
+        使わない（repo_status probe・§8.9 と同じ規律）。実測結果は会話履歴にも残す。
+        """
+        cid = msg["conversation_id"]
+        text = self._task_status_text(msg)
+        self._append_turn(cid, "assistant", text)
+        # 実測応答後もユーザーの続きの発話を待つ（§8.3 (C) 能動昇格）
+        self._set_awaiting(cid, True)
+        self.slack.notify(
+            text, msg.get("channel_id"),
+            team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
+        # 実行系タスクが無く着手待ちの計画があるときは、ボタンの実体を手元に出す
+        # （文言だけの案内でボタンを探させない・§8.10b）
+        if not self._running_tasks(cid):
+            self._represent_pending_plan(msg)
+
+    def _claims_progress(self, reply: str, progress: GenerationProgress | None = None) -> bool:
+        """返信が「進行中の作業がある」と主張しているかを脳 LLM の 1 問で選別する（§8.3）。
+
+        言語理解は LLM の仕事であり、語列挙の正規表現は使わない（活用形・言い換え・英語を
+        取りこぼした 2026-08-25 E2E FAIL の是正）。ここは選別のみで、事実判定（タスク実在）は
+        _running_tasks が担う。選別不能（パース不能・LLM 不達）は素通し（従来動作）へ縮退し、
+        warning で発生率を観測する — 選別失敗で返信を全置換する誤爆より安全側。
+        """
+        prompt = self._progress_claim_template.replace("{reply}", reply)
+        try:
+            stdout = run_ollama(self.model, prompt, timeout=self.timeout,
+                                host=self.ollama_host, think=self.think,
+                                progress=progress)
+            try:
+                parsed = json.loads(extract_json(stdout))
+            except json.JSONDecodeError:
+                parsed = json.loads(extract_json(repair_json_escapes(stdout)))
+            return parsed.get("claims_progress") is True
+        except (json.JSONDecodeError, OllamaTimeoutError, OllamaConnectionError) as e:
+            logger.warning("進行主張の選別に失敗（素通しへ縮退）: %s", e)
+            return False
+
+    def _recheck_detail_question(self, message_text: str, reply: str,
+                                 progress: GenerationProgress | None = None) -> str:
+        """会話継続の返信が「細部への質問」かを脳 LLM の 1 問で選別する（§8.3 細部質問の検品）。
+
+        対象・動作が特定できる依頼に「何を書くか」等の細部を聞き返して止まる取りこぼし
+        （2026-08-24 E2E で実測・プロンプト規則のみでは残存 11% を分離実測）の安全網。
+        言語理解は LLM の仕事であり、語列挙の正規表現・記号判定は使わない（質問形の
+        判定さえ言語・文体依存のため置かない。「〜ください。」で終わる聞き返しを実測）。
+        返り値は "detail" / "essential" / "other"。選別不能（パース不能・LLM 不達）は
+        "other"（素通し＝従来動作）へ縮退し、warning で発生率を観測する。
+        """
+        prompt = (self._ready_recheck_template
+                  .replace("{message}", message_text).replace("{reply}", reply))
+        try:
+            stdout = run_ollama(self.model, prompt, timeout=self.timeout,
+                                host=self.ollama_host, think=self.think,
+                                progress=progress)
+            try:
+                parsed = json.loads(extract_json(stdout))
+            except json.JSONDecodeError:
+                parsed = json.loads(extract_json(repair_json_escapes(stdout)))
+            # JSON としては妥当でも object でない出力（配列・文字列等）は契約外 → other
+            verdict = parsed.get("verdict") if isinstance(parsed, dict) else None
+            return verdict if verdict in ("detail", "essential", "other") else "other"
+        except (json.JSONDecodeError, OllamaTimeoutError, OllamaConnectionError) as e:
+            logger.warning("ready 再検査の選別に失敗（素通しへ縮退）: %s", e)
+            return "other"
 
     def _set_last_workspace(self, cid: str, workspace: str):
         """会話の「直近タスクの workspace」を記録し、セッションと一緒に永続化する（§8.3 probe）。"""
@@ -609,6 +844,8 @@ class ConversationManager:
         # ターンで脳が文脈としてオウム返しする・handle_message のエラー経路と同じ規律）
         if not error:
             self._append_turn(cid, "assistant", reply)
+            # 中止の決着報告で返答待ちは解ける（§8.3 (C)。続きの依頼はメンションで受ける）
+            self._set_awaiting(cid, False)
         self.slack.notify(
             reply, msg.get("channel_id"),
             team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
@@ -668,6 +905,8 @@ class ConversationManager:
         self._append_turn(
             cid, "assistant",
             f"（タスク実行完了。結果の要約は以下、全文は結果ファイル {result_path} にあります）\n{summary}")
+        # 完了還流で返答待ちは解ける（§8.3 (C)。続きの依頼はメンションで受ける）
+        self._set_awaiting(cid, False)
 
     @staticmethod
     def _coerce_ready(parsed: dict) -> bool:
@@ -703,7 +942,8 @@ class ConversationManager:
         return ready
 
     def _invoke_llm(self, history: list[dict], force: bool,
-                    progress: GenerationProgress | None = None) -> dict:
+                    progress: GenerationProgress | None = None,
+                    detail_retry: bool = False) -> dict:
         """脳 LLM（sa-ru.model）を呼び、{reply, ready, summary} を返す。
 
         パース失敗時は会話継続（ready=false）にフォールバックし、素の stdout を返信に回す
@@ -725,6 +965,18 @@ class ConversationManager:
                 "\n\n## 指示\n"
                 "ユーザーが明示的に実行を指示しました。会話が短くても、これまでの会話から意図を読み取り、"
                 "ready=true として summary に実行指示をまとめてください。"
+            )
+        if detail_retry:
+            # ready 再検査（§8.3 細部質問の検品）の再判定。直前の応答が細部への質問と
+            # 選別されたときだけ 1 回付く。force と違い ready=true を強制しない — 対象・
+            # 動作が本当に特定できないなら質問し直す余地を残す（誤検品の安全側）
+            prompt += (
+                "\n\n## 指示\n"
+                "あなたは直前に、実装の細部（書く内容・文言・書式・ブランチ名・コミットメッセージ等）を"
+                "尋ねる質問を返そうとしました。細部への質問は禁止です。対象と動作が発話から特定できる"
+                "なら、質問せず ready=true として summary に実行指示をまとめてください（細部は worker が"
+                "妥当な既定で決めます）。対象か動作そのものが特定できない場合のみ、それを確かめる質問を"
+                "返してください。"
             )
 
         stdout = None
@@ -748,14 +1000,14 @@ class ConversationManager:
                 parsed = json.loads(extract_json(stdout))
             except json.JSONDecodeError:
                 parsed = json.loads(extract_json(repair_json_escapes(stdout)))
-            # probe は許可値のみ通す（コマンドはコード側 _PROBE_COMMANDS で固定。脳 LLM の
-            # 出力を任意コマンド実行に接続しない・§8.3「確認系質問への実測応答」）
+            # probe は許可値のみ通す（応答の組み立てはコード側で固定。脳 LLM の
+            # 出力を任意コマンド実行・任意動作に接続しない・§8.3「確認系質問への実測応答」）
             probe = parsed.get("probe")
             return {
                 "reply": parsed.get("reply", ""),
                 "ready": self._coerce_ready(parsed),
                 "summary": parsed.get("summary"),
-                "probe": probe if probe == "repo_status" else None,
+                "probe": probe if probe in _PROBE_KINDS else None,
             }
         except json.JSONDecodeError:
             # JSON 化できない出力は会話継続に回す（解釈できない出力で実行へ進めない）
@@ -855,8 +1107,21 @@ class ConversationManager:
 
         done/ 等のサブディレクトリは走査しない（決着済みは訂正対象にならない）。
         """
-        if not os.path.isdir(self.confirm_dir):
+        found = self._pending_confirms(msg)
+        if not found:
             return None
+        _, path, record = max(found)
+        return path, record
+
+    def _pending_confirms(self, msg: dict) -> list[tuple]:
+        """提示中（pending）の確認レコード群を (created_at, path, record) で返す。
+
+        照合規則は _pending_confirm の 2 段階と同一（スレッド一致を優先し、無いときだけ
+        同一会話面へ落とす）。件数は進行状況の実測応答が実数で報告する（§8.3。固定文言
+        「1 件」が実態 2 件と食い違った 2026-08-26 E2E 検出の是正）。
+        """
+        if not os.path.isdir(self.confirm_dir):
+            return []
         cid = msg.get("conversation_id")
         same_cid, same_channel = [], []
         for name in os.listdir(self.confirm_dir):
@@ -877,13 +1142,7 @@ class ConversationManager:
                     and record.get("channel_id") == msg.get("channel_id")
                     and record.get("user_id") == msg.get("user_id")):
                 same_channel.append(entry)
-        # 同一会話の pending が複数並存し得る（決着させず会話を続けた場合）。最新を対象にする。
-        # スレッド一致を優先し、無いときだけ同一会話面の最新へ落とす
-        found = same_cid or same_channel
-        if not found:
-            return None
-        _, path, record = max(found)
-        return path, record
+        return same_cid or same_channel
 
     def _handle_correction(self, msg: dict, progress=None) -> bool:
         """提示済みプランへの訂正として処理できたら True を返す（会話処理はスキップ）。
@@ -940,6 +1199,8 @@ class ConversationManager:
         else:
             # 自然言語・音声は取り違え（sonnet ↔ opus 等）を 1 往復で捕捉するため差分のみ返す
             body = "【変更】\n" + "\n".join(echo)
+        # 訂正の再提示もユーザーの決定（着手/さらに訂正）待ち（§8.3 (C) 能動昇格）
+        self._set_awaiting(msg.get("conversation_id") or "", True)
         # 更新後の計画は着手ボタン付きで再提示する。訂正を重ねると最初の提示メッセージが
         # 上へ流れ、押すべきボタンを探させることになるため（§8.10b）。exec_request_id は
         # 変えないので、どのメッセージのボタンを押しても同じ確認レコードを決着させる
@@ -1027,6 +1288,8 @@ class ConversationManager:
         if contract is not None:
             # 契約は空でも「なし」を明示する（§8.10f。見えていない契約は承認されない）
             kwargs["contract_text"] = self._format_contract(contract)
+        # 計画提示 = 着手/訂正の返答待ち（§8.3 (C) 能動昇格。訂正はスレッド返信で届く）
+        self._set_awaiting(msg["conversation_id"], True)
         self.slack.send_exec_confirm_request(exec_request_id, summary, **kwargs)
 
     @staticmethod
@@ -1112,6 +1375,8 @@ class ConversationManager:
         if cid:
             with self._sessions_lock:
                 self._last_task_id[cid] = task_id
+        # 着手で返答待ちは解ける（§8.3 (C)。実行中スレッドの非メンション返信は passive）
+        self._set_awaiting(cid, False)
         # 実行 workspace を会話に紐付ける（§8.3 probe。repo: 指定が無ければ既定の
         # {workspace_base}/{task_id} — Orchestrator._workspace_for と同じ解決規則）
         self._set_last_workspace(
@@ -1158,6 +1423,8 @@ class ConversationManager:
 
     def notify_rejected(self, record: dict):
         """やり直し選択時。実行はせず会話継続を促す（履歴は維持される）。"""
+        # 「続けて指示してください」= 次の指示の返答待ち（§8.3 (C) 能動昇格）
+        self._set_awaiting(record.get("conversation_id") or "", True)
         self.slack.notify(
             "やり直します。続けて指示してください。",
             record.get("channel_id"), team_id=record.get("team_id"),

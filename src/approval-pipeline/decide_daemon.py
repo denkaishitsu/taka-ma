@@ -39,6 +39,14 @@ logger = logging.getLogger("decide-daemon")
 # `grep -n "task-deny" src/orchestrator/config/sa-ru.yaml src/approval-pipeline/decide_daemon.py`
 # で両側一致を確認する）
 _TASK_DENY_DIR = os.environ.get("TAKA_MA_TASK_DENY_DIR", "/opt/taka-ma/data/task-deny")
+# 環境改変コマンドの既定 deny（§8.10f 事前予防）。worker の勝手な環境改変（push 不能への
+# git init 等）は作業場を書き換えて失敗原因コードをズラし、反復停止（連続 2 回失敗）の検出を
+# 撹乱するため（2026-08-24 実測）、タスク別規則の有無にかかわらず全タスクで deny する。
+# 契約 directive（人が着手確認で承認した逐語命令）に含まれる場合のみ、sa-ru が task-deny
+# 規則へ書く allow_env が優先する。orchestrator/contract.py の ENV_MUTATION_COMMANDS と
+# 同一リストであること（grep で両端一致を確認する）
+_ENV_MUTATION_DENY = ("git init", "git remote add", "git remote set-url",
+                      "git remote remove", "git config")
 # deny ファイル名に使う task_id の受理形式（パス区切り・親参照でディレクトリ外を読まない）
 _TASK_ID_RE = re.compile(r"\A[A-Za-z0-9-]+\Z")
 
@@ -187,18 +195,25 @@ class DecideDaemon:
         照合は大文字小文字を無視した部分文字列一致（LLM を使わない決定的判定）。
         ファイル不在・破損は規則なしとして通常判定へ進む（deny は追加の防壁）。
         """
-        if not task_id or not _TASK_ID_RE.match(task_id):
-            return None
         if pending.tool_name != "Bash":
             return None
         command = str((pending.tool_input or {}).get("command") or "")
         if not command:
             return None
-        try:
-            with open(os.path.join(_TASK_DENY_DIR, f"{task_id}.json")) as f:
-                rule = json.load(f)
-        except (OSError, json.JSONDecodeError):
-            return None
+        # タスク別規則ファイル。不在・破損・task_id 不正は「規則なし」（deny は追加の防壁）。
+        # ただし既定 deny（環境改変系）は規則の有無にかかわらず適用する — 規則が読めない
+        # 状況で allow だけ消えて deny も消える、という非対称を作らない
+        rule: dict = {}
+        if task_id and _TASK_ID_RE.match(task_id):
+            try:
+                with open(os.path.join(_TASK_DENY_DIR, f"{task_id}.json")) as f:
+                    rule = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                rule = {}
+            if not isinstance(rule, dict):
+                # JSON としては妥当でも object でない内容（配列等）は破損と同じ「規則なし」
+                # 扱い（.get の AttributeError で全コマンド deny に化けさせない）
+                rule = {}
         patterns = rule.get("patterns") or []
         sources = rule.get("sources") or []
         lowered = command.lower()
@@ -206,6 +221,17 @@ class DecideDaemon:
             if isinstance(pat, str) and pat.strip() and pat.strip().lower() in lowered:
                 source = f"（拘束: {sources[0]}）" if sources else ""
                 return f"タスクの禁止型拘束に一致するため拒否: {pat.strip()} {source}".strip()
+        # 既定 deny（§8.10f 環境改変系）。契約 directive 由来の allow_env（人が着手確認で
+        # 承認した逐語命令に含まれる環境改変コマンド）に載っているものだけ通す。
+        # 照合は空白正規化ずみ（"git  init" 等の空白差で素通しさせない。`git -C x init` の
+        # ような語順変形は検出しない既知の限界 — 遵守照合・完了条件検査の多層で補う）
+        normalized = " ".join(lowered.split())
+        allow_env = {" ".join(a.lower().split()) for a in (rule.get("allow_env") or [])
+                     if isinstance(a, str)}
+        for pat in _ENV_MUTATION_DENY:
+            if pat in normalized and pat not in allow_env:
+                return (f"環境改変コマンドの既定 deny に一致するため拒否: {pat}"
+                        "（人が承認した命令に含まれる場合のみ許可されます）")
         return None
 
     async def start(self):
