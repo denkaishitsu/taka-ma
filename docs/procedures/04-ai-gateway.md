@@ -25,14 +25,14 @@
 
 ## 概要
 
-ya-ta はタスクの分解・分類・リスク判定を行う AI ルーティングエンジン。sa-ru から Python ライブラリとして import され、推論は ollama API 経由で DeepSeek-R1 32B が行う（設計書 §8.4）。
+ya-ta はタスクの分解・分類・リスク判定を行う AI ルーティングエンジン。sa-ru から Python ライブラリとして import され、推論は ollama API 経由で Qwen3.8 27B が行う（設計書 §8.4）。
 
 #### アーキテクチャ
 
 ```
 sa-ru (Python プロセス)
   ├── ya-ta (ライブラリ import)
-  │     └── ollama API → DeepSeek-R1 32B（推論）
+  │     └── ollama API → Qwen3.8 27B（推論）
   ├── TaskDecomposer  : タスク分解（DAG 生成）
   ├── TaskClassifier  : 難易度判定 + モデル指定解析
   └── RiskClassifier  : y/n 承認リスク判定
@@ -53,14 +53,14 @@ Mac mini M4 Pro (64GB)
 
 ### Step 1: 手動準備（PyInfra 実行前）
 
-#### 1-1. 分解脳モデル（Qwen3.6-27B）のダウンロード
+#### 1-1. 分解脳モデル（Qwen3.8-27B）のダウンロード
 
 ya-ta の推論モデルを Mac mini の ollama に取得する。サイズが大きく時間がかかるため、PyInfra から分離する。モデル名の正本は [`ya-ta.yaml`](../../src/ai_gateway/config/ya-ta.yaml) の `model`。
 
 ```bash
-ssh mac-mini "ollama pull qwen3.6:27b-q4_K_M"
-ssh mac-mini "ollama list | grep qwen3.6:27b"
-# → qwen3.6:27b-q4_K_M  約17GB
+ssh mac-mini "ollama pull qwen3.8:27b"
+ssh mac-mini "ollama list | grep qwen3.8:27b"
+# → qwen3.8:27b  約17GB
 ```
 
 #### 1-2. num_ctx の 32K 縮小（OOM 回避）— Step 2 の PyInfra が自動実行
@@ -69,7 +69,7 @@ ya-ta は Mac mini 64GB に sa-ru と同居する。既定だとモデル上限�
 
 初期投入後の検証:
 ```bash
-ssh mac-mini "ollama run qwen3.6:27b-q4_K_M hi >/dev/null; ollama ps; ollama stop qwen3.6:27b-q4_K_M"
+ssh mac-mini "ollama run qwen3.8:27b hi >/dev/null; ollama ps; ollama stop qwen3.8:27b"
 # → CONTEXT 32768 を確認。SIZE（実常駐）は §7.4 ランブックに従い model_capacity.yaml へ記録
 ```
 
@@ -130,7 +130,7 @@ import sys, json
 sys.path.insert(0, '/opt/taka-ma/ya-ta')
 from ai_gateway.decomposer import TaskDecomposer
 
-config = {'ya-ta': {'model': 'qwen3.6:27b-q4_K_M', 'llm_timeout_sec': 300}, 'models': {'opus': {}, 'gemini': {}, 'sonnet': {}, 'haiku': {}, 'gemma': {}}}
+config = {'ya-ta': {'model': 'qwen3.8:27b', 'llm_timeout_sec': 300}, 'models': {'opus': {}, 'gemini': {}, 'sonnet': {}, 'haiku': {}, 'gemma': {}}}
 d = TaskDecomposer(config)
 
 r = d.decompose('このJSONをYAMLに変換して')
@@ -157,7 +157,7 @@ sys.path.insert(0, '/opt/taka-ma/ya-ta')
 from ai_gateway.classifier import TaskClassifier, InvalidModelError
 
 config = {
-    'ya-ta': {'model': 'qwen3.6:27b-q4_K_M', 'llm_timeout_sec': 300},
+    'ya-ta': {'model': 'qwen3.8:27b', 'llm_timeout_sec': 300},
     'models': {
         'opus': {'capabilities': ['code', 'reasoning']},
         'sonnet': {'capabilities': ['code', 'reasoning']},
@@ -198,7 +198,7 @@ import sys, json
 sys.path.insert(0, '/opt/taka-ma/ya-ta')
 from ai_gateway.risk_classifier import RiskClassifier
 
-config = {'ya-ta': {'model': 'qwen3.6:27b-q4_K_M', 'llm_timeout_sec': 300}}
+config = {'ya-ta': {'model': 'qwen3.8:27b', 'llm_timeout_sec': 300}}
 rc = RiskClassifier(config)
 
 print('Tier 1:', json.dumps(rc.classify('cat src/readme.md'), ensure_ascii=False))
@@ -253,7 +253,7 @@ Slack で `/taka-ma-task プロジェクトを解析して :gemini、問題点�
 | 16 | `ya-ta.yaml` の `models` セクションに全登録モデルが定義されている | Step 2 |
 | 17 | `ya-ta.yaml` の `models` に `methods`（配列）/ `command` / `model_flag` が定義されている | Step 2 |
 | 18 | `/exam_gw` 付きタスク → 分解・分類結果のみ Slack に返却、タスク未実行 | 動作確認 5 |
-| 19 | `deepseek-r1:32b` に `num_ctx 32768` が焼き込まれている（`ollama ps` で CONTEXT 32768 / SIZE 約26GB、OOM 回避） | Step 1 |
+| 19 | `qwen3.8:27b` に `num_ctx 32768` が焼き込まれている（`ollama ps` で CONTEXT 32768 / SIZE 約18GB、OOM 回避） | Step 1 |
 
 ## 主要 API（実装本体への索引）
 
@@ -324,7 +324,9 @@ Slack で `/taka-ma-task プロジェクトを解析して :gemini、問題点�
 ### メモリ配分（Mac mini 64GB、参考）
 
 ```
-sa-ru (Gemma 4 12B Q4):     8.7GB（実測 2026-06-20、重み 7.6 + KV 1.1、num_ctx 40960・q8_0）
-ya-ta (DeepSeek-R1 32B Q4): ~20GB  ← sa-ru と同一プロセスだがモデルは ollama が管理
-OS + バッファ:              ~26GB
+sa-ru (Qwen3.6-35B-A3B Q4): 23GB（実測 2026-08-26、重み 23 + KV ≒0、num_ctx 32768。22〜23 で揺れるため安全側）
+ya-ta (Qwen3.8 27B):        18GB（実測 2026-08-26、重み 16.8 + KV 1.2、num_ctx 32768）← sa-ru と同一プロセスだがモデルは ollama が管理
+OS + バッファ:              ~23GB
+
+（値の正本は model_capacity.yaml。§7.4 ランブックで実測維持）
 ```

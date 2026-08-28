@@ -47,7 +47,7 @@
 | LLM | 区分 | 配置 | 担うコンポーネント | 用途 |
 |-----|------|------|------------------|------|
 | **Gemma 4 12B** | ローカル常駐（マルチモーダル） | Mac mini | sa-ru | オーケストレーション（stdout 文脈抽出・stdin 制御）・人間との音声/画像/テキスト会話 |
-| **DeepSeek-R1 32B** | ローカル（差し替え可） | Mac mini | ya-ta | タスク難易度判定・最適モデル選択 |
+| **Qwen3.8 27B** | ローカル（差し替え可） | Mac mini | ya-ta | タスク難易度判定・最適モデル選択 |
 | **Gemma 4 31B** | ローカル | MBP | light worker | 軽量タスク（質問応答・フォーマット変換等） |
 | **Claude Opus 5** | API (ProMax) | MBP (Claude Code ×N) | heavy worker | 要件定義・設計・実装・テスト（最難関は Fable 5 を `:fable` で明示指定） |
 | **Gemini 3.6 Flash**（agy 既定） | API (Pro) | MBP | heavy worker | マルチモーダル・フォールバック・cross-review。**初期リリースは Flash 固定** |

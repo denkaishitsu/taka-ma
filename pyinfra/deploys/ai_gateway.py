@@ -23,7 +23,7 @@ ensure_brew_path()
 # 未マージ worktree からの配備はマージ済み修正を巻き戻すため停止（#141・_guard.py 参照）。
 ensure_merged_head()
 
-# Step 1: DeepSeek-R1 32B ダウンロード（モデル名は ya-ta.yaml を単一ソースとして参照 — Task #26）
+# Step 1: 分解脳モデル ダウンロード（モデル名は ya-ta.yaml を単一ソースとして参照 — Task #26）
 # モデルは component="models" で記録（host グローバルな ollama rm のため、
 # 他デプロイが同一モデルを宣言しても upsert で 1 レコードに集約）。
 _ya_ta_conf = yaml.safe_load(Path("src/ai_gateway/config/ya-ta.yaml").read_text())["ya-ta"]
