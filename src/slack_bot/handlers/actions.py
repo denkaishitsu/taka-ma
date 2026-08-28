@@ -39,12 +39,16 @@ def _enqueue_audit_reject_task(record: dict, user: str, team_id: str) -> str:
     command = (
         f"path '{path}' の変更を revert し、関連タスクのプロセスを停止すること"
     )
+    # 変更が起きた実リポジトリを revert タスクへ引き継ぐ（§8.10g。workspace 無しだと
+    # sa-ru が使い捨て作業場を割り当て、revert 対象の実リポジトリを見失う —
+    # 2026-08-27 実測）。アラートに workspace が無い旧レコードは従来動作に縮退する
     return enqueue_task(
         "slack_action", command,
         user_id=user,
         team_id=team_id,
         channel_id=record.get("channel_id", ""),
-        thread_ts=record.get("thread_ts"))
+        thread_ts=record.get("thread_ts"),
+        workspace=record.get("workspace") or None)
 
 
 def register_actions(app):

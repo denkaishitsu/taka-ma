@@ -221,7 +221,7 @@ class GroundingVerifier:
         causes: list[str] = []
 
         # リポジトリ系検査の前提（git リポジトリであること）を 1 回だけ確認する
-        repo_kinds = {"pushed", "remote_file", "head_touches", "diff_limit"}
+        repo_kinds = {"pushed", "remote_file", "head_touches", "diff_limit", "branch_merged"}
         is_repo = None
         if any(a.get("kind") in repo_kinds for a in acceptance):
             rc, _ = self._probe(lines, f"git -C {ws} rev-parse --is-inside-work-tree")
@@ -341,6 +341,19 @@ class GroundingVerifier:
                             f"diff_limit 未達（変更 {total} 行 > 上限 {params['max_lines']} 行"
                             f"{'・対象 ' + path_filter if path_filter else ''}）")
                         causes.append("acceptance_failed:diff_limit")
+
+            elif kind == "branch_merged":
+                # マージ完了の実測（§8.10g）: source 先端が target の祖先（含まれている）か。
+                # fast-forward 後は両者同一先端で ancestor 判定が真になる
+                src = shlex.quote(params["source"])
+                tgt = shlex.quote(params["target"])
+                rc, _ = self._probe(
+                    lines, f"git -C {ws} merge-base --is-ancestor {src} {tgt}")
+                if rc != 0:
+                    problems.append(
+                        f"branch_merged 未達（{params['source']} は {params['target']} に"
+                        "取り込まれていない）")
+                    causes.append("acceptance_failed:branch_merged")
 
             else:
                 problems.append(f"未知の検査 kind: {kind}")

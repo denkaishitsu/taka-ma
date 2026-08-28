@@ -59,6 +59,7 @@ def _manager(tmp_dir):
                          "history_head_turns": 4, "history_tail_turns": 16},
         "task_context": {"workspace_base": "/opt/taka-ma/work",
                          "worker_home": "/Users/dev"},
+        "ya-ta": {"model": "dummy", "llm_timeout_sec": 60},
         "contract": {"intents_dir": tempfile.mkdtemp(prefix="intents-")},
     }
     return ConversationManager(config, _FakeNotifier(), task_dir=tmp_dir)

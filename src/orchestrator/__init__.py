@@ -42,6 +42,7 @@ from orchestrator.headless_runner import WorkerHeadlessRunner, build_hook_settin
 from orchestrator.preflight import AuthPreflight, PreflightFailure
 from orchestrator import contract as contract_rules
 from orchestrator import intent_store
+from orchestrator import runbook as runbook_rules
 from orchestrator.concurrency import DynamicConcurrencyLimiter
 from orchestrator.conversation import ConversationManager
 from orchestrator.grounding import GroundingReport, GroundingVerifier
@@ -1357,12 +1358,32 @@ class Orchestrator:
         except Exception:
             logger.exception("goal 更新・再検査に失敗（実行結果へは波及させない）: %s", task_id)
 
+    def _run_runbook_step(self, task: dict, subtask: dict) -> str:
+        """runbook step を決定的に実行する（同期・to_thread で呼ぶ。§8.10g）。
+
+        実行した状態変更コマンドは遵守照合の記録（_executed）へ worker と同様に積む
+        （§8.10f。runbook レーンでも「何を実行したか」の機械記録を欠かさない）。
+        前提不成立・実行失敗・事後未達は RunbookError（cause 付き）がそのまま伝播し、
+        _failure_cause_from_error が原因コードへ写す。
+        """
+        workspace = self._resolve_workspace(task)
+        rb = subtask["_runbook"]
+        executed, text = runbook_rules.run_step(
+            self.process_mgr.run_ssh_probe, workspace, rb["kind"], rb["params"])
+        task_id = task.get("task_id", "")
+        if executed and task_id:
+            self._executed().setdefault(task_id, []).extend(executed)
+        return text
+
     @staticmethod
     def _failure_cause_from_error(exc: BaseException) -> str:
         """例外から機械可読の失敗原因コードを導出する（§8.10f。LLM を使わない）。"""
         if isinstance(exc, PreflightFailure):
             return {"ssh": "ssh_unreachable", "git": "git_remote_unreachable",
                     "anthropic": "anthropic_auth"}.get(exc.kind, "worker_error")
+        if isinstance(exc, runbook_rules.RunbookError):
+            # runbook の前提不成立・実行失敗（§8.10g）。コードは例外自身が持つ
+            return exc.cause
         if "timeout" in str(exc).lower():
             return "worker_timeout"
         return "worker_error"
@@ -1580,6 +1601,21 @@ class Orchestrator:
                     raise RuntimeError(
                         f"依存先 Step {dep} が失敗したためスキップ") from dep_err
                 dep_results.append(f"Step {dep}: {results[dep]}")
+
+            # runbook（§8.10g 決定的実行）: worker LLM を通さず、承認済みの組立コマンド列を
+            # sa-ru のコードが直接実行する。依存結果の前置・拘束ブロック・モデル写像は
+            # 通らない（プロンプトが存在しないため）。前提・事後の実測は runbook 側が行う
+            if execution == "runbook" and subtask.get("_runbook"):
+                await self._notify(
+                    f"  サブタスク {step}: runbook（決定的実行）", channel,
+                    team_id=task.get("team_id"), thread_ts=task.get("thread_ts"))
+                output = await asyncio.to_thread(self._run_runbook_step, task, subtask)
+                results[step] = output
+                futures[step].set_result(output)
+                await self._notify(f"  サブタスク {step}/{len(futures)} 完了", channel,
+                                  team_id=task.get("team_id"),
+                                  thread_ts=task.get("thread_ts"))
+                return
 
             # 依存ステップの結果を入力に組み込む
             if dep_results:

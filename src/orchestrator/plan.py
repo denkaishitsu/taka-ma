@@ -20,6 +20,8 @@ WEIGHT_INLINE = "機械的"
 WEIGHT_SHALLOW = "軽"
 WEIGHT_UNSPECIFIED = "中"
 WEIGHT_DEEP = "重"
+# runbook（§8.10g 決定的実行）: モデル解決を通らない（LLM が居ない）ため専用ラベル
+WEIGHT_RUNBOOK = "決定的"
 
 # 深さ語 → depth 値（簡易記法・訂正の日本語入力用）。None は「省略」（写像の unspecified）。
 DEPTH_WORDS = {
@@ -94,6 +96,22 @@ def build_view(subtasks: list[dict], resolve) -> list[dict]:
     for s in subtasks:
         execution = s.get("execution", "agent")
         depth = s.get("depth")
+        if execution == "runbook":
+            # 決定的実行（§8.10g）。モデル写像を通さない（worker LLM が存在しない）
+            view.append({
+                "step": s["step"],
+                "overview": s.get("command", ""),
+                "execution": execution,
+                "depth": None,
+                "weight": WEIGHT_RUNBOOK,
+                "model": None,
+                "escalation": [],
+                "user_specified": False,
+                "overridden": False,
+                "wave": wave_of.get(s["step"], 1),
+                "parallel": width_of.get(s["step"], 1),
+            })
+            continue
         lane, candidates, user_specified = resolve(
             execution, depth, s.get("confidence"),
             s.get("model"), s.get("model_override"))
@@ -115,6 +133,8 @@ def build_view(subtasks: list[dict], resolve) -> list[dict]:
 
 def _model_display(item: dict) -> str:
     """1 サブタスクのモデル欄を組み立てる（実体名 + 由来 + 昇格先）。"""
+    if item["execution"] == "runbook":
+        return "なし（決定的実行・§8.10g）"
     model = item["model"] or "（候補なし — matrix 不備）"
     if item["user_specified"]:
         return f"{model}（明示指定・昇格なし）"

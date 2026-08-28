@@ -17,17 +17,20 @@
 """
 
 import datetime
+import glob
 import json
 import logging
 import os
 import re
 import shlex
+import subprocess
 import threading
 import time
 import uuid
 from pathlib import Path
 
 from ai_gateway.classifier import InvalidModelError
+from ai_gateway.contractor import Contractor
 from ai_gateway.llm import (
     GenerationProgress,
     OllamaConnectionError,
@@ -38,7 +41,9 @@ from ai_gateway.llm import (
 )
 from orchestrator import contract as contract_rules
 from orchestrator import intent_store
+from orchestrator import runbook as runbook_rules
 from orchestrator.file_queue import atomic_write_json
+from orchestrator.grounding import GroundingVerifier
 
 logger = logging.getLogger("sa-ru.conversation")
 
@@ -186,8 +191,12 @@ class ConversationManager:
         contract_conf = config.get("contract") or {}
         self._contract_enabled = bool(contract_conf)
         self.intents_dir = contract_conf.get("intents_dir")
-        self._contract_template = (
-            (PROMPTS_DIR / "contract.md").read_text() if self._contract_enabled else None)
+        # 契約化の実行主体は ya-ta（§8.4「契約化の呼び出し」。会話脳での契約化は
+        # 構造化出力が実測で不安定だったため移管 — 2026-08-28 E2E）。上位モデルでの
+        # 再契約化（§8.4.x (e) 昇格ラダー）の実行手段はこちら（sa-ru）が注入する
+        self.contractor = (
+            Contractor(config, escalate_runner=self._contract_escalation_runner)
+            if self._contract_enabled else None)
         # conversation_id → 直近タスクの失敗原因コード列（連続分のみ・§8.10f 反復停止判定）。
         # セッション永続化ファイルにも保存し、再起動をまたいで反復を見失わない
         self._failure_causes: dict[str, list[str]] = {}
@@ -593,6 +602,20 @@ class ConversationManager:
                         msg.get("channel_id"),
                         team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
                     return
+                # open の過去依頼を世界に対して再検査する（§8.10g。後追い達成の機械検出）
+                self._recheck_open_intents(cid, msg)
+                # ── 再入 reconcile（§8.10g）: 着手確認を出す前に完了条件を実測する。
+                # 全 PASS なら計画を出さず実測報告で止まる（同一計画の再提示ループを
+                # 構造的に遮断 — 2026-08-27 インシデントの再発防止）。/taka-ma-go
+                # （force_ready）は「達成済みでも再実行せよ」の明示エスケープとして
+                # reconcile を通過させる（反復停止ゲートと同じ規律） ──
+                if not msg.get("force_ready"):
+                    pre_satisfied = self._reconcile_acceptance(
+                        cid, contract_data, workspace, msg)
+                    if pre_satisfied is None:
+                        return
+                    if pre_satisfied:
+                        contract_data["_pre_satisfied"] = pre_satisfied
             self._present_summary(msg, summary, models, workspace,
                                   contract=contract_data, progress=progress)
         else:
@@ -603,7 +626,16 @@ class ConversationManager:
             # 脳の返信は使わず実測文言へ差し替え、あれば実測を併記する。エラー由来の定型文は
             # 対象外（主張を含まない・選別呼び出しのコストも掛けない）
             grounded_replaced = False
-            if not result.get("error") and self._claims_progress(reply, progress=progress):
+            claims = ({"progress": False, "state": False} if result.get("error")
+                      else self._claims_check(reply, progress=progress))
+            if claims["state"]:
+                # 実行状態の主張（実行した/していない・マージ/push の済/未 等）は、実行系
+                # タスクの有無にかかわらず**全置換**する（§8.10g 状態主張ゲート。2026-08-27
+                # インシデント: 実マージ済みの状態で脳が会話記憶から「マージしていない」と
+                # 虚偽回答 — 当時は実行系タスクが在ったため併記経路に落ち、虚偽が画面に出た）
+                reply = self._task_status_text(msg) + "\n\n" + self._probe_block(cid)
+                grounded_replaced = True
+            elif claims["progress"]:
                 running = self._running_tasks(cid)
                 if running:
                     reply = reply + "\n\n" + self._task_status_text(msg)
@@ -625,45 +657,123 @@ class ConversationManager:
             if grounded_replaced:
                 self._represent_pending_plan(msg)
 
-    # probe で実行する読み取り専用コマンド（§8.3「確認系質問への実測応答」で固定列挙）。
-    # 任意コマンド実行の入り口にしない（脳 LLM が選べるのは probe 種別のみ・コマンドはコード固定）
+    # probe で実行する読み取り専用コマンド（§8.3「確認系質問への実測応答」で固定列挙・
+    # §8.10g で拡張）。任意コマンド実行の入り口にしない（脳 LLM が選べるのは probe 種別のみ・
+    # コマンドはコード固定）。--porcelain / for-each-ref の機械形式は機械判定行の導出元
+    # （_derive_repo_verdicts）と共有するため、書式を変えるときは両方を同時に見ること
     _PROBE_COMMANDS = ("git -C {ws} remote -v",
                        "git -C {ws} rev-parse --abbrev-ref HEAD",
+                       "git -C {ws} status --porcelain",
+                       "git -C {ws} for-each-ref refs/heads "
+                       "--format='%(refname:short) %(objectname:short) %(upstream:track)'",
+                       "git -C {ws} branch --format='%(refname:short)' --no-merged main",
+                       "git -C {ws} log -5 --oneline",
+                       "git -C {ws} stash list",
                        "ls -la {ws}")
     # probe 1 コマンドの SSH タイムアウト（秒）と、返信へ載せる 1 出力の上限文字数
     _PROBE_TIMEOUT_SEC = 30
     _PROBE_OUTPUT_MAX_CHARS = 1500
 
-    def _answer_probe(self, msg: dict):
-        """確認系質問に実行結果（実出力）で答える（§8.3 probe）。
+    @staticmethod
+    def _derive_repo_verdicts(results: list[tuple[str, int, str]]) -> list[str]:
+        """probe 実出力から機械判定行を導出する（§8.10g。LLM 不使用）。
 
-        返信は必ず 1 メッセージ。実行できた場合はコマンドごとの rc・実出力、実行不能
-        （workspace 不明・SSH 手段なし・SSH 不達）の場合はその事実とエラーを返す。
-        いずれも脳 LLM の生成テキストは使わない（宣言反復＝2026-08-10 インシデント F2 の再発防止）。
+        導出元は --porcelain / for-each-ref / branch --no-merged の機械形式出力のみ。
+        「マージは終わったか」「push 済みか」に**判定文**で答えられるようにする（raw
+        ダンプは従来どおり併記＝証跡。2026-08-27 インシデント: 固定 3 コマンドの raw
+        ダンプでは ahead/behind・未マージ状態が読めず、質問に答えられなかった）。
+        取得不能（rc 非 0）の項目は判定行を出さない（誤った断定をしない）。
         """
-        cid = msg["conversation_id"]
+        verdicts: list[str] = []
+        for cmd, rc, out in results:
+            if rc != 0:
+                continue
+            if "status --porcelain" in cmd:
+                lines = [ln for ln in out.splitlines() if ln.strip()]
+                untracked = sum(1 for ln in lines if ln.startswith("??"))
+                if lines:
+                    verdicts.append(
+                        f"未コミット変更: {len(lines)} 件（うち未追跡 {untracked} 件）")
+                else:
+                    verdicts.append("未コミット変更: なし（作業ツリー clean）")
+            elif "for-each-ref" in cmd:
+                diverged = []
+                for ln in out.splitlines():
+                    # 形式: "<branch> <hash> [ahead N, behind M]"（track 無しは 2 列）
+                    if "[" in ln and "]" in ln:
+                        name = ln.split()[0]
+                        track = ln[ln.index("["):ln.index("]") + 1]
+                        diverged.append(f"{name} {track}")
+                if diverged:
+                    verdicts.append("origin と差があるブランチ: " + "、".join(diverged))
+                elif out.strip():
+                    verdicts.append("origin と差があるブランチ: なし（全ブランチ一致）")
+            elif "--no-merged" in cmd:
+                names = [ln.strip() for ln in out.splitlines() if ln.strip()]
+                if names:
+                    verdicts.append("main へ未マージのブランチ: " + "、".join(names))
+                else:
+                    verdicts.append("main へ未マージのブランチ: なし")
+            elif "stash list" in cmd:
+                n = len([ln for ln in out.splitlines() if ln.strip()])
+                if n:
+                    verdicts.append(f"stash 退避: {n} 件（未復元の作業が残っている可能性）")
+        return verdicts
+
+    def _probe_workspace(self, cid: str) -> str | None:
+        """probe の対象 workspace を解決する（§8.3 / §8.10g）。
+
+        直近タスクの workspace（_last_workspace）→ セッションの `repo:` 指定
+        （session_workspace）の順。従来は前者のみで、タスク未実行の会話では repo: 指定が
+        あっても「workspace 不明」に落ちていた（既存欠陥の是正・§8.10g）。
+        """
         with self._sessions_lock:
             # _last_workspace は永続化ファイルからの遅延回復を経る（_load_or_create_session）
             self._load_or_create_session(cid)
-            workspace = self._last_workspace.get(cid)
+            return self._last_workspace.get(cid) or self.session_workspace.get(cid)
+
+    def _probe_block(self, cid: str) -> str:
+        """repo 実測ブロック（機械判定行 + raw 証跡）を組み立てる（§8.3 probe / §8.10g）。
+
+        probe 応答と状態主張の差し替え（handle_message）の両方が使う。脳 LLM の生成
+        テキストは一切使わない（宣言反復＝2026-08-10 インシデント F2 の再発防止）。
+        """
+        workspace = self._probe_workspace(cid)
         if self.process_mgr is None:
-            text = "実測確認を実行できません: SSH 実行手段が未構成です（sa-ru の構成異常）"
-        elif not workspace:
-            text = ("実測確認を実行できません: この会話で実行したタスクの workspace が"
-                    "見つかりません。タスクを実行してから再度お尋ねください")
-        else:
-            ws = shlex.quote(workspace)
-            lines = [f"実測結果（workspace: {workspace}）"]
-            for template in self._PROBE_COMMANDS:
-                cmd = template.format(ws=ws)
-                rc, output = self.process_mgr.run_ssh_probe(
-                    cmd, timeout=self._PROBE_TIMEOUT_SEC)
-                out = (output or "").strip()
-                if len(out) > self._PROBE_OUTPUT_MAX_CHARS:
-                    out = out[:self._PROBE_OUTPUT_MAX_CHARS] + "\n…（以降略）"
-                lines.append(f"$ {cmd} (rc={rc})")
-                lines.append(out if out else "（出力なし）")
-            text = "\n".join(lines)
+            return "実測確認を実行できません: SSH 実行手段が未構成です（sa-ru の構成異常）"
+        if not workspace:
+            return ("実測確認を実行できません: この会話の workspace が見つかりません。"
+                    "`repo:/絶対パス` で指定するか、タスクを実行してから再度お尋ねください")
+        ws = shlex.quote(workspace)
+        results: list[tuple[str, int, str]] = []
+        lines = []
+        for template in self._PROBE_COMMANDS:
+            cmd = template.format(ws=ws)
+            rc, output = self.process_mgr.run_ssh_probe(
+                cmd, timeout=self._PROBE_TIMEOUT_SEC)
+            out = (output or "").strip()
+            results.append((cmd, rc, out))
+            if len(out) > self._PROBE_OUTPUT_MAX_CHARS:
+                out = out[:self._PROBE_OUTPUT_MAX_CHARS] + "\n…（以降略）"
+            lines.append(f"$ {cmd} (rc={rc})")
+            lines.append(out if out else "（出力なし）")
+        # 機械判定行を先頭へ（§8.10g。導出はコマンド実出力のパースのみ・LLM 不使用）
+        verdicts = self._derive_repo_verdicts(results)
+        head = [f"実測結果（workspace: {workspace}）"]
+        if verdicts:
+            head.append("【機械判定】")
+            head += [f"- {v}" for v in verdicts]
+        return "\n".join(head + lines)
+
+    def _answer_probe(self, msg: dict):
+        """確認系質問に実行結果（実出力）で答える（§8.3 probe）。
+
+        返信は必ず 1 メッセージ。実行できた場合は機械判定行 + コマンドごとの rc・実出力、
+        実行不能（workspace 不明・SSH 手段なし・SSH 不達）の場合はその事実とエラーを返す。
+        いずれも脳 LLM の生成テキストは使わない（宣言反復＝2026-08-10 インシデント F2 の再発防止）。
+        """
+        cid = msg["conversation_id"]
+        text = self._probe_block(cid)
         # 実測結果を会話履歴にも残す（後続ターンで脳が事実として参照できるようにする）
         self._append_turn(cid, "assistant", text)
         # 実測応答後もユーザーの続きの発話を待つ（§8.3 (C) 能動昇格）
@@ -699,11 +809,75 @@ class ConversationManager:
                 tasks.append(task)
         return tasks
 
+    def _terminal_task_record(self, cid: str) -> dict | None:
+        """この会話の直近タスクの終端記録（done アーカイブ）を返す。無ければ None（§8.10g）。
+
+        「済んだのか」への答えは実行中タスクの有無ではなく終端記録にある — 2026-08-28 E2E
+        実測: マージ完了 30 秒後の「マージは終わったか」に、実行中 0 件しか読めず正答
+        できなかった欠陥（終端記録への経路欠落）の是正。対象は _last_task_id が指す
+        直近タスクのみに限定し、done アーカイブの全件走査はしない。
+        """
+        with self._sessions_lock:
+            tid = self._last_task_id.get(cid)
+        if not tid:
+            return None
+        paths = glob.glob(os.path.join(self.task_dir, "done", "*", f"*_{tid}.json"))
+        for path in sorted(paths, reverse=True):
+            try:
+                with open(path) as f:
+                    record = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if record.get("status") in ("completed", "failed"):
+                return record
+        return None
+
+    def _terminal_task_text(self, record: dict) -> str:
+        """直近タスクの終端記録と、完了条件の回答時点の再検査を機械整形する（§8.10g）。
+
+        記録は過去のある時点の測定にすぎないため鵜呑みにしない: 記録に残る完了条件
+        （kind/params）をいま再実測して併記し、食い違いは現在の実測を優先して明示する。
+        担保は 2 段 — 書く時（成功は事後実測・完了検査の PASS でしか記録されない）と
+        読む時（この再検査。reconcile と同じ GroundingVerifier を使う）。
+        """
+        status = "完了" if record.get("status") == "completed" else "失敗"
+        when = (record.get("updated_at") or "")[:16].replace("T", " ")
+        lines = [f"直近タスク（終端記録）: {status}（{when}）"]
+        acceptance = record.get("acceptance") or []
+        workspace = record.get("workspace")
+        if acceptance and workspace and self.process_mgr is not None:
+            try:
+                verifier = GroundingVerifier(self.process_mgr.run_ssh_probe)
+                # 検査は 1 件ずつ回す（reconcile と同じ粒度。件数は契約検証で上限済み）
+                for check in acceptance:
+                    report = verifier.verify_acceptance(workspace, [check])
+                    params = " ".join(
+                        f"{k}={v}" for k, v in (check.get("params") or {}).items())
+                    mark = "PASS" if report.ok else "FAIL"
+                    lines.append(
+                        f"- いま再検査: {check.get('kind')} {params}".rstrip() + f" → {mark}")
+                    if not report.ok and record.get("status") == "completed":
+                        lines.append("  （記録では完了ですが、現在の実測は未達です — "
+                                     "完了後に状態が変わった可能性があります）")
+            except Exception:
+                logger.exception("終端記録の再検査に失敗（記録時点の測定のみで回答）")
+                lines.append("- 再検査は実行不能（実測手段の失敗）。上記は記録時点の測定")
+        elif acceptance:
+            lines.append("- 再検査手段なし（workspace 未特定）。上記は記録時点の測定")
+        else:
+            # 完了検査の無いタスク（純生成等）は終端記録の実在と結果が実測の上限。
+            # それ以上は断言しない（測れないものは出さない・§8.10g）
+            first = (record.get("result") or "").strip().splitlines()
+            if first:
+                lines.append(f"- 結果（記録・冒頭）: {first[0][:120]}")
+        return "\n".join(lines)
+
     def _task_status_text(self, msg: dict) -> str:
         """当該会話の実行系タスクの実測テキストを組み立てる（§8.3。LLM 不使用）。
 
-        根拠はタスクキューの実レコードと着手待ちの計画（pending の確認レコード）のみ。
-        task_status probe の応答本文と、進行主張の差し替え/併記の両方で使う。
+        根拠はタスクキューの実レコード・直近タスクの終端記録（§8.10g）・着手待ちの計画
+        （pending の確認レコード）のみ。task_status probe の応答本文と、進行主張の
+        差し替え/併記の両方で使う。
         """
         running = self._running_tasks(msg["conversation_id"])
         if running:
@@ -711,6 +885,9 @@ class ConversationManager:
             lines += [f"- {t.get('task_id', '')[:8]}: {t.get('status')}" for t in running[:5]]
             return "\n".join(lines)
         text = "タスクは走っていません（実測: この会話の実行系タスク 0 件）。"
+        terminal = self._terminal_task_record(msg["conversation_id"])
+        if terminal:
+            text += "\n" + self._terminal_task_text(terminal)
         pendings = self._pending_confirms(msg)
         if pendings:
             # 件数は実数（固定文言「1 件」が実態と食い違った 2026-08-26 E2E 検出の是正）。
@@ -760,13 +937,16 @@ class ConversationManager:
         if not self._running_tasks(cid):
             self._represent_pending_plan(msg)
 
-    def _claims_progress(self, reply: str, progress: GenerationProgress | None = None) -> bool:
-        """返信が「進行中の作業がある」と主張しているかを脳 LLM の 1 問で選別する（§8.3）。
+    def _claims_check(self, reply: str,
+                      progress: GenerationProgress | None = None) -> dict:
+        """返信が進行主張・実行状態の主張を含むかを脳 LLM の 1 問で選別する（§8.3 / §8.10g）。
 
         言語理解は LLM の仕事であり、語列挙の正規表現は使わない（活用形・言い換え・英語を
-        取りこぼした 2026-08-25 E2E FAIL の是正）。ここは選別のみで、事実判定（タスク実在）は
-        _running_tasks が担う。選別不能（パース不能・LLM 不達）は素通し（従来動作）へ縮退し、
-        warning で発生率を観測する — 選別失敗で返信を全置換する誤爆より安全側。
+        取りこぼした 2026-08-25 E2E FAIL の是正）。ここは選別のみで、事実判定（タスク実在・
+        repo 実状態）は _running_tasks / _probe_block が担う。返り値は
+        {"progress": bool, "state": bool}。選別不能（パース不能・LLM 不達）は素通し
+        （従来動作）へ縮退し、warning で発生率を観測する — 選別失敗で返信を全置換する
+        誤爆より安全側。
         """
         prompt = self._progress_claim_template.replace("{reply}", reply)
         try:
@@ -777,10 +957,15 @@ class ConversationManager:
                 parsed = json.loads(extract_json(stdout))
             except json.JSONDecodeError:
                 parsed = json.loads(extract_json(repair_json_escapes(stdout)))
-            return parsed.get("claims_progress") is True
+            return {"progress": parsed.get("claims_progress") is True,
+                    "state": parsed.get("claims_state") is True}
         except (json.JSONDecodeError, OllamaTimeoutError, OllamaConnectionError) as e:
-            logger.warning("進行主張の選別に失敗（素通しへ縮退）: %s", e)
-            return False
+            logger.warning("進行/状態主張の選別に失敗（素通しへ縮退）: %s", e)
+            return {"progress": False, "state": False}
+
+    def _claims_progress(self, reply: str, progress: GenerationProgress | None = None) -> bool:
+        """後方互換ラッパ（既存テスト・呼び出し互換）。進行主張のみを返す。"""
+        return self._claims_check(reply, progress=progress)["progress"]
 
     def _recheck_detail_question(self, message_text: str, reply: str,
                                  progress: GenerationProgress | None = None) -> str:
@@ -1050,14 +1235,20 @@ class ConversationManager:
     # ── 契約化パス（設計書 §8.10f。ready=true 後の第 2 の構造化呼び出し） ──
 
     def _build_contract(self, cid: str, summary: str, progress=None) -> dict | None:
-        """会話から実行契約 {directive, constraints, acceptance, workspace, needs_repo} を得る。
+        """会話から実行契約 {directive, constraints, acceptance, runbook, workspace,
+        needs_repo, rest_summary} を得る。
 
-        会話出口契約 {reply, ready, summary} にはキーを足さず、契約化専用のプロンプト
-        （contract.md）で脳モデルをもう 1 回呼ぶ（§8.10f。逸脱実績のある契約の対象面を
-        広げない）。出力はコード側（contract_rules.validate_contract）で検証し、directive /
-        constraints は**ユーザー発話の逐語引用**のみ受理する。逸脱・パース不能は 1 回
-        リトライし、それでも確定しなければ None（呼び出し側が fail-closed で人へ差し戻す）。
+        会話出口契約 {reply, ready, summary} にはキーを足さず、契約化は ya-ta
+        （Contractor・§8.4「契約化の呼び出し」）へ委譲する。sa-ru が渡すのは会話履歴の
+        二窓ビューと確定要約のみで、受理判断（contract_rules.validate_contract —
+        directive / constraints は**ユーザー発話の逐語引用**のみ受理）はこちらの検証
+        関数を注入して行う（権威はフィールド・§8.10f）。ローカル 2 回不合格は昇格
+        ラダー（§8.4.x (e)）が上位 worker モデルで再契約化し、全段失敗のみ None
+        （呼び出し側が fail-closed で人へ差し戻す）。
         """
+        if self.contractor is None:
+            logger.error("契約化が有効なのに Contractor が未構築（構成不整合）")
+            return None
         with self._sessions_lock:
             history = self._load_or_create_session(cid)
             snapshot = self._history_view(history)
@@ -1065,29 +1256,133 @@ class ConversationManager:
             source_text = "\n".join(t["text"] for t in history if t.get("role") == "user")
         history_text = "\n".join(
             f"{'ユーザー' if t['role'] == 'user' else 'sa-ru'}: {t['text']}" for t in snapshot)
-        prompt = (self._contract_template
-                  .replace("{history}", history_text)
-                  .replace("{summary}", summary))
-        for attempt in (1, 2):
-            try:
-                stdout = run_ollama(self.model, prompt, timeout=self.timeout,
-                                    host=self.ollama_host, think=self.think,
-                                    progress=progress)
-                try:
-                    parsed = json.loads(extract_json(stdout))
-                except json.JSONDecodeError:
-                    # 不正エスケープの機械修復（_invoke_llm と同じ規律・2026-08-24 実測）
-                    parsed = json.loads(extract_json(repair_json_escapes(stdout)))
-            except (json.JSONDecodeError, OllamaTimeoutError, OllamaConnectionError) as e:
-                logger.warning("契約化パス失敗（%d 回目）: %s", attempt, e)
-                continue
-            validated, problems = contract_rules.validate_contract(parsed, source_text)
-            if validated is not None:
-                # push を含む依頼で完了条件が空なら既定検査を付与する（§8.10f。脳の
-                # 立て損ねで「push の実測検査なしに完了」と言える状態を作らない）
-                return contract_rules.apply_default_acceptance(validated, summary)
-            logger.warning("契約化パスの出力が逸脱（%d 回目）: %s", attempt, problems)
-        return None
+        validated, provenance = self.contractor.contract(
+            history_text, summary,
+            lambda parsed: contract_rules.validate_contract(parsed, source_text),
+            progress=progress)
+        if validated is None:
+            return None
+        # push を含む依頼で完了条件が空なら既定検査を付与する（§8.10f。脳の
+        # 立て損ねで「push の実測検査なしに完了」と言える状態を作らない）
+        contract = contract_rules.apply_default_acceptance(validated, summary)
+        # 昇格で確定した契約は来歴を着手確認へ載せる（§8.4.x (e) 可視化。どの脳が
+        # 立てた契約かを人が承認時に見える。"_" 前置きキーは提示専用＝レコードへ運ばない）
+        if provenance.get("origin") not in (None, "local"):
+            contract["_contract_origin"] = {
+                "model": provenance["origin"],
+                "local_failures": provenance.get("local_failures", 0)}
+        return contract
+
+    def _contract_escalation_runner(self, model_name: str, prompt: str) -> str:
+        """昇格ラダーの 1 段: 上位 worker モデルで契約化プロンプトを 1 回だけ実行する。
+
+        契約化はツール実行を伴わない単発生成のため、worker CLI を `<command> -p
+        <model_flag>` の SSH 単発（プロンプトは stdin）で呼ぶ（§8.4.x (e)。stream-json・
+        PreToolUse フック・workspace は使わない＝書き込み能力を持たない呼び出し）。
+        実行できない段（未登録モデル・keychain 依存 CLI・SSH 手段なし）は例外で返し、
+        Contractor が次段へ進める。
+        """
+        if self.process_mgr is None:
+            raise RuntimeError("SSH 実行手段なし（process_mgr 未注入）")
+        model_conf = (self.config.get("models") or {}).get(model_name)
+        if not model_conf:
+            raise RuntimeError(f"未登録モデル: {model_name}")
+        if model_conf.get("keychain_auth"):
+            # keychain 依存 CLI（agy 等）は SSH セッションから認証を読めない（§8.6）
+            raise RuntimeError(f"{model_name} は SSH 単発で実行不可（keychain 認証依存）")
+        cli = model_conf.get("command", "")
+        remote = f"{cli} -p {model_conf.get('model_flag', '')}".strip()
+        try:
+            # タイムアウトはローカル契約化と同じ ya-ta.llm_timeout_sec を共用（新キーなし・§8.4）
+            return self.process_mgr.run_ssh_command(
+                remote, timeout=self.config["ya-ta"]["llm_timeout_sec"], stdin_text=prompt)
+        except subprocess.TimeoutExpired as e:
+            # TimeoutExpired は Contractor の捕捉対象（RuntimeError）へ正規化する。
+            # 素通しすると段の失敗でなく会話処理全体を落とす（ハング CLI が 1 段で全体を殺す）
+            raise RuntimeError(f"昇格段のタイムアウト: {e}") from e
+
+    # ── 再入 reconcile（設計書 §8.10g。計画・着手確認の前に世界の実状態を測る） ──
+
+    def _reconcile_acceptance(self, cid: str, contract: dict, workspace: str | None,
+                              msg: dict) -> list[str] | None:
+        """着手確認前に契約の完了条件を実測し、済んだ検査を洗い出す（§8.10g）。
+
+        返り値:
+          None — 全 kind PASS。実測報告を返信済みで、呼び出し側は計画・着手確認を出さない
+                 （達成済みの依頼を実行系に入れない。再実行は明示指示を要求）
+          list — 済んだ検査の表示行（部分 PASS。着手確認へ「済（実測）」として載せる）。
+                 検査なし・workspace 未解決・実測手段なし・検査自体の失敗は []（従来動作）
+        """
+        acceptance = (contract or {}).get("acceptance") or []
+        if not acceptance or not workspace or self.process_mgr is None:
+            return []
+        satisfied: list[str] = []
+        evidences: list[str] = []
+        try:
+            verifier = GroundingVerifier(self.process_mgr.run_ssh_probe)
+            # 検査は 1 件ずつ回す（部分 PASS の粒度を得るため。件数は契約検証で
+            # 既定付与上限に抑えられており、SSH 往復の増分は限定的）
+            for check in acceptance:
+                report = verifier.verify_acceptance(workspace, [check])
+                if report.ok:
+                    params = " ".join(
+                        f"{k}={v}" for k, v in (check.get("params") or {}).items())
+                    satisfied.append(f"{check.get('kind')} {params}".rstrip())
+                    evidences.append(report.text)
+            # 契約に runbook step があるときは、その事後条件も実測する（§8.10g）。
+            # 完了条件が目標の一部（commit/push）しか捉えていなくても、未実施の
+            # runbook 操作（merge 等）が残っていれば「達成済み」と誤抑止しない
+            # — 2026-08-28 E2E 実測: マージ未実施の依頼を全 PASS で抑止した欠陥の是正
+            for rb in (contract or {}).get("runbook") or []:
+                done, _ = runbook_rules.step_already_done(
+                    self.process_mgr.run_ssh_probe, workspace,
+                    rb["kind"], rb["params"])
+                if not done:
+                    return satisfied
+        except Exception:
+            # 事前実測の失敗で依頼を堰き止めない（検査は出口でも必ず走る・§8.10f）
+            logger.exception("事前実測（reconcile）に失敗（計画提示は継続）")
+            return []
+        if len(satisfied) == len(acceptance):
+            text = ("完了条件は既に満たされています（実測）。実行は行いません。"
+                    "再実行が必要な場合はその旨を明示してください。\n\n"
+                    + "\n\n".join(evidences))
+            self._append_turn(cid, "assistant", text)
+            self._set_awaiting(cid, True)
+            self.slack.notify(
+                text, msg.get("channel_id"),
+                team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
+            return None
+        return satisfied
+
+    def _recheck_open_intents(self, cid: str, msg: dict):
+        """open の過去依頼を世界に対して再検査し、満たされたものだけ閉じる（§8.10g）。
+
+        従来の発火点は「別タスクの完了時」（Orchestrator._finalize_goal）のみで、ユーザー
+        発話の時点では走らなかった。ready のたびに再検査し、後追いで達成済みになった依頼を
+        機械検出して閉じる（宣言では閉じない・§8.10f 依頼の寿命）。失敗は会話処理へ
+        波及させない。
+        """
+        intents_dir = getattr(self, "intents_dir", None)
+        if not intents_dir or self.process_mgr is None:
+            return
+        try:
+            verifier = GroundingVerifier(self.process_mgr.run_ssh_probe)
+            for record in intent_store.list_open(intents_dir, cid):
+                if not record.get("acceptance") or not record.get("workspace"):
+                    continue
+                report = verifier.verify_acceptance(
+                    record["workspace"], record["acceptance"])
+                if report.ok:
+                    intent_store.set_goal_status(
+                        intents_dir, record["task_id"], intent_store.GOAL_ACHIEVED)
+                    self.slack.notify(
+                        "過去の未達依頼が現在は完了条件を満たしています（達成として閉じます）: "
+                        f"{(record.get('summary') or '')[:60]}",
+                        msg.get("channel_id"), team_id=msg.get("team_id"),
+                        thread_ts=msg.get("thread_ts"))
+        except Exception:
+            logger.exception("open 依頼の再検査に失敗（会話処理は継続）")
 
     # ── 計画プレビューの訂正（設計書 §8.10b / §10.2.1） ──
 
@@ -1210,6 +1505,78 @@ class ConversationManager:
             thread_ts=msg.get("thread_ts"))
         return True
 
+    def _merge_runbook_plan(self, rb_steps: list[dict], workspace: str, summary: str,
+                            contract: dict | None = None,
+                            progress=None) -> tuple[list[dict], list[str]]:
+        """runbook step 列を計画の先頭へ置き、残りの作業の分解を後続に直列で繋ぐ（§8.10g）。
+
+        返り値は (計画, 済み step の表示行)。**計画時に各 step の事後条件を実測し、
+        既に成立している step は計画に載せない**（§8.10g 残作業の導出。失敗タスクへの
+        自然な続き「もう一回やって」に、済んだ commit/push を再提案しない — 2026-08-28
+        E2E 実測の是正）。判定不能は載せる側へ倒し、実行時の前提実測が最終防衛。
+
+        runbook step の command は組立後コマンドの逐語（表示用）。実行は step 内の
+        `_runbook`（kind/params）から同じ組立を通す。
+
+        残り作業の分解入力は契約の `rest_summary`（§8.10g 分解の二重実行抑止）:
+        - null → agent 分解を省略（計画は runbook step のみ）。確定要約を丸ごと分解へ
+          渡すと git 操作が入力に残り、注意書き（散文）の遵守頼みでは二重実行
+          （runbook と agent step が同じ push/merge を持つ）を構造的に防げない
+        - 文字列 → その要約だけを分解する（入力から git 操作を除く＝抑止を構造にする）
+        - キー欠落（旧出力・検証縮退）→ 従来どおり確定要約を分解（縮退動作）
+        いずれも「runbook が実行する操作をサブタスクに含めない」注意書きは多層として
+        維持する（済み step も covered に含める — 分解へ再流入させない）。
+        """
+        plan: list[dict] = []
+        covered: list[str] = []
+        skipped: list[str] = []
+        todo: list[dict] = []
+        for rb in rb_steps:
+            covered.append(f"{rb['kind']} {rb['params']}")
+            done = False
+            evidence = ""
+            if self.process_mgr is not None:
+                try:
+                    done, evidence = runbook_rules.step_already_done(
+                        self.process_mgr.run_ssh_probe, workspace,
+                        rb["kind"], rb["params"])
+                except Exception:
+                    logger.exception("runbook 済み判定に失敗（計画へ載せる側へ縮退）")
+            if done:
+                skipped.append(f"runbook {rb['kind']} — {evidence}")
+            else:
+                todo.append(rb)
+        for i, rb in enumerate(todo, start=1):
+            commands = runbook_rules.build_commands(workspace, rb["kind"], rb["params"])
+            plan.append({
+                "step": i,
+                "command": " && ".join(commands),
+                "execution": "runbook",
+                "depth": None,
+                "confidence": 1.0,
+                "depends_on": [i - 1] if i > 1 else [],
+                "_runbook": rb,
+            })
+        k = len(plan)
+        note = ("\n\n（注意: 次の git 操作は runbook が別途決定的に実行するため、"
+                "サブタスクに含めないこと: " + "、".join(covered) + "）")
+        if contract is not None and "rest_summary" in contract:
+            rest_summary = contract["rest_summary"]
+            # null = 残り作業なしの明示 → agent 分解を省略（計画は runbook のみ）
+            rest = ([] if rest_summary is None
+                    else self._build_plan(rest_summary + note, progress=progress) or [])
+        else:
+            rest = self._build_plan(summary + note, progress=progress) or []
+        for s in rest:
+            s = dict(s)
+            s["step"] = s["step"] + k
+            deps = [d + k for d in (s.get("depends_on") or [])]
+            # 依存なしの step も runbook の後へ直列化する（repo 状態が runbook で変わるため）。
+            # runbook が全て済み（k=0）のときは分解結果の依存をそのまま使う
+            s["depends_on"] = deps or ([k] if k else [])
+            plan.append(s)
+        return plan, skipped
+
     def _build_plan(self, summary: str, progress=None) -> list[dict] | None:
         """確定要約を分解して計画プレビュー用のサブタスク列を返す（失敗時は None）。
 
@@ -1241,9 +1608,20 @@ class ConversationManager:
         # 逐語命令（directive）は分解しない（§10.2。原文を command とする 1 件のプラン）。
         # ya-ta の言い換えを通すと変換のたびに劣化する
         directive = (contract or {}).get("directive")
+        rb_steps = (contract or {}).get("runbook") or []
         if directive:
             plan = [{"step": 1, "command": directive, "execution": "agent",
                      "depth": None, "confidence": 1.0, "depends_on": []}]
+        elif rb_steps and workspace:
+            # 定型 git 操作は runbook step（決定的実行）として計画の先頭へ置く（§8.10g）。
+            # コマンドはここで組み立てて凍結し、実行側は同じ組立（build_commands）を通る
+            # ため「承認した列と実行される列」が構造的に一致する。済み step は計画に
+            # 載せず「済（実測）」として契約提示へ回す（残作業の導出）
+            plan, rb_skipped = self._merge_runbook_plan(rb_steps, workspace, summary,
+                                                        contract=contract,
+                                                        progress=progress)
+            if rb_skipped and contract is not None:
+                contract.setdefault("_pre_satisfied", []).extend(rb_skipped)
         else:
             plan = self._build_plan(summary, progress=progress)
         record = {
@@ -1287,7 +1665,13 @@ class ConversationManager:
                   "workspace_text": workspace_text}
         if contract is not None:
             # 契約は空でも「なし」を明示する（§8.10f。見えていない契約は承認されない）
-            kwargs["contract_text"] = self._format_contract(contract)
+            contract_text = self._format_contract(contract)
+            # git 操作を含みそうな依頼が runbook なしのときの注意行（§8.10g 警告補助。
+            # 変換・ブロックはしない — 判断は着手確認を見る人が行う）
+            warning = contract_rules.runbook_warning(contract, summary)
+            if warning:
+                contract_text += "\n" + warning
+            kwargs["contract_text"] = contract_text
         # 計画提示 = 着手/訂正の返答待ち（§8.3 (C) 能動昇格。訂正はスレッド返信で届く）
         self._set_awaiting(msg["conversation_id"], True)
         self.slack.send_exec_confirm_request(exec_request_id, summary, **kwargs)
@@ -1304,6 +1688,18 @@ class ConversationManager:
                 lines.append(f"- {prefix}{c.get('text', '')}")
         else:
             lines.append("拘束条件: なし")
+        runbook = contract.get("runbook") or []
+        if runbook:
+            # 組立後コマンドの逐語は実行計画側に表示される（§8.10g。二重に長文化しない）
+            lines.append(f"runbook（決定的実行・worker LLM なし）: {len(runbook)} step "
+                         "— 組立後コマンドは実行計画に逐語表示")
+            # 残り作業（runbook 外・agent 分解の入力）は常に提示する（§8.10f rest_summary。
+            # null=分解省略の縮約も人の承認対象にする — 見えていない縮約は承認されない）
+            if "rest_summary" in contract:
+                lines.append("残り作業（分解対象）: "
+                             + (contract["rest_summary"] or "なし（runbook で完結）"))
+            else:
+                lines.append("残り作業（分解対象）: 未特定（確定要約の全体を分解）")
         acceptance = contract.get("acceptance") or []
         if acceptance:
             lines.append("完了条件（完了時に sa-ru が実測検査）:")
@@ -1312,6 +1708,14 @@ class ConversationManager:
                 lines.append(f"- {a.get('kind')} {params}".rstrip())
         else:
             lines.append("完了条件: なし（完了検査は行われません）")
+        # 事前実測（reconcile・§8.10g）で既に満たされていた検査を明示する
+        for line in contract.get("_pre_satisfied") or []:
+            lines.append(f"- 済（実測）: {line}")
+        # 昇格で確定した契約の来歴（§8.4.x (e) 可視化。どの脳が立てた契約かを人が見える）
+        origin = contract.get("_contract_origin")
+        if origin:
+            lines.append(f"契約化: ローカル検証不合格 {origin.get('local_failures', 0)} 回"
+                         f" → {origin.get('model')}（昇格）")
         return "\n".join(lines)
 
     # ── 着手確認の決着（確認ループから呼ばれる） ──

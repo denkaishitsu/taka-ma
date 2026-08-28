@@ -42,7 +42,7 @@
   - [8.1 通信原則](#81-通信原則)
   - [8.2 通信パス一覧](#82-通信パス一覧)
   - [8.3 ① u-zu → sa-ru（会話投入 → 確定要約 → タスク投入）](#83-①-u-zu--sa-ru会話投入--確定要約--タスク投入)
-  - [8.4 ② sa-ru → ya-ta（タスク分解・分類・リスク判定）](#84-②-sa-ru--ya-taタスク分解分類リスク判定)
+  - [8.4 ② sa-ru → ya-ta（タスク分解・分類・リスク判定・契約化）](#84-②-sa-ru--ya-taタスク分解分類リスク判定契約化)
   - [8.5 ③ sa-ru → worker CLI（重量タスク実行、実行アダプタ抽象）](#85-③-sa-ru--worker-cli重量タスク実行実行アダプタ抽象)
   - [8.6 ④ sa-ru → Antigravity CLI（subprocess 経路）](#86-④-sa-ru--antigravity-clisubprocess-経路)
   - [8.7 ⑤ sa-ru → Gemma 4 31B（軽量タスク実行）](#87-⑤-sa-ru--gemma-4-31b軽量タスク実行)
@@ -54,6 +54,7 @@
   - [8.10d 中止・取消命令の即時実行（承認ゲートを通さない制御コマンド分類）](#810d-中止取消命令の即時実行承認ゲートを通さない制御コマンド分類)
   - [8.10e intent 連続捕捉（依頼意図のドリフト検出 → 人の承認 → append）](#810e-intent-連続捕捉依頼意図のドリフト検出--人の承認--append)
   - [8.10f 会話⇄実行の受け渡し契約（命令原文・拘束条件・完了条件）](#810f-会話実行の受け渡し契約命令原文拘束条件完了条件)
+  - [8.10g 決定的実行と実測回答（LLM 裁量の構造撤去）](#810g-決定的実行と実測回答llm-裁量の構造撤去)
   - [8.11 qu-e → sa-ru（監査アラート）](#811-qu-e--sa-ru監査アラート)
   - [8.12 qu-e file_audit → sa-ru（ファイル変更アラート）](#812-qu-e-file_audit--sa-ruファイル変更アラート)
   - [8.13 sa-ru → qu-e（タスクコンテキスト共有）](#813-sa-ru--qu-eタスクコンテキスト共有)
@@ -1073,14 +1074,14 @@ taka-ma 自身がユーザーへ質問・確認を出して返答を待ってい
 
 同一スレッドに複数依頼（AAA/BBB）が混在した場合の話題別グルーピングは、**「1 スレッド = 1 セッション」を維持し、配管層では親子チェーン（`parent_task_id`）と全履歴保持までを担う**方式を採る。発話がどの依頼（タスク）への続きかの切り分けは意味層（§8.10e ドリフト検出が task_id 単位で判定する構造）に置く。セッションを話題単位に分割する方式（topic_id サブセッション）は、話題分類の誤りがそのまま会話文脈の分断（= F3 と同型の文脈喪失）として現れるリスクに対し、混在頻度の実測が無い現段階では採らない。混在の実害が観測された時点で、ready 判定時に脳 LLM へ「当該依頼に関係する発話範囲」を選ばせる文脈スライス方式を再検討する。
 
-### 8.4 ② sa-ru → ya-ta（タスク分解・分類・リスク判定）
+### 8.4 ② sa-ru → ya-ta（タスク分解・分類・リスク判定・契約化）
 
 | 項目 | 仕様 |
 |------|------|
 | 方式 | Python ライブラリ import（同一プロセス内） |
 | 呼び出し元 | `src/sa-ru/orchestrator.py` |
-| 呼び出し先 | `src/ya-ta/decomposer.py`, `src/ya-ta/classifier.py`, `src/ya-ta/risk_classifier.py` |
-| LLM バックエンド | 分解・分類: Qwen3.6-27B（dense）／リスク判定: Qwen3.6-35B-A3B（MoE）。いずれも ollama localhost・HTTP API（下記「リスク判定のモデル分離」） |
+| 呼び出し先 | `src/ya-ta/decomposer.py`, `src/ya-ta/classifier.py`, `src/ya-ta/risk_classifier.py`, `src/ya-ta/contractor.py` |
+| LLM バックエンド | 分解・分類・契約化: Qwen3.6-27B（dense）／リスク判定: Qwen3.6-35B-A3B（MoE）。いずれも ollama localhost・HTTP API（下記「リスク判定のモデル分離」） |
 
 **ya-ta は launchd サービスとしては廃止。** sa-ru が直接 import して関数呼び出しする。これによりクラッシュ問題（exit -15）が構造的に解消される。モジュールとしての独立性は維持する（将来のモデル差し替え対応）。
 
@@ -1163,11 +1164,29 @@ result = risk.classify("Write to: src/app.ts")
 # => {"tier": 2, "reason": "ファイル書き込み", "action": "route_to_qu-e"}
 ```
 
+**契約化の呼び出し（§8.10f 契約化パスの実行主体）:**
+
+依頼理解の構造化（会話 → 実行契約 `{directive, constraints, acceptance, runbook, workspace, needs_repo, rest_summary}` の抽出）は、分解・分類と同族の「構造化出力」業務であり、ya-ta が担う。従来は sa-ru の会話脳（MoE）に置いていたが、これは会話⇄実行契約の導入時の実装都合であり、会話脳の構造化出力は実測で不安定だった（2026-08-28 E2E: 契約化 5 回中 4 回が仕様違反 — 完了条件欄への runbook 操作名の記載 ×2・`commit_paths` の `message` 欠落・必須 params の全欠落。機械検証は全件検出したが、都度人へ差し戻った）。契約化を ya-ta（分解と同じ dense モデル）へ移し、失敗時は §8.4.x (e) の昇格ラダーで上位モデルが補う。
+
+```python
+from ya_ta.contractor import Contractor
+
+contractor = Contractor(config, escalate_runner=...)  # escalate_runner は sa-ru が注入（§8.4.x (e)）
+raw = contractor.contract(history_view, summary)
+# => {"directive": ..., "constraints": [...], "acceptance": [...], "runbook": [...],
+#     "workspace": ..., "needs_repo": ..., "rest_summary": ...}
+```
+
+- 入力は sa-ru が渡す**会話履歴の二窓ビューと確定要約**のみ（会話セッションの持ち主は sa-ru のまま。ya-ta は状態を持たない）
+- プロンプトは `src/ai_gateway/prompts/contract.md`（契約化専用。orchestrator 側から移動し、重複を残さない）。モデル・タイムアウト・think は `ya-ta.yaml` の既存キー（`model` / `llm_timeout_sec` / `llm_think`）を共用し、契約化専用の設定キーは新設しない
+- **受理判断は ya-ta に持たせない**: ya-ta が返すのは抽出結果（パース済み JSON）まで。検証は従来どおり sa-ru 側コード `validate_contract`（逐語照合の出典＝ユーザー発話・kind 許可リスト・fail-closed）が行う — 権威はフィールドの原則（§8.10f）は移管後も不変
+
 **フォールバック（ya-ta 自体の判定エラー時の安全側挙動）:**
 
 - タスク分解: パースエラー時 → 元の指示をサブタスク1件（`execution: agent` / `depth` 省略 / `confidence: 0.0`）として扱う。これは写像テーブル上 sonnet（中位・万能）へ落ち、かつ agent レーンで実行される安全側の既定
 - タスク分類: パースエラー時 → `{"execution": "agent", "depth": null, "confidence": 0.0}`（安全側に倒す＝sonnet）
 - リスク分類: パースエラー時 → `{"tier": 3}` （人間判断に倒す）
+- 契約化: パースエラー・検証（`validate_contract`）FAIL がローカルモデルで 2 回連続 → §8.4.x (e) の昇格ラダーで上位 worker モデルへ。全段失敗時のみ fail-closed（着手確認を出さず不足を人に確認・§8.10f）。分解・分類のような「安全側の既定値」への縮退はしない（推測で埋めた契約は逐語原則に反する）
 - confidence < `routing.confidence_threshold`（既定 0.8）の判定 → 写像テーブル上で自動的に sonnet（迷いの落下先）へ。旧「light → heavy 強制ルーティング」はこの落下で置換された。閾値は設定ファイルで管理し、判定ログの実データで較正する（§2.2「閾値・rubric は実データで較正」）
 
 **LLM 呼び出し・出力の失敗検知（フォールバック発動条件の明確化）:**
@@ -1240,6 +1259,17 @@ ya-ta の confidence が `routing.confidence_threshold` 未満、または depth
 
 - **現状: 未実装**。初動の ya-ta 判定で決まったモデルが最後まで実行する
 - 将来、タスク中間で `capabilities` 不足を検出した際に再ルーティングする経路を追加する予定
+
+**(e) 脳系業務の昇格ラダー（契約化 — 相互扶助の実装第 1 号）**
+
+(a)(b) は worker の**実行**を対象とするが、相互扶助は ya-ta 自身の**脳系業務**（構造化出力）にも適用する。第 1 号は契約化（§8.4「契約化の呼び出し」）: ローカルモデルの構造化出力が機械検証を通らないとき、人へ跳ね返す前にラダー上位のモデルが同じ業務を引き受ける。2026-08-28 E2E でローカル契約化の仕様違反 5 回中 4 回が**すべて機械検証で検出されながら毎回人へ差し戻った**（昇格経路の欠落）ことの是正である。
+
+- **発火条件**: 契約化の出力がパース不能、または sa-ru の `validate_contract` で不合格 — が**ローカルモデル（`ya-ta.model`）で 2 回連続**したとき
+- **昇格先**: `routing.escalation.ladder`（既定 `[haiku, sonnet, opus]`）を (a) と共用し、各段 1 回ずつ同一プロンプト（`contract.md`）で再契約化する。専用ラダーの設定キーは新設しない（管理者は既存キーで編成する）
+- **検証は同一**: どの段で生成された契約も受理判断は sa-ru の `validate_contract` のみ（権威はフィールド・逐語照合の出典はユーザー発話のまま）。段の実行エラー（SSH 不達・CLI エラー・タイムアウト）は検証 FAIL と同列にその段の失敗とし、次段へ進む
+- **呼び出しチャネル**: 契約化はツール実行を伴わない単発生成のため、headless 系モデルは worker CLI の SSH 単発（`claude -p <プロンプト> --model <flag>`。`model_flag` は `ya-ta.yaml` の models 登録が源）で呼び、stdout から JSON を抽出する。stream-json・PreToolUse フック・workspace は使わない（書き込み能力を持たない呼び出し）。実行関数は sa-ru が `Contractor` へ注入する（ya-ta モジュールに SSH・CLI 依存を持ち込まない — ライブラリ方式の維持）。会話応答を塞ぐ位置のためハートビート進捗通知（§10.8）の配下で行う
+- **全段失敗**: fail-closed（§8.10f）— 着手確認を出さず不足を人に確認する。従来と同じ最終防衛であり、ラダーは「人へ届く前の段階」を増やすだけで受理基準を緩めない
+- **可視化**: 昇格で確定した契約には、着手確認へ「契約化: ローカル検証不合格 2 回 → <モデル名>（昇格）」の来歴行を機械付与する（どの脳が立てた契約かを人が承認時に見える）。試行列（モデル・不合格理由）は判定ログ（§8.4.1）へ記録し、ラダー較正の実データとする
 
 **機能の対象モデル**
 
@@ -1905,10 +1935,11 @@ Slack から MBP の稼働 ollama モデルを手動 unload する経路。停�
 
 #### 契約化パス（ready 後の第 2 の構造化呼び出し）
 
-会話出口契約 `{reply, ready, summary, probe}` にはキーを足さない（§8.10e と同じ理由: パース失敗・型逸脱の実績がある契約の対象面を広げない）。`ready=true` の後、sa-ru は契約化専用プロンプト（`contract.md`）で脳モデルをもう 1 回呼び、会話（二窓ビュー）と確定要約から `{directive, constraints, acceptance, needs_repo}` を得る。
+会話出口契約 `{reply, ready, summary, probe}` にはキーを足さない（§8.10e と同じ理由: パース失敗・型逸脱の実績がある契約の対象面を広げない）。`ready=true` の後、sa-ru は契約化を **ya-ta（`Contractor`・§8.4「契約化の呼び出し」）へ委譲**し、会話（二窓ビュー）と確定要約から `{directive, constraints, acceptance, runbook, workspace, needs_repo, rest_summary}` を得る。契約化＝依頼理解の構造化は分解・分類と同族の ya-ta 業務であり、会話脳（sa-ru）に置いた旧構成は実測で不安定だった（経緯は §8.4）。
 
 - `directive` / `constraints.text` は発話からの**逐語引用**に限る。原文に無い命令・拘束を生成してはならない（着手確認の提示で出所発話と照合できる）
-- 出力の検証はコード側。逸脱（非 JSON・未知の検査 kind・引用元が会話に不在）は 1 回リトライ後、**着手確認を出さず**不足を人に確認する（解釈できない出力で実行へ進めない）
+- 出力の検証は sa-ru 側コード（`validate_contract`）。逸脱（非 JSON・未知の検査 kind・引用元が会話に不在）はローカルモデルで 1 回リトライし、2 回連続の不合格で §8.4.x (e) の昇格ラダー（上位 worker モデルでの再契約化・同一検証）へ進む。全段失敗時のみ**着手確認を出さず**不足を人に確認する（解釈できない出力で実行へ進めない — fail-closed の最終防衛は不変）
+- `rest_summary` は「runbook（§8.10g）に載る定型 git 操作を**除いた**残り作業の要約。runbook が依頼の全てなら null」。境界を越える受け渡しフィールドではなく**計画組立（分解入力）専用**で、worker・完了検査へは渡さない（用途は §8.10g「分解の二重実行抑止」）。runbook を持つ契約（＝rest_summary が分解入力として消費される契約）の着手確認には常に提示する（null なら「残り作業: なし」— 見えていない縮約は承認されない。runbook が無い契約では消費されないため提示しない）
 - `needs_repo`（実リポジトリを要するか）は脳の判定に機械補助を重ねる: `directive` に git コマンドがある、または `acceptance` にリポジトリ系検査がある場合は強制 true
 
 #### 着手確認での提示と fail-closed（§8.10b の拡張）
@@ -1944,6 +1975,7 @@ Slack から MBP の稼働 ollama モデルを手動 unload する経路。停�
 | `remote_file` | branch, path | remote の当該ブランチ上にファイルが存在（fetch + cat-file） |
 | `file` | path | workspace 内にファイルが存在 |
 | `head_touches` | path | HEAD コミットが当該パスを変更している |
+| `branch_merged` | source, target | source ブランチが target に取り込まれている（merge-base --is-ancestor で実測・§8.10g で追加。マージを含む依頼の完了条件を機械語彙で表せなかった 2026-08-28 E2E 実測の是正） |
 | `diff_limit` | max_lines, path（省略時は全ファイル合計） | HEAD コミットの変更行数（追加＋削除の numstat 合計）が max_lines 以下。依頼が量を指定した（「一行だけ追記」等）のに worker が規模を膨らませる逸脱（実測 2026-08-24: 一行追記指示に README 全面書き下ろし・当時の検査 pushed / head_touches は全 PASS で素通し）を出口で「未達」に落とす。量指定の無い依頼には載せない（正当な大規模変更を誤未達にしない）。検査基盤は head_touches と同じ HEAD コミット比較 — worker が複数コミットへ分割すると単一コミットの検査をすり抜け得る既知の限界も head_touches と共通で、これは §8.10f の遵守照合（コマンド列）と多層で補う |
 
 - 実行主体は GroundingVerifier（既存を流用・新設しない）。**全 kind PASS のときに限り**通知・会話還流に「完了」の語を使える。1 つでも FAIL なら「未達」とし、検査の rc・実出力をそのまま併記する
@@ -1997,6 +2029,74 @@ worker の勝手な環境改変（push 不能に対する `git init` 等）は�
 - 発話の記法・自然文抽出（§8.13 の `repo:` / マーカー語の正規表現）→ 契約化パスへの入力の 1 つに格下げ。workspace の権威は契約フィールド
 - §8.9 の主張検出正規表現 → 補助に降格（上記）
 - 完了通知の「完了 / 未達」の文言導出 → acceptance 検査に一本化
+
+### 8.10g 決定的実行と実測回答（LLM 裁量の構造撤去）
+
+§8.10f は「理解は転送しない」を境界の契約で実現したが、境界の内側では依然として (a) git 定型操作の実行、(b) 状態質問への回答、(c) 再入時の実行要否判断が LLM の裁量に置かれていた。2026-08-27 インシデント（Slack 実行スレッド）で、この 3 面が同時に破綻することを実測で確認した:
+
+- worker（haiku）が指示にない `git stash` で作業ツリーを退避（reflog 09:41:56 `reset: moving to HEAD`）し、復元せず放置 → 監査が「ファイル削除」と検知
+- 「マージ」担当 step が何も実行せずに成功として畳まれ（reflog 上、当該時刻に main は未更新）、別 worker が誤った基点からのブランチ作成を独断 rebase で「修復」
+- 会話脳が実マージ（10:13:33）の 14 分後に「コミットやマージは行っておりません」と会話履歴の記憶から虚偽回答（probe 未選択・ログ上 git 実行なし）
+- ユーザーの再指示のたびに同一計画を再提示（3 回）。過去タスクの達成状態を測る経路が存在しない
+
+いずれも、入力が同じなら結果が一意に決まる**決定的にできる仕事**である。本節の原則は「決定的にできる仕事を LLM にさせない」。deny リストや語検出の追加（パッチ）ではなく、LLM が関与しない実行・回答経路を新設して裁量面そのものを撤去する。
+
+| 原則 | 内容 |
+|------|------|
+| 決定的にできる仕事を LLM にさせない | git 定型操作の実行・repo 状態の導出・完了条件の再検査は決定的。LLM の関与は「どの決定的手段を使うか」の**選択**までとし、コマンド組立・実行・判定・文言化はコードが行う（probe / 検査カタログと同じ規律の実行系への拡張） |
+| 修復しない | 決定的実行の前提が崩れていたら（dirty tree・非 FF 等）、修復（stash / rebase / reset / checkout juggling）を試みず、実測つきで失敗として人へ返す。修復の判断は人の権限 |
+| 状態主張は測定からのみ | 実行状態（した/していない・済/未）に関する文は、測定結果からの機械導出のみが会話へ出られる。LLM の記憶・会話履歴からの状態主張は画面に出さない |
+
+#### (1) git ランブック実行（runbook レーン）
+
+git の定型操作を、worker LLM を介さず sa-ru のコードが直接実行するサブタスク種別として新設する。
+
+- **固定カタログ**（acceptance カタログと同じ規律: kind と params のみ。コマンド組立はコード側・LLM に自由なコマンドを書かせない）:
+
+| kind | params | 実行内容（すべて `git -C <workspace>`） | 前提（実行前に実測・不成立なら失敗） | 事後測定（実行後に実測） |
+|------|--------|------|------|------|
+| `commit_paths` | paths, message | `add <paths>` → `commit -m <message>` | paths に実変更がある | `head_touches` 相当で paths を確認 |
+| `push` | branch（省略時 HEAD） | `push origin <branch>` | 対象ブランチが存在 | `pushed` 検査と同一実装 |
+| `merge_ff` | source, target | `switch <target>` → `merge --ff-only <source>` | 作業ツリーが clean・FF 可能 | target の HEAD が source と一致 |
+| `branch_create` | name, base | `switch -c <name> <base>` | name 未存在・base が存在 | HEAD ブランチ = name・起点 = base |
+| `switch` | branch | `switch <branch>` | 作業ツリーが clean | HEAD ブランチ = branch |
+
+- **生成**: 契約化パス（§8.10f `contract.md`。実行主体は ya-ta・§8.4）を拡張し、契約化脳が `runbook`（kind/params の列）を提案できるようにする。検証はコード側（kind 許可リスト・params の形式検査。`validate_contract` と同じ fail-closed）。脳が runbook の kind を完了条件欄に置く取り違え（2026-08-28 E2E で高頻度に実測）は、カタログ名の完全一致判定で runbook へ機械移送する（決定的・LLM 不使用。params 不正は移送後も従来どおり契約不成立）。**語列挙による agent ステップの自動変換は行わない**（自然文からの機械変換は、§8.3 の probe 規律導入時に廃した語列挙検出と同じ脆さ）。ただし決定的な**警告補助**は付す: 確定要約・directive に push / merge 系の語があるのに runbook が空なら、着手確認へ「git 操作が agent 実行になっています」の注意行を機械付与する（判断は人）
+- **残作業の導出（計画時の step 実測）**: 計画を組む時点で各 runbook step の事後条件を実測し、**既に成立している step は計画に載せず「済（実測）」として着手確認へ明示**する。失敗で終わったタスクへの自然な続き（「もう一回やって」）に、済んだ commit / push を再提案して前提不成立で再失敗する構造を塞ぐ（2026-08-28 E2E 実測の是正）。判定不能（SSH 不達等）は計画に載せる側へ倒し、実行時の前提実測が最終防衛となる
+- **分解の二重実行抑止（`rest_summary` を分解入力にする）**: runbook を持つ計画で残り作業（ファイル作成・編集等）を agent サブタスクへ分解する際、分解入力を確定要約ではなく契約の `rest_summary`（§8.10f。runbook 操作を除いた残り作業の要約・無ければ null）とする。`rest_summary` が null なら agent 分解自体を省略する（計画は runbook step のみ）— git 操作を含む確定要約を丸ごと分解へ渡し「runbook の操作をサブタスクに含めるな」の注意書き（プロンプト散文）で抑止する従来方式は、LLM の遵守頼みで二重実行（runbook と agent step が同じ push/merge を持つ）を構造的に防げない。入力から git 操作を除くことで抑止を構造にする。注意書きは多層として維持する。`rest_summary` 欠落（旧出力・検証縮退）や runbook が空の契約は従来どおり確定要約を分解する（縮退動作）。縮約の可視化は着手確認が担う: 計画（runbook のみ）と「残り作業: なし」の両方が人の承認対象になる
+- **提示と承認**: runbook の各 step は着手確認で**組み立て後のコマンド逐語**を提示し、計画と一緒に凍結される。承認された逐語列以外は構造的に実行できない（LLM が居ないため追加・置換・修復コマンドが発生し得ない）。これが Tier 判定の代替となる（decide デーモン / PreToolUse フックは worker プロセス内でのみ発火するため runbook レーンを通らない — 「人間が事前に逐語承認した固定列のみ」がそれと等価以上の統制であることを設計上の根拠とする）。qu-e file_audit は独立に効き続ける（多層維持）
+- **実行**: dispatcher は `execution=runbook` の step を `RemoteProcessManager.run_ssh_command`（既存・書込可）で直接実行する。実行したコマンドは遵守照合の記録（`_executed`）へ worker と同様に積む
+- **失敗**: 前提・事後測定の不成立は `failure_cause` に `runbook_precondition:<kind>` / `runbook_failed:<kind>` を記録し、検査の rc・実出力を添えて人へ返す。**修復しない**（dirty tree での merge は stash せず「未コミット変更 N 件」の実測を返す）
+- **住み分け**: runbook が置き換えるのは**純粋な repo 管理操作**（コミット・push・マージ・ブランチ作成/切替）。ファイルの作成・編集とその内容判断は従来どおり worker（LLM）の仕事であり、worker が自分の成果物をコミットする行為は禁じない（出口の acceptance / 遵守照合で統制）
+
+#### (2) repo 状態の実測回答（測定の拡張と機械判定行）
+
+- `repo_status` probe の固定コマンドセットを拡張する（すべて読み取り専用・workspace のみパラメータ化）: HEAD ブランチ / `status --porcelain` / `for-each-ref refs/heads --format='%(refname:short) %(objectname:short) %(upstream:track)'`（全ブランチの ahead/behind） / `branch --no-merged main`・`branch --merged main` / `log -5 --oneline` / `stash list`
+- 応答の先頭に**機械判定行**を付す: 「main へ未マージ: <ブランチ列>」「origin と差: main (ahead 2)」「未コミット変更: N 件」「stash: N 件」。導出は porcelain / for-each-ref の**機械形式出力のパースのみ**（LLM 不使用 — 従来の「raw ダンプ規律」は raw 併記で維持しつつ、質問に答えられる判定文を機械側が持つ）
+- **状態主張ゲート**: `progress_claim` の選別を実行状態の主張（実行した/していない・完了/未完・マージ/push 済み/未済）へ拡張する。LLM の役割は「reply が状態主張を含むか」の 1 問選別のみ（probe の型）。主張ありの reply は capture せず、`repo_status` + `task_status` の実測ブロックで**全置換**する（既存 `_claims_progress` の全置換パターンの拡張）。脳が probe を選ばずに状態を語る経路を塞ぐ
+- workspace 解決の欠陥是正: probe の workspace 参照に `session_workspace`（`repo:` 指定で即設定される値）を加える（現状は `_last_workspace` のみでタスク未実行の会話では常に「workspace が見つかりません」に落ちる）
+- **直近タスクの帰結の実測回答（終端記録＋回答時再検査）**: 「済んだのか」型の実行の事実確認への応答は、この会話の**直近タスクの終端記録**（done アーカイブ。完了/失敗と、記録時に実測された完了検査の結果を含む）を第一の実測源として読む。実行中タスクの有無だけでは帰結の質問に答えられない（2026-08-28 E2E 実測: マージ完了 30 秒後の「マージは終わったか」に「実行中 0 件」としか答えられなかった — 終端記録への読み経路の欠落）。記録は過去のある時点の測定にすぎないため鵜呑みにしない: 記録に残る完了条件（kind/params）を**回答時点で再実測**（GroundingVerifier — 出口検査・reconcile と同一部品）して併記し、食い違いは現在の実測を優先して明示する。担保は 2 段 — 書く時（成功は事後測定・完了検査の PASS でしか記録されない・(1)）と読む時（この再検査）。repo を使わない依頼（純生成等）は終端記録の実在と結果が実測の上限で、それ以上は断言しない
+
+#### (3) 再入 reconcile（完了条件の事前実測）
+
+計画・着手確認を出す**前に**、世界の実状態を測って「もう済んでいる仕事」を実行系に入れない。
+
+- 挿入位置は ready 直後・反復停止ゲート（§8.10f）と同一ブロック（契約化の直後・着手確認提示の前）。ハートビート（§10.8）配下で実行する
+- **新契約の事前実測**: 契約の `acceptance` を `GroundingVerifier.verify_acceptance`（既存・単独呼出可）で即時検査する。**全 kind PASS** なら着手確認を出さず、「完了条件は既に満たされています（実測）」と証跡を返し、再実行には明示指示を要求する。明示指示の実体は既存の明示エスケープ `/taka-ma-go`（force_ready）で、このときだけ reconcile を通過して計画提示へ進む（反復停止ゲートと同じ規律。エスケープ無しでは達成済み依頼を再実行できない）。**部分 PASS** なら着手確認に「済（実測): <検査列>」行を機械付与する（計画 step 自体の縮約はしない — step と acceptance の対応は機械的に取れないため。既知の限界として明記）
+- **open intent の再検査**: `_finalize_goal` の open intent 再検査ループ（§8.10f「依頼の寿命」）の発火点に「会話の ready 時」を追加する。後続の実行を経ずに達成されていた依頼も、ユーザーの次の発話時点で機械検出して閉じる
+- これにより「同一計画の再提示ループ」は構造的に停止する: 達成済みなら実測報告で止まり、未達成なら反復停止ゲート（連続 2 回失敗）が効く
+
+#### (4) 同因の実装欠陥の是正（本インシデントで実測）
+
+- **file_audit Reject の revert タスクへの workspace 継承**: Reject（§8.12）が投入する revert タスクは、従来 workspace を持たず既定の捨て作業場で実行されていた（2026-08-27 実測: revert 対象の実リポジトリを見失い「作業ツリーは clean」の空振り報告になった）。qu-e は変更の帰属タスクの workspace を task context（§8.13）で既に知っているため、file_audit アラートに `workspace` を同梱し、u-zu が revert タスクの `workspace` として引き継ぐ。workspace を持たない旧アラートは従来動作へ縮退する
+
+#### E2E 検証の観点（本節の受け入れ）
+
+2026-08-27 の 3 失敗類型をそのまま再現シナリオとする:
+
+1. dirty tree を持つリポジトリへ「コミット → push → main マージ」を依頼 → runbook 化され、stash が発生せず、前提不成立時は実測つき失敗で止まる
+2. マージ実施後に「マージは終わったか」を質問 → 機械判定行（実測）で正答し、LLM 記憶による状態主張が画面に出ない
+3. 達成済みの依頼を再度指示 → 計画を再提示せず「完了条件は既に満たされています（実測）」で止まる
 
 ### 8.11 qu-e → sa-ru（監査アラート）
 

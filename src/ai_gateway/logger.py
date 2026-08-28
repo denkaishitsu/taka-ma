@@ -57,3 +57,23 @@ class YaTaLogger:
         }
         with open(self._log_path(), "a") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def log_contract(self, origin, attempts: list[dict]):
+        """契約化 1 回分の試行列を当日ログに追記する（設計書 §8.4.x (e)）。
+
+        昇格ラダーの較正（どのモデルで何が不合格だったか）の一次データ。判定ログと
+        同じファイルに kind で区別して混載する（日付 rotation を二重に持たない）。
+
+        Args:
+            origin: 契約を確定したモデル（"local"=ya-ta ローカル / モデル名=昇格 /
+                None=全段失敗）。
+            attempts: 試行列 [{"model": 名前, "problems": 不合格理由リスト}, ...]。
+        """
+        entry = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "kind": "contract",
+            "origin": origin,
+            "attempts": attempts,
+        }
+        with open(self._log_path(), "a") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")

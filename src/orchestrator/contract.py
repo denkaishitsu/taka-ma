@@ -7,6 +7,8 @@ orchestrator が担う）。テストが実機・モデルに依存しないよ�
 
 import re
 
+from orchestrator import runbook as runbook_rules
+
 # 完了条件の検査カタログ（§8.10f）。LLM に自由な検査コマンドを書かせず、検査はこの
 # kind とパラメータの組に限定する（probe と同じ「LLM 出力を任意コマンド実行に接続しない」規律）。
 # コマンド組立は grounding.GroundingVerifier.verify_acceptance（コード側）が行う。
@@ -16,10 +18,14 @@ ACCEPTANCE_KINDS = {
     "file": {"required": {"path"}, "optional": set()},
     "head_touches": {"required": {"path"}, "optional": set()},
     "diff_limit": {"required": {"max_lines"}, "optional": {"path"}},
+    # マージ完了の検査（§8.10g）。「source が target に取り込まれたか」を merge-base で
+    # 実測する。2026-08-28 E2E 実測: この語彙が無く、マージを含む依頼の完了条件が
+    # commit/push しか表せなかった（脳が操作名 merge_ff で代用しようとする誘因にもなった)
+    "branch_merged": {"required": {"source", "target"}, "optional": set()},
 }
 
 # リポジトリ系の検査（§8.10f needs_repo の機械補助: これを含む契約は実リポジトリを要する）
-REPO_KINDS = {"pushed", "remote_file", "head_touches", "diff_limit"}
+REPO_KINDS = {"pushed", "remote_file", "head_touches", "diff_limit", "branch_merged"}
 
 # 整数パラメータ（検査コマンド文字列には乗せず比較にのみ使う）。上限は暴走値の拒否
 _INT_PARAMS = {"max_lines"}
@@ -90,8 +96,10 @@ def env_mutation_allows(directive: str | None) -> list[str]:
 def validate_contract(raw, source_text: str) -> tuple[dict | None, list[str]]:
     """契約化パスの LLM 出力を検証・正規化する。(契約 dict, 逸脱理由リスト) を返す。
 
-    逸脱が 1 つでもあれば契約は None（fail-closed。呼び出し側がリトライ / 人へ差し戻す）。
-    正規化済み契約は {directive, constraints, acceptance, workspace, needs_repo}。
+    逸脱が 1 つでもあれば契約は None（fail-closed。呼び出し側がリトライ・昇格 /
+    人へ差し戻す）。正規化済み契約は {directive, constraints, acceptance, runbook,
+    workspace, needs_repo(, rest_summary)}。rest_summary キーは入力に在って型が
+    正しいときのみ載る（欠落は「従来どおり確定要約を分解」の縮退印・§8.10g）。
     workspace はここでは文字列のまま返す（絶対パス検証・~ 展開は conversation.parse_workspace
     と同一規則に通す責務が呼び出し側にある。検証規則を二重に持たない）。
     """
@@ -133,9 +141,19 @@ def validate_contract(raw, source_text: str) -> tuple[dict | None, list[str]]:
                     patterns.append(p.strip())
         constraints.append({"text": text, "forbid": forbid, "patterns": patterns})
 
+    # 脳が runbook の kind（merge_ff 等）を完了条件欄に置く誤りを機械補正する（§8.10g。
+    # カタログ名の完全一致のみで判定＝決定的・LLM 不使用。2026-08-28 E2E 実測: qwen が
+    # この取り違えを高頻度で再発し、fail-closed が契約ごと弾いて依頼が進まなくなる。
+    # 移送先の runbook 検証は通常どおり掛かる — params 不正なら従来どおり契約不成立）
+    raw_acceptance = [a for a in (raw.get("acceptance") or [])]
+    misplaced_runbook = [a for a in raw_acceptance
+                         if isinstance(a, dict)
+                         and a.get("kind") in runbook_rules.RUNBOOK_KINDS]
+    raw_acceptance = [a for a in raw_acceptance if a not in misplaced_runbook]
+
     # acceptance: カタログ検証（未知 kind・パラメータ不正は逸脱）
     acceptance: list[dict] = []
-    for a in raw.get("acceptance") or []:
+    for a in raw_acceptance:
         if not isinstance(a, dict) or a.get("kind") not in ACCEPTANCE_KINDS:
             problems.append(f"未知の検査 kind: {a.get('kind') if isinstance(a, dict) else a}")
             continue
@@ -169,28 +187,55 @@ def validate_contract(raw, source_text: str) -> tuple[dict | None, list[str]]:
             continue
         acceptance.append({"kind": kind, "params": params})
 
+    # runbook: 定型 git 操作の決定的実行列（§8.10g）。カタログ・パラメータ検証は
+    # runbook 側（コマンド組立と同居する SSOT）に委ねる。完了条件欄から移送された
+    # 誤配置分（上記）は既存の runbook 列の後ろへ足す。非配列の runbook は
+    # 従来どおり逸脱として弾かせる（移送で型エラーを覆い隠さない）
+    base_runbook = raw.get("runbook")
+    if base_runbook is None:
+        base_runbook = []
+    raw_runbook = (base_runbook + misplaced_runbook
+                   if isinstance(base_runbook, list) else base_runbook)
+    runbook, rb_problems = runbook_rules.validate_runbook(raw_runbook)
+    if rb_problems:
+        problems.extend(rb_problems)
+
     if problems:
         return None, problems
 
     # needs_repo: 脳の判定に機械補助を重ねる（§8.10f。directive の git コマンド・
-    # リポジトリ系検査があれば強制 true。脳が false と言っても機械判定が勝つ）
+    # リポジトリ系検査・runbook 列があれば強制 true。脳が false と言っても機械判定が勝つ）
     needs_repo = bool(raw.get("needs_repo"))
     if directive and _GIT_CMD_RE.search(directive):
         needs_repo = True
     if any(a["kind"] in REPO_KINDS for a in acceptance):
+        needs_repo = True
+    if runbook:
         needs_repo = True
 
     workspace = raw.get("workspace")
     if not isinstance(workspace, str) or not workspace.strip():
         workspace = None
 
-    return {
+    result = {
         "directive": directive,
         "constraints": constraints,
         "acceptance": acceptance,
+        "runbook": runbook,
         "workspace": workspace,
         "needs_repo": needs_repo,
-    }, []
+    }
+    # rest_summary: runbook 外の残り作業の要約（§8.10f。計画組立の分解入力専用・
+    # worker / 完了検査へは渡さない）。null は「残り作業なし＝agent 分解を省略」の
+    # 明示。キー欠落・型不正は契約不成立にせずキーを載せない（縮退＝従来どおり
+    # 確定要約を分解する。§8.10g 分解の二重実行抑止）
+    if "rest_summary" in raw:
+        rest = raw["rest_summary"]
+        if rest is None:
+            result["rest_summary"] = None
+        elif isinstance(rest, str) and rest.strip():
+            result["rest_summary"] = rest.strip()
+    return result, []
 
 
 # 依頼が push を含むかの検出（既定検査の自動付与用）。語彙は grounding.py の主張検出
@@ -280,6 +325,28 @@ def apply_default_acceptance(contract: dict, summary: str) -> dict:
     return contract
 
 
+# git 操作語の検出（§8.10g 警告補助）。push は _PUSH_WORD_RE、マージ/merge・コミット/commit
+# を加える。用途は**着手確認への注意行の付与のみ**（自動変換には使わない — 語列挙による
+# 言語理解は §8.3 probe 規律導入時に廃した方式。人が見る警告に限って許容する）
+_GIT_OP_WORD_RE = re.compile(
+    r"push(?:ed)?|プッシュ|merge|マージ|commit(?:ted)?|コミット", re.IGNORECASE)
+
+
+def runbook_warning(contract: dict, summary: str) -> str | None:
+    """git 操作を含みそうな依頼が runbook なしで agent 実行になるときの注意文（§8.10g）。
+
+    判定は決定的（語検出のみ）で、返すのは人向けの警告 1 行。変換・ブロックはしない
+    （判断は着手確認を見る人が行う）。runbook がある・git 操作語が無いなら None。
+    """
+    if contract.get("runbook"):
+        return None
+    text = f"{summary}\n{contract.get('directive') or ''}"
+    if _GIT_OP_WORD_RE.search(text):
+        return ("注意: git 操作を含む依頼ですが runbook（決定的実行）が未使用です。"
+                "git 操作は worker LLM の裁量実行になります")
+    return None
+
+
 def directive_command(directive: str) -> str:
     """逐語命令の worker 指示文（定型・§8.10f）。分解・言い換えを通さず原文を運ぶ。"""
     return ("以下のコマンドを記載どおり逐語実行し、実行したコマンドと実出力のみを報告せよ。"
@@ -332,6 +399,12 @@ def required_input_for(cause: str) -> str:
         return _REQUIRED_INPUT[cause]
     if base == "acceptance_failed":
         return "完了条件が満たせていません。条件または依頼内容を見直してください"
+    if base == "runbook_precondition":
+        return ("git 操作の前提が満たされていません（実測は失敗報告に併記）。"
+                "リポジトリ状態を確認し、対処を指示してください")
+    if base == "runbook_failed":
+        return ("git 操作が失敗しました（実測は失敗報告に併記）。"
+                "リポジトリ状態を確認し、対処を指示してください")
     return _REQUIRED_INPUT.get(base, "失敗原因を確認のうえ、依頼を修正してください")
 
 

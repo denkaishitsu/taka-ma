@@ -326,6 +326,10 @@ class FileAuditHandler(FileSystemEventHandler):
             team_id = task.get("team_id", "") if task else ""
             thread_ts = task.get("thread_ts") if task else None
             task_id = task.get("task_id", "") if task else ""
+            # 変更が属するタスクの workspace（§8.13 task_context 由来）。Reject の revert
+            # タスクが実リポジトリを見失わないよう、アラートまで運ぶ（§8.10g。2026-08-27
+            # 実測: workspace を持たない revert タスクが捨て作業場で実行され空振りした）
+            workspace = task.get("workspace", "") if task else ""
 
             # 変更内容の要約を作り、それを材料に qu-e LLM へ approve/deny/escalate を判定させる
             diff = self._compute_diff_summary(path, event_type)
@@ -342,6 +346,7 @@ class FileAuditHandler(FileSystemEventHandler):
                 "event": event_type,
                 "path": path,
                 "task_id": task_id,
+                "workspace": workspace,
                 "command": command,
                 "status": status,
             }
@@ -445,6 +450,9 @@ class FileAuditHandler(FileSystemEventHandler):
             "audit_log_id": audit_id,
             "task_id": record.get("task_id", ""),
             "path": record.get("path", ""),
+            # Reject の revert タスクへ実リポジトリを引き継ぐ（§8.10g。u-zu が
+            # enqueue_task(workspace=...) に載せる）
+            "workspace": record.get("workspace", ""),
             "decision": record.get("decision", "escalate"),
             "reason": record.get("reason", ""),
             "confidence": record.get("confidence", 0.0),

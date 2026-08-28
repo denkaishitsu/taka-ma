@@ -67,6 +67,7 @@ def _manager(tmp_dir):
                          "history_head_turns": 4, "history_tail_turns": 16},
         "task_context": {"workspace_base": "/opt/taka-ma/work",
                          "worker_home": "/Users/dev"},
+        "ya-ta": {"model": "dummy", "llm_timeout_sec": 60},
         "contract": {"intents_dir": tempfile.mkdtemp(prefix="intents-")},
     }
     return ConversationManager(config, _FakeNotifier(), task_dir=tmp_dir)
@@ -157,8 +158,10 @@ def test_awaiting_restored_from_session_file(monkeypatch):
 # 自体は実機 E2E とプロンプト（converse.md / progress_claim.md）の責務。
 
 def _claims(mgr, monkeypatch, value):
-    monkeypatch.setattr(mgr, "_claims_progress",
-                        lambda reply, progress=None: value)
+    # handle_message の選別入口は #158 で _claims_check（progress/state の 2 判定）へ
+    # 拡張された。本ファイルの検証対象は進行主張の配線のため state は常に False で固定する
+    monkeypatch.setattr(mgr, "_claims_check",
+                        lambda reply, progress=None: {"progress": value, "state": False})
 
 
 def test_probe_task_status_answers_with_measured(monkeypatch):

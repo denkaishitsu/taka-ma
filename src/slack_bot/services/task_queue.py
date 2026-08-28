@@ -17,12 +17,16 @@ TASK_DIR = "/opt/taka-ma/data/tasks"
 
 
 def enqueue_task(source: str, command: str, *, user_id: str, team_id: str,
-                 channel_id: str, thread_ts: str | None = None) -> str:
+                 channel_id: str, thread_ts: str | None = None,
+                 workspace: str | None = None) -> str:
     """§8.3 形式のタスクファイルを 1 件作成し、生成した task_id を返す。
 
     source: タスクの発生元（slack_command / slack_mention / slack_dm / slack_action）。
     team_id: 送信元ワークスペース。複数ワークスペース運用時に応答先を特定する（§8.3）。
     thread_ts: スレッド返信先。スレッド外（スラッシュコマンド等）では None。
+    workspace: 実開発リポジトリの絶対パス（§8.13 / §8.10g）。file_audit Reject の
+    revert タスク等、対象パスが確定している投入で使う。None ならキー自体を持たせない
+    （sa-ru 側が既定の使い捨て作業場を解決する従来動作）。
     """
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     task_id = str(uuid.uuid4())
@@ -38,6 +42,8 @@ def enqueue_task(source: str, command: str, *, user_id: str, team_id: str,
         "created_at": now,
         "updated_at": now,
     }
+    if workspace:
+        task["workspace"] = workspace
     os.makedirs(TASK_DIR, exist_ok=True)
     # ファイル名は時刻接頭辞 + task_id。sorted() 走査で投入順に処理されるようにする。
     ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
