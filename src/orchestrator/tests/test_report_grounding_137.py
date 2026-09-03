@@ -265,7 +265,8 @@ def test_run_worker_headless_raises_on_nonzero_exit(monkeypatch):
     o.config = {"headless": {
         "mini_host": "mac-mini", "decide_client": "/x/decide_client.py",
         "decide_socket": "/x/decide.sock", "hook_timeout_sec": 310,
-        "python_bin": "/opt/taka-ma-env/bin/python3", "run_timeout_sec": 60}}
+        "python_bin": "/opt/taka-ma-env/bin/python3", "run_timeout_sec": 60,
+        "stream_limit_bytes": 10 * 1024 * 1024}}
     o.process_mgr = types.SimpleNamespace(run_ssh_command=lambda *a, **k: "")
     o._mbp_host = "mbp"
     # §8.14 / #139（merge 統合: _run_worker_headless が起動前に preflight.check を呼ぶ）

@@ -50,7 +50,7 @@ def test_env_mutation_list_identical_both_ends():
 
 def _validate_acceptance(acc):
     raw = {"directive": None, "constraints": [], "acceptance": acc,
-           "workspace": None, "needs_repo": True}
+           "workspace": None, "needs_repo": True, "rest_summary": None}
     return contract_rules.validate_contract(raw, "一行だけ追記しろ")
 
 

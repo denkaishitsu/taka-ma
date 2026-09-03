@@ -38,7 +38,8 @@ from ai_gateway.risk_classifier import RiskClassifier
 from orchestrator.process_manager import RemoteProcessManager
 from orchestrator.slack_notifier import SlackNotifier
 from orchestrator.pty_wrapper import WorkerPtyWrapper
-from orchestrator.headless_runner import WorkerHeadlessRunner, build_hook_settings
+from orchestrator.headless_runner import (
+    StreamReadError, WorkerHeadlessRunner, build_hook_settings)
 from orchestrator.preflight import AuthPreflight, PreflightFailure
 from orchestrator import contract as contract_rules
 from orchestrator import intent_store
@@ -151,6 +152,17 @@ def _select_method(model_conf: dict, use_case: str = "default") -> str:
 # worker 出力の自己申告昇格マーカー。worker が「このタスクは自分の手に余る」と判断した際に
 # 出力へ埋め込む（設計書 §2.2「昇格の引き金 (a)」）。行頭一致で検出する。
 ESCALATE_MARKER = "ESCALATE:"
+
+# 既定裁量の定型（§8.10f 配布規則・コード側テンプレート）。全 worker step（runbook 除く）の
+# 指示文末尾へ機械付与する。生成・編集依頼で worker が細部を質問だけ返して止まり、成果物ゼロで
+# 「完了」する逸脱の是正（2026-09-03 E2E 実測: メモ作成依頼に内容を質問・完了検査 未達）。
+# 「前提の欠落は報告」を残すのは、不在の対象を創作させないため（同日 E2E: ファイル不在への
+# 質問は正しい挙動だった）
+DEFAULT_DISCRETION_NOTE = (
+    "\n\n（この実行は非対話です。確認の質問への回答は届きません。実装の細部"
+    "（内容・文言・書式・命名等）は妥当な既定で自ら決めて成果物を作成してください。"
+    "作業を妨げる前提の欠落（対象の不在等）がある場合のみ、作業せず理由を報告して"
+    "ください）")
 
 
 def _escalate_reason(output: str) -> str | None:
@@ -869,6 +881,14 @@ class Orchestrator:
                 status = record.get("status")
                 if status in ("confirmed", "rejected"):
                     await self._finalize_confirm(path, record, status)
+                elif status == "superseded":
+                    # 新しい発話の契約化で失効した pending（§8.10b stale 計画の失効）。
+                    # 決着アクションは無く、退避のみ（放置するとディレクトリに滞留する）
+                    try:
+                        self.exec_confirm_q.mark_done(path)
+                    except Exception:
+                        logger.exception("失効レコードの退避に失敗、隔離: %s", path)
+                        self.exec_confirm_q.quarantine(path)
             await asyncio.sleep(self.exec_confirm_poll)
 
     @property
@@ -941,8 +961,14 @@ class Orchestrator:
 
         - pending のまま       → 何もしない（人間の決着待ち。期限なし）
         - approved             → 承認レコードを done/ へ退避し、タスクを init へ戻して再投入
-        - rejected / その他    → タスクを failed で中止
-        - レコード不在         → 追跡不能。failed で中止する（保留の拠り所を失っており、放置
+        - rejected             → **タスクは中止しない**。レコードを done/ へ退避（rejected の
+                                 まま＝却下の引き継ぎの根拠になる）し、タスクを再投入する。
+                                 worker が同一操作へ再到達したら rejection_carryover が
+                                 再依頼なしで deny し、worker は代替 or 遂行不能報告へ進む
+                                 （§8.10 却下の粒度。2026-08-30 実測: 付随操作の却下が
+                                 承認済みの本体作業ごとタスクを道連れにした — の是正。
+                                 タスク全体の中止は中止命令 §8.10d のみが行う）
+        - その他 / レコード不在 → 追跡不能。failed で中止する（保留の拠り所を失っており、放置
                                  すると誰にも決着させられないタスクが永久に残る）
 
         再投入前に承認レコードを退避するのは、保留を解消してからでないと次の worker が
@@ -959,7 +985,9 @@ class Orchestrator:
         if record is not None and status == STATUS_APPROVAL_PENDING:
             return  # 決着待ち（保留の正常状態）
 
-        if status == STATUS_APPROVAL_APPROVED:
+        if status in (STATUS_APPROVAL_APPROVED, STATUS_APPROVAL_REJECTED):
+            # 却下も再投入する（§8.10 却下の粒度）。退避された rejected レコードは
+            # rejection_carryover の根拠になり、同一操作は再依頼なしで deny される
             await asyncio.to_thread(self._archive_held_records, task_id, request_id)
             # 再投入回数の上限（§8.10）。承認 → 再投入 → 同じ操作で再び保留、が延々繰り返す
             # 場合に打ち切る。上限は「収束しなかった」ことの表明であり、承認そのものの否定ではない。
@@ -987,29 +1015,24 @@ class Orchestrator:
                 "_reinject_count": reinject_count,
                 "held_approval_id": "",
             })
-            await self._notify("承認を確認しました。未了分から再開します。", channel,
-                               team_id=team_id, thread_ts=thread_ts)
+            if status == STATUS_APPROVAL_REJECTED:
+                await self._notify(
+                    "却下された操作を禁止して続行します（当該操作のみ deny・タスクは継続）。",
+                    channel, team_id=team_id, thread_ts=thread_ts)
+            else:
+                await self._notify("承認を確認しました。未了分から再開します。", channel,
+                                   team_id=team_id, thread_ts=thread_ts)
             return
 
-        # rejected / レコード不在 / 想定外 status → 中止
+        # レコード不在 / 想定外 status → 中止
         if record is None:
             reason = f"承認レコードが見つかりません (ID: {request_id})"
             message = f"承認待ちの記録を追跡できないため中止しました（ID: {request_id}）。"
-        elif status == STATUS_APPROVAL_REJECTED:
-            reason = f"人間承認が却下されました (ID: {request_id})"
-            message = "却下により中止しました。"
         else:
             reason = f"承認レコードが想定外の status です: {status} (ID: {request_id})"
             message = f"承認の状態を解釈できないため中止しました（status={status}）。"
         await asyncio.to_thread(self._archive_held_records, task_id, request_id)
-        # 却下は機械可読の原因コードで記録する（§8.10f。却下された操作の自動再試行を
-        # 反復停止ゲートが塞ぐ材料になる）
-        cause = "approval_rejected" if status == STATUS_APPROVAL_REJECTED else None
-        result_path = await self._update_status(
-            path, "failed", result=reason,
-            extra=({"failure_cause": cause} if cause else None))
-        if cause:
-            await self._record_outcome(task, cause)
+        result_path = await self._update_status(path, "failed", result=reason)
         await self._notify(f"{message}\n結果ファイル: {result_path}", channel,
                            team_id=team_id, thread_ts=thread_ts)
 
@@ -1233,11 +1256,18 @@ class Orchestrator:
                 await asyncio.to_thread(self._finalize_goal, task, grounding)
             else:
                 cause = self._chain_failure_cause(futures)
+                # 失敗の実測証跡は終端記録（正本）と通知の両方へ載せる（§8.10g。
+                # 「Step N → 失敗」だけでは人が判定根拠を読めない — 2026-08-30 E2E の是正）
+                evidence = self._chain_failure_evidence(futures)
                 result_path = await self._update_status(
-                    task_file, "failed",
+                    task_file, "failed", result=evidence or None,
                     extra=({"failure_cause": cause} if cause else None))
                 await self._notify_failure(task, subtasks, results, failed_steps, channel,
                                            team_id, thread_ts, result_path=result_path)
+                if evidence:
+                    await self._notify_chunked("失敗の実測（判定根拠）:", evidence,
+                                               channel, team_id=team_id,
+                                               thread_ts=thread_ts)
                 await self._record_outcome(task, cause or "worker_error")
 
         except Exception as e:
@@ -1303,7 +1333,9 @@ class Orchestrator:
         try:
             workspace = self._resolve_workspace(task)
             verifier = GroundingVerifier(self.process_mgr.run_ssh_probe)
-            report = verifier.verify_acceptance(workspace, task.get("acceptance") or [])
+            # 契約に branch があれば当該 ref を対象に測る（§8.10f 測定の ref 化）
+            report = verifier.verify_acceptance(workspace, task.get("acceptance") or [],
+                                                default_branch=task.get("branch"))
             report.workspace = workspace
             return report
         except Exception as e:
@@ -1345,7 +1377,8 @@ class Orchestrator:
                     continue
                 verifier = GroundingVerifier(self.process_mgr.run_ssh_probe)
                 report = verifier.verify_acceptance(
-                    record["workspace"], record["acceptance"])
+                    record["workspace"], record["acceptance"],
+                    default_branch=record.get("branch"))
                 if report.ok:
                     intent_store.set_goal_status(
                         intents_dir, record["task_id"], intent_store.GOAL_ACHIEVED)
@@ -1398,6 +1431,23 @@ class Orchestrator:
                 continue
             return self._failure_cause_from_error(exc)
         return None
+
+    def _chain_failure_evidence(self, futures: dict) -> str:
+        """失敗した連鎖の実測証跡を、サブタスク future の例外本文から集める（§8.10g）。
+
+        RunbookError の本文は前提・事後測定の証跡（$ コマンド / rc / 実出力）を同梱して
+        いる。従来これが通知・終端記録のどちらにも載らず、人には「Step N → 失敗」しか
+        届かなかった（2026-08-30 E2E 実測: 前提不成立の判定根拠が読めない — の是正）。
+        """
+        parts: list[str] = []
+        for step, fut in sorted(futures.items()):
+            if not fut.done() or fut.cancelled():
+                continue
+            exc = fut.exception()
+            if exc is None or isinstance(exc, ApprovalHold):
+                continue
+            parts.append(f"Step {step}: {exc}")
+        return "\n\n".join(parts)
 
     def _write_task_deny(self, task: dict):
         """禁止型拘束（§8.10f constraints forbid=true）をタスク別 deny 規則として登録する。
@@ -1632,6 +1682,9 @@ class Orchestrator:
                 task.get("constraints") or [])
             if constraints_block:
                 command = constraints_block + command
+            # 既定裁量の定型（§8.10f 配布規則）: runbook はこの地点より前で return 済みの
+            # ため、付与対象は agent / inline の全 worker step に構造的に限られる
+            command = command + DEFAULT_DISCRETION_NOTE
 
             await self._notify(f"  サブタスク {step}: {_axis_label(subtask)}", channel,
                               team_id=task.get("team_id"), thread_ts=task.get("thread_ts"))
@@ -1940,6 +1993,15 @@ class Orchestrator:
                     return
                 result_future.set_result(output)
                 return
+            except StreamReadError as e:
+                # stream-json 読取失敗（行長上限超過等）はインフラ起因で worker の能力と
+                # 無関係。「難所」と誤解釈して昇格ラダーを回すと偽昇格（haiku→sonnet→opus）
+                # と誤った難所統計を生むため、ここで打ち切り failed に倒す（設計 §8.5）。
+                last_error = e
+                await self._notify(
+                    f"  {model_name} stream 読取エラー（インフラ起因・昇格しません）: {e}",
+                    channel, team_id=team_id, thread_ts=thread_ts)
+                break
             except Exception as e:
                 last_error = e
                 await self._notify(
@@ -2214,7 +2276,8 @@ class Orchestrator:
         # SSH 越しに claude -p を起動し、stream-json を解析して最終出力を得る。
         runner = WorkerHeadlessRunner(
             instance_id, command=cli_command, model_flag=model_flag,
-            ssh_host=self._mbp_host, cwd=workspace, hook_settings_path=settings_path)
+            ssh_host=self._mbp_host, cwd=workspace, hook_settings_path=settings_path,
+            stream_limit_bytes=hcfg["stream_limit_bytes"])
         result = await runner.run(command, timeout=hcfg["run_timeout_sec"])
         # 実行された Bash コマンドを遵守照合（§8.10f）用に記録する。タスク終端
         # （_execute_chain の finally）で必ず破棄されるため肥大しない

@@ -69,6 +69,8 @@ Slack → Slack Bot (常駐) → launchctl start/stop → sa-ru / ya-ta
 | `/taka-ma-blender on` | SSH 経由で `brew services stop ollama` | MBP の ollama |
 | `/taka-ma-blender off` | SSH 経由で `brew services start ollama` | MBP の ollama |
 | `/taka-ma-ollama-stop` | controls/ へ制御命令を投入 → sa-ru が `stop_ollama()`（稼働モデルを `ollama stop`、§8.10c）。サービスは残し次推論で自動再ロード | MBP の ollama 稼働モデル |
+| `/taka-ma-go` | 実行の明示エスケープ。LLM 判定を待たず直近会話を要約して着手確認へ進める（force_ready）。Slack の slash command は thread_ts を運ばないため**チャンネル面の会話のみ**（設計書 §8.3） | sa-ru の会話 |
+| `@taka-ma go`（スレッド内） | スレッド会話の明示エスケープ。メンション本文が空白除去後に**逐語で `go` または `/taka-ma-go`** のとき、当該スレッド会話を force_ready で前進させる（逐語一致のみ。「go しろ」等は発火しない。設計書 §8.3） | sa-ru の会話 |
 
 ### Slack Bot 自体の管理
 

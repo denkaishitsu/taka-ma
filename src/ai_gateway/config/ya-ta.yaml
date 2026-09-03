@@ -32,6 +32,16 @@ ya-ta:
                               # ※ コードは HTTP API で num_ctx を渡さないため、実効値は
                               #   モデル側 Modelfile の PARAMETER num_ctx 32768 に焼き込んで担保する
                               #   （構築手順書 04 §1-2 参照。初期投入時に PyInfra が自動焼込）。
+  contractor:                 # 契約化（会話 → 実行契約の抽出・設計書 §8.4「契約化の呼び出し」）。
+                              # ローカル 27B 級 3 世代が実測不合格（2026-08-28 E2E 5 回中 4 回
+                              # 仕様違反・2026-08-29 意味不正）のため、契約化のみ worker CLI の
+                              # 上位モデルを既定にする。ready 毎 1 回の最低頻度・誤りコスト最大の
+                              # 1 点に確実なモデルを使う配分。分解・分類・リスク判定はローカル維持
+    backend: "worker_cli"     # worker_cli（既定）/ local。CLI の呼び出し自体の失敗（SSH 不達・
+                              # 認証失効）時は自動でローカル（上の model）へ縮退し、着手確認に
+                              # 縮退モードを明示する（検証 validate_contract は同一）
+    model: "opus"             # models レジストリのキー参照（モデル実体は models.opus が持つ。
+                              # 直書きしない）。契約化の失敗率・縮退頻度は判定ログ §8.4.1 で実測
 
 # ルーティング写像（light/heavy 2値 → execution × depth 直交2軸）
 # ya-ta は execution/depth/confidence の生判定のみ返し、モデルへの写像は orchestrator が

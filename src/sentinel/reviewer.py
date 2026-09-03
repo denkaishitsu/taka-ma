@@ -93,7 +93,8 @@ class QueReviewer:
     """
 
     def __init__(self, model: str, ollama_host: str, prompts_dir: str,
-                 inference_lock: str, *, review_timeout_sec: float):
+                 inference_lock: str, *, review_timeout_sec: float,
+                 keep_alive_sec: float):
         """レビューアを構築する。
 
         Args:
@@ -106,11 +107,15 @@ class QueReviewer:
                 1 件ずつに直列化する。
             review_timeout_sec: 審査 LLM（ollama HTTP）1 回の応答待ち上限秒
                 （qu-e.yaml の qu-e.review_timeout_sec が唯一の源。コード側に既定値なし）。
+            keep_alive_sec: 審査モデルの ollama 常駐時間（秒・数値。-1=無期限）。cold ロードが
+                審査タイムアウト → Tier 3 濫発を生むため常駐させる（設計 §8.8 審査の可用性。
+                qu-e.yaml の qu-e.keep_alive_sec が唯一の源。コード側に既定値なし）。
         """
         self.model = model
         self.ollama_url = ollama_host
         self._inference_lock = inference_lock
         self._review_timeout_sec = review_timeout_sec
+        self._keep_alive_sec = keep_alive_sec
         # ロックファイルの親ディレクトリを用意（初回 open で失敗しないように）。
         # ベア名（ディレクトリ成分なし）だと dirname="" で makedirs が FileNotFoundError に
         # なるため、その場合はカレント（"."）に倒す。
@@ -214,7 +219,10 @@ Respond in JSON:
             async with httpx.AsyncClient() as client:
                 resp = await client.post(
                     f"{self.ollama_url}/api/generate",
-                    json={"model": self.model, "prompt": prompt, "stream": False},
+                    # keep_alive は数値必須（-1=無期限）。審査モデルを常駐させ、cold ロードが
+                    # 審査タイムアウト → Tier 3 濫発を生む経路を除去する（設計 §8.8）。
+                    json={"model": self.model, "prompt": prompt, "stream": False,
+                          "keep_alive": self._keep_alive_sec},
                     timeout=self._review_timeout_sec,
                 )
                 # HTTP エラー応答（5xx 等）は "response" キーを欠くことがあり、そのまま

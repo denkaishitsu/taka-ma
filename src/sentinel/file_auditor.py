@@ -38,6 +38,13 @@ _BROAD_PATTERN_RE = re.compile(r"\A[*?/\[\]]+\Z")
 # （ollama コンテキスト溢れ・判定劣化）を防ぐ。超過分は切り詰めて明示する。
 _DIFF_MAX_CHARS = 4000
 
+# worker が作業中に作る一時成果物の既定除外（§8.12 一時成果物の既定除外）。
+# `.tmp-*` 名のディレクトリ配下・`*.tmp` ファイルは監査対象にしない（2026-08-30 実測:
+# mermaid 検証の一時ファイル 14 件が 1 件ずつ通知され、承認面が溺れた）。除外はパターン
+# 固定のコード側定数で、.gitignore 書き換え監査の思想（除外ルールの変更は監査する）とは
+# 競合しない（yaml の ignore_patterns と違い、書き換えで監査面を狭められない）。
+_TEMP_ARTIFACT_PATTERNS = (".tmp-*", "*.tmp")
+
 
 class GitignoreCache:
     """`.gitignore` のパターン列を mtime ベースでキャッシュする。
@@ -120,6 +127,8 @@ class FileAuditHandler(FileSystemEventHandler):
         # システム制御プレーンとして basename で除外する（§8.12 システム制御プレーンの除外）。
         self.control_plane_files: list[str] = config["file_audit"]["control_plane_files"]
         self.debounce_sec: float = config["file_audit"]["debounce_sec"]
+        # 同一 task_id の deny/escalate アラートをダイジェスト 1 通に集約する窓（§8.12）
+        self.alert_digest_window_sec: float = config["file_audit"]["alert_digest_window_sec"]
         self.log_dir: str = config["file_audit"]["log_dir"]
         self.alert_dir: str = config["file_audit"]["o_moi_alert_dir"]
         self.ssh_host: str = config["file_audit"]["mac_mini_host"]
@@ -138,6 +147,11 @@ class FileAuditHandler(FileSystemEventHandler):
         # 参照は watchdog ワーカースレッドだが、dict の単一キー代入/削除は GIL 下で
         # 安全なためロックは持たない
         self._suppressed_subtrees: dict[str, float] = {}
+        # アラートのダイジェスト集約台帳（§8.12 同一タスクの連続アラート集約）。
+        # task_id → {"alerts": [(audit_id, record), ...], "channel_id", "thread_ts",
+        # "team_id", "timer": TimerHandle}。_audit（イベントループ上）だけが触るため
+        # ロックは持たない
+        self._digest: dict[str, dict] = {}
         # ログ出力先は起動時に作っておく（初回書き込みで失敗しないように）
         os.makedirs(self.log_dir, exist_ok=True)
 
@@ -192,8 +206,8 @@ class FileAuditHandler(FileSystemEventHandler):
             return False
         # パスを構成要素に分解し、各要素単位でパターン照合する（中間ディレクトリの除外も拾うため）
         parts = path.split(os.sep)
-        # 固定の無視パターン ∪ そのリポジトリの .gitignore
-        patterns = list(self.ignore_patterns)
+        # 固定の無視パターン ∪ 一時成果物の既定除外（コード側定数）∪ そのリポジトリの .gitignore
+        patterns = list(self.ignore_patterns) + list(_TEMP_ARTIFACT_PATTERNS)
         gitignore = self._find_gitignore(path)
         if gitignore:
             patterns.extend(self._gitignore.get_patterns(gitignore))
@@ -356,13 +370,77 @@ class FileAuditHandler(FileSystemEventHandler):
             # 想定外の値）はすべて sa-ru へ通知して人間確認に回す。reviewer 側で decision は
             # approve/deny/escalate に正規化済みだが、ここでも「approve 以外は通知」を基準にする。
             if record.get("decision") != "approve":
-                self._push_alert_to_o_moi(audit_id, record, channel_id, thread_ts, team_id)
+                if task_id:
+                    # 同一タスクからの連続アラートは窓内でダイジェスト 1 通に集約する（§8.12。
+                    # 1 件ずつのボタン付き連投は本当に見るべき承認の注意を薄める）
+                    self._enqueue_digest(task_id, audit_id, record,
+                                         channel_id, thread_ts, team_id)
+                else:
+                    # タスクに紐付かない匿名変更は集約キーが無く、即時に個別通知する
+                    self._push_alert_to_o_moi(audit_id, record, channel_id, thread_ts, team_id)
         except Exception:
             # 1 件の失敗で監視を止めない。原因追跡のためスタックトレースは残す
             logger.exception("file_audit 処理失敗: path=%s", path)
             # fail-closed: 監査できなかった変更を無音で通さない。判定を得られなかった事実を
             # 最小情報で人間へ escalate 通知する（監視が沈黙したまま危険変更が通る経路を塞ぐ）。
             self._push_audit_failure_alert(path, event_type)
+
+    def _enqueue_digest(self, task_id: str, audit_id: str, record: dict,
+                        channel_id: str, thread_ts: str | None, team_id: str):
+        """deny/escalate アラートをタスク別ダイジェスト台帳へ積む（§8.12 連続アラート集約）。
+
+        同一 task_id の最初のアラートで alert_digest_window_sec のタイマーを張り、窓が
+        閉じた時点で 1 通にまとめて push する（1 件だけなら従来どおりの個別アラート）。
+        イベントループ上（_audit）からのみ呼ばれるため台帳アクセスは直列。
+        """
+        entry = self._digest.get(task_id)
+        if entry is None:
+            entry = {"alerts": [], "channel_id": channel_id, "thread_ts": thread_ts,
+                     "team_id": team_id,
+                     "timer": self.loop.call_later(
+                         self.alert_digest_window_sec,
+                         lambda: self._flush_digest(task_id))}
+            self._digest[task_id] = entry
+        entry["alerts"].append((audit_id, record))
+
+    def _flush_digest(self, task_id: str):
+        """窓が閉じたタスクのダイジェストを 1 通の代表アラートとして push する（§8.12）。
+
+        1 件だけなら個別アラートそのまま。複数件は件数＋パス列挙＋代表理由（先頭件）を
+        1 レコードに畳む。decision は 1 件でも deny があれば deny（安全側の代表値）。
+        個別レコードは監査ログ（jsonl）に記録済みで、ダイジェストは通知面だけを束ねる。
+        """
+        entry = self._digest.pop(task_id, None)
+        if not entry or not entry["alerts"]:
+            return
+        alerts = entry["alerts"]
+        try:
+            if len(alerts) == 1:
+                audit_id, record = alerts[0]
+                self._push_alert_to_o_moi(audit_id, record, entry["channel_id"],
+                                          entry["thread_ts"], entry["team_id"])
+                return
+            first_id, first = alerts[0]
+            paths = [rec.get("path", "") for _, rec in alerts]
+            digest = dict(first)
+            digest["decision"] = ("deny" if any(
+                rec.get("decision") == "deny" for _, rec in alerts) else "escalate")
+            digest["reason"] = (
+                f"同一タスクの連続アラート {len(alerts)} 件を集約"
+                f"（代表理由: {first.get('reason', '')}）")
+            digest["diff_summary"] = "対象パス:\n" + "\n".join(f"- {p}" for p in paths)
+            # 代表 id は先頭件の audit_log_id（jsonl と突合可能な実在 id）。構成メンバーの
+            # id も添えて、個別の監査記録へ辿れるようにする（sa-ru 側は .get で安全に無視可）
+            digest["member_audit_ids"] = [aid for aid, _ in alerts]
+            self._push_alert_to_o_moi(first_id, digest, entry["channel_id"],
+                                      entry["thread_ts"], entry["team_id"])
+        except Exception:
+            # ダイジェスト組み立ての失敗で通知を無音ロストさせない（fail-closed）
+            logger.exception("アラートダイジェスト push 失敗: task_id=%s", task_id)
+            self._push_audit_failure_alert(
+                alerts[0][1].get("path", ""), "digest",
+                reason=f"アラートダイジェストの組み立てに失敗（task_id={task_id}・"
+                       f"{len(alerts)} 件）。個別の監査記録は jsonl にある。人間確認が必要")
 
     def _pick_task_context(self, path: str) -> dict | None:
         """変更パスが属するタスクを workspace 接頭辞で特定する（§8.13、複数並行対応）。
@@ -462,6 +540,8 @@ class FileAuditHandler(FileSystemEventHandler):
             "channel_id": channel_id,
             "team_id": team_id,
             "thread_ts": thread_ts,
+            # ダイジェスト集約（§8.12）の構成メンバー audit id。個別アラートでは空
+            "member_audit_ids": record.get("member_audit_ids", []),
         }
         # alert_dir を作ってから標準入力で JSON を流し込む（1 コマンドで mkdir + 書き込み）。
         # ファイル名を audit_id にすることで sa-ru 側が監査ログと突き合わせられる。

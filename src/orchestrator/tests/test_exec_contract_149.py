@@ -52,7 +52,8 @@ SOURCE = ("repo:/Users/dev/DevDev/projects/xxx で作業しろ\n"
 def test_validate_accepts_verbatim_directive():
     validated, problems = contract_rules.validate_contract(
         {"directive": "git push -u origin feature/docs", "constraints": [],
-         "acceptance": [], "workspace": None, "needs_repo": False}, SOURCE)
+         "acceptance": [], "workspace": None, "needs_repo": False,
+         "rest_summary": None}, SOURCE)
     assert problems == []
     assert validated["directive"] == "git push -u origin feature/docs"
     # directive に git コマンド → needs_repo は機械補助で強制 true
@@ -65,7 +66,7 @@ def test_validate_accepts_verbatim_directive_regardless_of_language():
     source = "docs を feature ブランチへ push しろ"
     validated, problems = contract_rules.validate_contract(
         {"directive": "docs を feature ブランチへ push しろ",
-         "constraints": [], "acceptance": []}, source)
+         "constraints": [], "acceptance": [], "rest_summary": None}, source)
     assert problems == []
     assert validated["directive"] == "docs を feature ブランチへ push しろ"
 
@@ -88,7 +89,7 @@ def test_validate_rejects_fabricated_constraint():
 def test_validate_constraint_patterns_min_length():
     """短すぎる deny パターン（無差別ブロックの危険）は捨てられる。"""
     validated, problems = contract_rules.validate_contract(
-        {"directive": None, "acceptance": [],
+        {"directive": None, "acceptance": [], "rest_summary": None,
          "constraints": [{"text": "鍵の再登録はするな", "forbid": True,
                           "patterns": ["ssh-keygen", "git"]}]}, SOURCE)
     assert problems == []
@@ -112,6 +113,7 @@ def test_validate_rejects_unsafe_acceptance_params():
 def test_validate_repo_kind_forces_needs_repo():
     validated, problems = contract_rules.validate_contract(
         {"directive": None, "constraints": [], "needs_repo": False,
+         "rest_summary": None,
          "acceptance": [{"kind": "remote_file",
                          "params": {"branch": "feature/docs", "path": "docs/01.md"}}]},
         SOURCE)
@@ -328,12 +330,12 @@ def test_directive_contract_freezes_verbatim_plan(monkeypatch):
     tmp = tempfile.mkdtemp()
     mgr = _manager(tmp)
     _ready(mgr, monkeypatch)
-    monkeypatch.setattr(mgr, "_build_contract", lambda cid, summary, progress=None: {
+    monkeypatch.setattr(mgr, "_build_contract", lambda cid, summary, progress=None, force_ready=False: ({
         "directive": "git push -u origin feature/docs",
         "constraints": [{"text": "鍵の再登録はするな", "forbid": True,
                          "patterns": ["ssh-keygen"]}],
         "acceptance": [{"kind": "pushed", "params": {}}],
-        "workspace": None, "needs_repo": True})
+        "workspace": None, "needs_repo": True}, {}))
 
     mgr.handle_message(_msg("repo:/Users/dev/DevDev/projects/xxx git push -u origin feature/docs をやれ"))
 
@@ -361,9 +363,9 @@ def test_needs_repo_without_workspace_blocks_before_confirm(monkeypatch):
     tmp = tempfile.mkdtemp()
     mgr = _manager(tmp)
     _ready(mgr, monkeypatch)
-    monkeypatch.setattr(mgr, "_build_contract", lambda cid, summary, progress=None: {
+    monkeypatch.setattr(mgr, "_build_contract", lambda cid, summary, progress=None, force_ready=False: ({
         "directive": None, "constraints": [], "acceptance": [],
-        "workspace": None, "needs_repo": True})
+        "workspace": None, "needs_repo": True}, {}))
 
     mgr.handle_message(_msg("既存リポジトリのコードを直して"))
 
@@ -376,7 +378,7 @@ def test_contract_failure_blocks_confirm(monkeypatch):
     tmp = tempfile.mkdtemp()
     mgr = _manager(tmp)
     _ready(mgr, monkeypatch)
-    monkeypatch.setattr(mgr, "_build_contract", lambda cid, summary, progress=None: None)
+    monkeypatch.setattr(mgr, "_build_contract", lambda cid, summary, progress=None, force_ready=False: (None, {}))
 
     mgr.handle_message(_msg("なにかやって"))
 
@@ -389,9 +391,9 @@ def test_contract_workspace_proposal_is_validated_and_used(monkeypatch):
     tmp = tempfile.mkdtemp()
     mgr = _manager(tmp)
     _ready(mgr, monkeypatch)
-    monkeypatch.setattr(mgr, "_build_contract", lambda cid, summary, progress=None: {
+    monkeypatch.setattr(mgr, "_build_contract", lambda cid, summary, progress=None, force_ready=False: ({
         "directive": None, "constraints": [], "acceptance": [],
-        "workspace": "~/DevDev/projects/xxx", "needs_repo": True})
+        "workspace": "~/DevDev/projects/xxx", "needs_repo": True}, {}))
 
     mgr.handle_message(_msg("さっきのリポジトリの続きをやって"))
 
@@ -405,9 +407,9 @@ def test_repeated_cause_stops_replanning(monkeypatch):
     tmp = tempfile.mkdtemp()
     mgr = _manager(tmp)
     _ready(mgr, monkeypatch)
-    monkeypatch.setattr(mgr, "_build_contract", lambda cid, summary, progress=None: {
+    monkeypatch.setattr(mgr, "_build_contract", lambda cid, summary, progress=None, force_ready=False: ({
         "directive": None, "constraints": [], "acceptance": [],
-        "workspace": None, "needs_repo": False})
+        "workspace": None, "needs_repo": False}, {}))
     task = {"conversation_id": "c1"}
     mgr.record_task_outcome(task, "workspace_not_repo")
     mgr.record_task_outcome(task, "workspace_not_repo")
@@ -427,9 +429,9 @@ def test_repeated_cause_resets_on_new_workspace(monkeypatch):
     tmp = tempfile.mkdtemp()
     mgr = _manager(tmp)
     _ready(mgr, monkeypatch)
-    monkeypatch.setattr(mgr, "_build_contract", lambda cid, summary, progress=None: {
+    monkeypatch.setattr(mgr, "_build_contract", lambda cid, summary, progress=None, force_ready=False: ({
         "directive": None, "constraints": [], "acceptance": [],
-        "workspace": None, "needs_repo": False})
+        "workspace": None, "needs_repo": False}, {}))
     task = {"conversation_id": "c1"}
     mgr.record_task_outcome(task, "workspace_not_repo")
     mgr.record_task_outcome(task, "workspace_not_repo")

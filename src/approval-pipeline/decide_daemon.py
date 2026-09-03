@@ -45,6 +45,14 @@ _TASK_DENY_DIR = os.environ.get("TAKA_MA_TASK_DENY_DIR", "/opt/taka-ma/data/task
 # 契約 directive（人が着手確認で承認した逐語命令）に含まれる場合のみ、sa-ru が task-deny
 # 規則へ書く allow_env が優先する。orchestrator/contract.py の ENV_MUTATION_COMMANDS と
 # 同一リストであること（grep で両端一致を確認する）
+# 読み取り専用ツールの固定小リスト（§8.4 決定的前置フィルタ）。副作用を持たないツール名の
+# 完全一致のみ。Bash 等の内容依存ツールは含めない（コマンド文字列の自然文解析はしない —
+# 判定できないものはリストに入れない fail-closed）。2026-08-29 実測（ToolSearch を
+# Tier 3 判定）の是正: これらは LLM 判定を呼ばず Tier 1 確定にする
+_READ_ONLY_TOOLS = frozenset({
+    "Read", "Grep", "Glob", "LS", "ToolSearch", "WebSearch",
+})
+
 _ENV_MUTATION_DENY = ("git init", "git remote add", "git remote set-url",
                       "git remote remove", "git config")
 # deny ファイル名に使う task_id の受理形式（パス区切り・親参照でディレクトリ外を読まない）
@@ -168,6 +176,18 @@ class DecideDaemon:
         if deny_reason:
             logger.info("タスク別 deny 規則で拒否: task_id=%s (%s)", task_id, deny_reason)
             return {"allow": False, "reason": deny_reason}
+        # 読み取り専用ツールの決定的前置フィルタ（§8.4）: 固定小リストの完全一致は
+        # Tier 判定（LLM）を呼ばず即 allow。deny 系（タスク別 deny・既定 deny）の後に
+        # 置く — deny は Bash のみが対象のため read-only ツールとは交差しないが、
+        # 「決定論の deny が常に先」の判定順を崩さない
+        if pending.tool_name in _READ_ONLY_TOOLS:
+            # 高頻度（worker の Read/Grep 全件）のため info でなく debug（task-deny 分岐との
+            # ログ対称性は保ちつつ、常用ログを溢れさせない）
+            logger.debug("read-only 前置フィルタで許可: tool=%s task_id=%s",
+                         pending.tool_name, task_id)
+            return {"allow": True,
+                    "reason": f"読み取り専用ツール（決定的前置フィルタ・Tier 1 確定）: "
+                              f"{pending.tool_name}"}
         # deadline: 前段（リスク分類・qu-e 審査）の所要時間が Tier3 の人間待ちを圧迫しても、
         # 「内側（Tier3）が先に確定」を保つため、decide 全体の締切を中核へ渡す。5 秒の余白は
         # Tier3 確定後の監査記録・done/ 退避・応答書き込みが wait_for に切られないための猶予。

@@ -59,6 +59,10 @@ headless:
                                                         # される venv を既定にする）
   hook_timeout_sec: 310                                # PreToolUse フックの上限（Tier3 人間待ち 300 秒を切らない値）
   run_timeout_sec: 1800                                # claude -p 1 回の全体上限（秒）
+  stream_limit_bytes: 10485760                         # stream-json 1 行の読取上限（10MB）。既定 64KB では大きい
+                                                        # ファイルを読んだ tool_result 1 行で行長超過となり、読取
+                                                        # エラーが「難所」と誤解釈され偽昇格を起こした（設計 §8.5・
+                                                        # 2026-08-30 実測）。値の管理はここが唯一の源（コード定数なし）
 
 # worker 起動前の認証プリフライト（SSH / git remote / Anthropic）— AuthPreflight が参照
 # （Orchestrator._run_worker_headless が worker 起動直前に呼ぶ。コード側に既定値なし・SSOT）

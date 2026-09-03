@@ -210,7 +210,7 @@ def test_push_postcondition_mismatch_fails():
 def test_validate_contract_accepts_runbook_and_forces_needs_repo():
     raw = {"directive": None, "constraints": [], "acceptance": [],
            "runbook": [{"kind": "push", "params": {}}],
-           "workspace": None, "needs_repo": False}
+           "workspace": None, "needs_repo": False, "rest_summary": None}
     validated, problems = contract_rules.validate_contract(raw, "push しておいて")
     assert problems == []
     assert validated["runbook"] == [{"kind": "push", "params": {}}]
@@ -224,7 +224,8 @@ def test_validate_contract_migrates_runbook_kind_from_acceptance():
            "acceptance": [{"kind": "merge_ff",
                            "params": {"source": "feature/x", "target": "main"}},
                           {"kind": "file", "params": {"path": "docs/note.md"}}],
-           "runbook": [], "workspace": None, "needs_repo": True}
+           "runbook": [], "workspace": None, "needs_repo": True,
+           "rest_summary": None}
     validated, problems = contract_rules.validate_contract(raw, "もう一回やって")
     assert problems == []
     assert [r["kind"] for r in validated["runbook"]] == ["merge_ff"]
@@ -301,6 +302,9 @@ class _FakeProcMgr:
         if "ls -la" in command:
             return (0, "-rw-r--r-- 1 u s 1 a") if any(
                 p in command for p in self.present) else (1, "No such file")
+        if "diff-tree" in command:
+            # head_touches（状態遷移型）: present のパスを HEAD の変更として返す
+            return 0, "\n".join(self.present)
         return 0, ""
 
 
@@ -315,11 +319,26 @@ def _reconcile_cm(present):
 
 
 def test_reconcile_all_pass_suppresses_plan():
+    """状態遷移型検査（head_touches）を含む全 PASS は計画を出さず実測報告で止まる。"""
     cm = _reconcile_cm(present=["docs/a.md"])
-    contract = {"acceptance": [{"kind": "file", "params": {"path": "docs/a.md"}}]}
+    contract = {"acceptance": [
+        {"kind": "file", "params": {"path": "docs/a.md"}},
+        {"kind": "head_touches", "params": {"path": "docs/a.md"}},
+    ]}
     out = cm._reconcile_acceptance("cid", contract, "/tmp/repo", {"conversation_id": "cid"})
     assert out is None  # 全 PASS → 計画・着手確認を出さない
     assert any("完了条件は既に満たされています（実測）" in n for n in cm.slack.notes)
+
+
+def test_reconcile_existence_only_does_not_suppress():
+    """存在型（file）のみの事前 PASS は弁別力なし＝実行拒否しない（§8.10g 弁別力規則。
+    2026-08-29 実障害: 既存ファイルの不具合報告に対し file 事前 PASS を根拠に
+    「完了条件は既に満たされています。実行は行いません」と実行を拒否した — の是正）。"""
+    cm = _reconcile_cm(present=["docs/a.md"])
+    contract = {"acceptance": [{"kind": "file", "params": {"path": "docs/a.md"}}]}
+    out = cm._reconcile_acceptance("cid", contract, "/tmp/repo", {"conversation_id": "cid"})
+    assert out == ["file path=docs/a.md"]  # 「済（実測）」注記に留め、着手確認へ進む
+    assert cm.slack.notes == []
 
 
 def test_reconcile_partial_pass_returns_satisfied_lines():
@@ -371,10 +390,10 @@ def _drive_reconcile(monkeypatch, force):
     mgr = _handle_manager(tempfile.mkdtemp())
     monkeypatch.setattr(mgr, "_invoke_llm", lambda history, force, progress=None: {
         "ready": True, "summary": "要約", "reply": ""})
-    monkeypatch.setattr(mgr, "_build_contract", lambda cid, summary, progress=None: {
+    monkeypatch.setattr(mgr, "_build_contract", lambda cid, summary, progress=None, force_ready=False: ({
         "directive": None, "constraints": [],
         "acceptance": [{"kind": "file", "params": {"path": "a.md"}}],
-        "runbook": [], "workspace": None, "needs_repo": False})
+        "runbook": [], "workspace": None, "needs_repo": False}, {}))
     monkeypatch.setattr(mgr, "_recheck_open_intents", lambda cid, msg: None)
     reconcile_calls = []
     monkeypatch.setattr(mgr, "_reconcile_acceptance",
@@ -420,7 +439,8 @@ def test_validate_contract_accepts_branch_merged():
     raw = {"directive": None, "constraints": [],
            "acceptance": [{"kind": "branch_merged",
                            "params": {"source": "feature/x", "target": "main"}}],
-           "runbook": [], "workspace": None, "needs_repo": False}
+           "runbook": [], "workspace": None, "needs_repo": False,
+           "rest_summary": None}
     validated, problems = contract_rules.validate_contract(raw, "マージして")
     assert problems == []
     assert validated["acceptance"][0]["kind"] == "branch_merged"
@@ -505,14 +525,19 @@ def test_merge_runbook_plan_orders_and_shifts_dependencies():
     plan, skipped = cm._merge_runbook_plan(
         [{"kind": "push", "params": {}},
          {"kind": "switch", "params": {"branch": "main"}}],
-        "/tmp/repo", "push して main に切替えてから設計書を作成", progress=None)
+        "/tmp/repo", "push して main に切替えてから設計書を作成",
+        # 分解入力は契約の rest_summary（§8.10g 必須キー化・確定要約フォールバック廃止）
+        contract={"rest_summary": "設計書を作成"}, progress=None)
     assert skipped == []
     assert [s["step"] for s in plan] == [1, 2, 3, 4]
-    assert plan[0]["execution"] == "runbook" and plan[0]["_runbook"]["kind"] == "push"
-    assert plan[0]["command"] == "git -C /tmp/repo push origin HEAD"  # 組立後コマンドの逐語
-    assert plan[1]["depends_on"] == [1]
-    # ya-ta 分解分は runbook の後ろへ直列化・依存番号もシフトされる
-    assert plan[2]["depends_on"] == [2] and plan[3]["depends_on"] == [3]
+    # 残り作業あり（§8.10g 成果系の後置・2026-09-03 改訂）: 準備系 switch → agent 列 →
+    # 成果系 push の順で直列化される（push を先行させると空 push になる）
+    assert plan[0]["execution"] == "runbook" and plan[0]["_runbook"]["kind"] == "switch"
+    assert plan[1]["execution"] == "agent" and plan[1]["depends_on"] == [1]
+    assert plan[2]["execution"] == "agent" and plan[2]["depends_on"] == [2]
+    assert plan[3]["execution"] == "runbook" and plan[3]["_runbook"]["kind"] == "push"
+    assert plan[3]["command"] == "git -C /tmp/repo push origin HEAD"  # 組立後コマンドの逐語
+    assert plan[3]["depends_on"] == [3]
     # 分解へは「runbook が実行する操作を含めない」注意が明示される（二重実行の防止）
     assert "サブタスクに含めない" in cm.plan_service.built_with
 
@@ -556,6 +581,36 @@ def test_merge_runbook_plan_skips_already_done_steps():
     assert len(skipped) == 2
     assert any("コミット済み" in s for s in skipped)
     assert any("push 済み" in s for s in skipped)
+
+
+def test_post_work_runbook_kept_and_ordered_after_agent_when_rest_exists():
+    """「編集してコミット」型（残り作業あり）では、クリーンな作業ツリーでも成果系
+    commit/push を「済み」と誤判定せず、agent step の後ろへ直列化する（§8.10g 成果系の
+    後置・2026-09-03 E2E 実測の是正: 計画時のクリーン tree を「コミット済み」と誤判定して
+    commit step が計画から欠落し、head_touches 未達で終わった）。"""
+    cm = ConversationManager.__new__(ConversationManager)
+    # 済み判定が走れば commit（変更なし）・push（先端一致）とも「済み」に見える状態を偽装
+    cm.process_mgr = _StateProbe([
+        ("is-inside-work-tree", 0, "true"),
+        ("status --porcelain", 0, ""),
+        ("ls-remote origin", 0, "aaaa\trefs/heads/feature/x"),
+        ("rev-parse feature/x", 0, "aaaa"),
+        ("rev-parse --abbrev-ref HEAD", 0, "feature/x"),
+    ])
+    cm.plan_service = _FakePlanService([
+        {"step": 1, "command": "ファイルを追記", "execution": "agent", "depth": "shallow",
+         "confidence": 0.9, "depends_on": []},
+    ])
+    plan, skipped = cm._merge_runbook_plan(
+        [{"kind": "commit_paths", "params": {"paths": ["docs/a.md"], "message": "x"}},
+         {"kind": "push", "params": {"branch": "feature/x"}}],
+        "/tmp/repo", "追記してコミットして push",
+        contract={"rest_summary": "docs/a.md へ追記する"}, progress=None)
+    # 成果系は済みスキップされない（skipped 空）・agent → commit → push の順
+    assert skipped == []
+    assert [s.get("execution") for s in plan] == ["agent", "runbook", "runbook"]
+    assert [s["_runbook"]["kind"] for s in plan[1:]] == ["commit_paths", "push"]
+    assert plan[1]["depends_on"] == [1] and plan[2]["depends_on"] == [2]
 
 
 def test_plan_view_runbook_step_bypasses_model_resolution():

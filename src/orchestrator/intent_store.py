@@ -32,7 +32,7 @@ def _now() -> str:
 
 def create(intents_dir: str, *, task_id: str, conversation_id: str | None,
            summary: str, acceptance: list, workspace: str | None,
-           user_id: str = "") -> None:
+           branch: str | None = None, user_id: str = "") -> None:
     """確定タスク生成と同時に intent レコードを作る（§8.10e。初期要件は承認済み確定要約 1 件）。
 
     acceptance が空の依頼は検査で閉じる根拠が無いため、goal_status を持つ意味がない —
@@ -54,6 +54,7 @@ def create(intents_dir: str, *, task_id: str, conversation_id: str | None,
         }],
         "acceptance": acceptance or [],
         "workspace": workspace,   # 再検査（後続タスク完了時の open 目標の再評価）の対象
+        "branch": branch,         # 再検査の対象 ref（§8.10f 測定の ref 化。None=HEAD）
         "goal_status": GOAL_OPEN if acceptance else GOAL_ACHIEVED,
         "created_at": now,
         "updated_at": now,

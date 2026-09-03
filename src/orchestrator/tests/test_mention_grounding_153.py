@@ -105,9 +105,9 @@ def test_awaiting_true_on_plan_presentation_false_on_start(monkeypatch):
     mgr = _manager(tmp)
     monkeypatch.setattr(mgr, "_invoke_llm", lambda history, force, progress=None: {
         "ready": True, "summary": "要約", "reply": ""})
-    monkeypatch.setattr(mgr, "_build_contract", lambda cid, summary, progress=None: {
+    monkeypatch.setattr(mgr, "_build_contract", lambda cid, summary, progress=None, force_ready=False: ({
         "directive": None, "constraints": [], "acceptance": [],
-        "workspace": None, "needs_repo": False})
+        "workspace": None, "needs_repo": False}, {}))
     mgr.handle_message(_msg("やって"))
     assert _session_data(mgr)["awaiting_reply"] is True
 
@@ -237,11 +237,13 @@ def test_progress_claim_ignores_other_conversation_tasks(monkeypatch):
     assert "タスクは走っていません" in mgr.slack.notes[-1]
 
 
-def test_progress_claim_mentions_pending_plans_with_real_count(monkeypatch):
-    """着手待ちの計画は実数の件数で併記し、最新の計画をボタン付きで再提示する。
+def test_progress_claim_mentions_pending_plans_without_represent(monkeypatch):
+    """進行主張の実測差し替えでは、件数は実数で併記するが**自動再提示はしない**。
 
-    固定文言「1 件」が実態 2 件と食い違い、「着手ボタンで開始できます」と言いながら
-    ボタンを出さなかった 2026-08-26 実機 E2E 検出の是正を固定する。
+    件数の実数併記は 2026-08-26 実機 E2E 検出の是正のまま維持。自動再提示は
+    2026-08-29 実障害（別話題の発話への実測差し替えに乗って stale 計画が承認面へ
+    再提示された）で廃止した（§8.10b 再提示の限定 — 再提示は probe 応答経路と
+    訂正経路のみ）。行わないことを予告する文言も出さない。
     """
     tmp = tempfile.mkdtemp()
     mgr = _manager(tmp)
@@ -257,8 +259,8 @@ def test_progress_claim_mentions_pending_plans_with_real_count(monkeypatch):
     note = mgr.slack.notes[-1]
     assert "タスクは走っていません" in note
     assert "着手待ちの計画が 2 件" in note
-    # 最新（created_at が新しい方）の計画がボタン付きで再提示される
-    assert mgr.slack.plan_updates == [{"exec_request_id": "e2", "body": "S2"}]
+    assert "再提示します" not in note
+    assert mgr.slack.plan_updates == []
 
 
 def test_task_status_probe_represents_pending_plan(monkeypatch):
@@ -341,14 +343,14 @@ def test_default_file_check_for_deliverable_path():
     out = contract_rules.apply_default_acceptance(
         _contract(), "docs/design/basic-design.md を追記して")
     assert out["acceptance"] == [
-        {"kind": "file", "params": {"path": "docs/design/basic-design.md"}}]
+        {"kind": "file_changed", "params": {"path": "docs/design/basic-design.md"}}]
 
 
 def test_default_file_check_composes_with_pushed():
     out = contract_rules.apply_default_acceptance(
         _contract(), "docs/a.md を更新して push もして")
     assert {"kind": "pushed", "params": {}} in out["acceptance"]
-    assert {"kind": "file", "params": {"path": "docs/a.md"}} in out["acceptance"]
+    assert {"kind": "file_changed", "params": {"path": "docs/a.md"}} in out["acceptance"]
 
 
 def test_default_file_check_not_duplicated_when_brain_covered_path():
@@ -383,10 +385,10 @@ def test_default_file_check_capped():
     summary = "次を更新して: " + " ".join(f"docs/f{i}.md" for i in range(8))
     out = contract_rules.apply_default_acceptance(_contract(), summary)
     assert len(out["acceptance"]) == 5
-    assert all(a["kind"] == "file" for a in out["acceptance"])
+    assert all(a["kind"] == "file_changed" for a in out["acceptance"])
 
 
 def test_default_file_check_reads_directive_too():
     out = contract_rules.apply_default_acceptance(
         _contract(directive="edit docs/b.md"), "任せる")
-    assert out["acceptance"] == [{"kind": "file", "params": {"path": "docs/b.md"}}]
+    assert out["acceptance"] == [{"kind": "file_changed", "params": {"path": "docs/b.md"}}]

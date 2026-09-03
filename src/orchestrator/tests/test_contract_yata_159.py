@@ -1,13 +1,14 @@
-"""契約化の ya-ta 移管と昇格ラダー（設計書 §8.4「契約化の呼び出し」/ §8.4.x (e) / §8.10f / §8.10g）。
+"""契約化の ya-ta 移管と worker CLI バックエンド（設計書 §8.4「契約化の呼び出し」/ §8.10f / §8.10g）。
 
-検証する振る舞い（2026-08-28 E2E の契約化失敗 4 事例の構造的再発防止）:
+検証する振る舞い（2026-08-28 E2E の契約化失敗 4 事例の構造的再発防止＋バックエンド規律）:
 - 失敗事例の再現: (1) 完了条件欄への runbook 操作名の記載（機械移送で契約成立を維持）、
   (2) commit_paths の message 欠落、(3) 必須 params の全欠落 — (2)(3) は機械検証で不成立
-- 昇格ラダー: ローカルモデル 2 回不合格 → ladder の上位モデルで再契約化・同一検証。
-  段の実行エラーは次段へ・全段失敗のみ None（fail-closed は人へ差し戻す従来動作のまま）
-- 昇格チャネル: worker CLI の `<command> -p <model_flag>` SSH 単発（keychain 依存は拒否）
+- バックエンド: 既定は worker CLI（contractor.model・既定 opus）。検証不合格 2 回で
+  fail-closed（最上位で不合格の契約を下位へ落とさない）。CLI の呼び出し自体の失敗が
+  続いたときのみローカルへ縮退し、縮退は着手確認へ明示される
+- CLI チャネル: worker CLI の `<command> -p <model_flag>` SSH 単発（keychain 依存は拒否）
 - rest_summary: null=agent 分解の省略 / 文字列=それだけを分解 / キー欠落=確定要約を分解（縮退）
-- 提示: 着手確認に「残り作業」と昇格来歴の行が載る（見えていない縮約・脳は承認されない）
+- 提示: 着手確認に「残り作業」と縮退来歴の行が載る（見えていない縮約・脳は承認されない）
 
 conversation.py は test_exec_contract_149.py と同方式でファイル直ロードする。
 """
@@ -87,21 +88,21 @@ def test_e2e_case_all_params_missing_fails():
     assert any("merge_ff" in p for p in problems)
 
 
-# ── Contractor（ya-ta）: ローカル試行と昇格ラダー ──
+# ── Contractor（ya-ta）: worker CLI 既定バックエンドとローカル縮退 ──
 
 GOOD_OUTPUT = json.dumps(_raw(directive="git push -u origin feature/docs",
                               needs_repo=True), ensure_ascii=False)
-# 事例 (2) をそのままローカルモデルの出力として使う（検証不合格の実物）
+# 事例 (2) をそのままモデルの出力として使う（検証不合格の実物）
 BAD_OUTPUT = json.dumps(_raw(
     runbook=[{"kind": "commit_paths", "params": {"paths": ["docs/overview.md"]}}]),
     ensure_ascii=False)
 
 
-def _contractor_config(ladder=("haiku", "sonnet")):
+def _contractor_config(**contractor):
     return {
-        "ya-ta": {"model": "local-dummy", "llm_timeout_sec": 60},
+        "ya-ta": {"model": "local-dummy", "llm_timeout_sec": 60,
+                  "contractor": contractor or {}},
         "sa-ru": {"ollama_host": "http://localhost:11434"},
-        "routing": {"escalation": {"ladder": list(ladder)}},
     }
 
 
@@ -109,11 +110,11 @@ def _validate(parsed):
     return contract_rules.validate_contract(parsed, SOURCE)
 
 
-def test_local_failure_escalates_to_ladder(monkeypatch):
-    """ローカル 2 回不合格 → ladder 先頭（haiku）で再契約化・同一検証で成立。"""
-    local_calls = []
-    monkeypatch.setattr(contractor_mod, "run_ollama",
-                        lambda *a, **k: local_calls.append(a) or BAD_OUTPUT)
+def test_cli_primary_success_never_calls_local(monkeypatch):
+    """既定バックエンド = worker CLI（既定 opus）。成立時はローカルを呼ばない（§8.4）。"""
+    def _no_local(*a, **k):
+        raise AssertionError("ローカルを呼んではならない")
+    monkeypatch.setattr(contractor_mod, "run_ollama", _no_local)
     runner_calls = []
     c = contractor_mod.Contractor(
         _contractor_config(),
@@ -121,62 +122,75 @@ def test_local_failure_escalates_to_ladder(monkeypatch):
         or GOOD_OUTPUT)
     validated, prov = c.contract("履歴", "要約する", _validate)
     assert validated["directive"] == "git push -u origin feature/docs"
-    assert len(local_calls) == 2
-    assert [name for name, _ in runner_calls] == ["haiku"]
-    assert "要約する" in runner_calls[0][1]  # 同一プロンプト（確定要約入り）で再契約化
-    assert prov["origin"] == "haiku"
-    assert prov["local_failures"] == 2
-    assert [a["model"] for a in prov["attempts"]] == ["local-dummy", "local-dummy", "haiku"]
+    assert [name for name, _ in runner_calls] == ["opus"]
+    assert "要約する" in runner_calls[0][1]
+    assert prov["origin"] == "opus"
+    assert prov["backend"] == "worker_cli"
+    assert prov["degraded"] is False
 
 
-def test_local_success_skips_ladder(monkeypatch):
-    """ローカル 1 回目で成立すれば昇格しない。"""
-    monkeypatch.setattr(contractor_mod, "run_ollama", lambda *a, **k: GOOD_OUTPUT)
-
-    def _never(name, prompt):
-        raise AssertionError("昇格してはならない")
-
-    validated, prov = contractor_mod.Contractor(
-        _contractor_config(), escalate_runner=_never).contract("履歴", "要約", _validate)
-    assert validated is not None
-    assert prov["origin"] == "local"
-    assert prov["local_failures"] == 0
-
-
-def test_rung_execution_error_advances_to_next(monkeypatch):
-    """段の実行エラー（SSH/CLI）は検証不合格と同列にその段の失敗とし、次段へ進む。"""
-    monkeypatch.setattr(contractor_mod, "run_ollama", lambda *a, **k: BAD_OUTPUT)
-
-    def _runner(name, prompt):
-        if name == "haiku":
-            raise RuntimeError("SSH command failed")
-        return GOOD_OUTPUT
-
-    validated, prov = contractor_mod.Contractor(
-        _contractor_config(), escalate_runner=_runner).contract("履歴", "要約", _validate)
-    assert validated is not None
-    assert prov["origin"] == "sonnet"
-    assert prov["attempts"][2]["problems"][0].startswith("実行失敗")
-
-
-def test_all_rungs_fail_returns_none(monkeypatch):
-    """全段失敗 → (None, origin=None)。呼び出し側の fail-closed（人へ）に乗る。"""
-    monkeypatch.setattr(contractor_mod, "run_ollama", lambda *a, **k: BAD_OUTPUT)
+def test_cli_invalid_twice_fails_closed_without_local(monkeypatch):
+    """CLI 検証不合格 2 回 → fail-closed。最上位で不合格の契約をローカルへ落とさない。"""
+    def _no_local(*a, **k):
+        raise AssertionError("検証不合格でローカルへ縮退してはならない")
+    monkeypatch.setattr(contractor_mod, "run_ollama", _no_local)
     validated, prov = contractor_mod.Contractor(
         _contractor_config(), escalate_runner=lambda n, p: BAD_OUTPUT
     ).contract("履歴", "要約", _validate)
     assert validated is None
     assert prov["origin"] is None
-    assert len(prov["attempts"]) == 4  # ローカル 2 + haiku + sonnet
+    assert [a["model"] for a in prov["attempts"]] == ["opus", "opus"]
 
 
-def test_no_runner_means_no_escalation(monkeypatch):
-    """escalate_runner 未注入（段階導入）はローカル失敗で確定する。"""
+def test_cli_exec_failure_degrades_to_local(monkeypatch):
+    """CLI の呼び出し自体の失敗（SSH 不達等）が続いたときのみローカルへ縮退する。"""
+    monkeypatch.setattr(contractor_mod, "run_ollama", lambda *a, **k: GOOD_OUTPUT)
+
+    def _dead_cli(name, prompt):
+        raise RuntimeError("SSH command failed")
+
+    validated, prov = contractor_mod.Contractor(
+        _contractor_config(), escalate_runner=_dead_cli).contract("履歴", "要約", _validate)
+    assert validated is not None
+    assert prov["origin"] == "local"
+    assert prov["degraded"] is True
+    assert [a["model"] for a in prov["attempts"]] == ["opus", "opus", "local-dummy"]
+    assert prov["attempts"][0]["problems"][0].startswith("実行失敗")
+
+
+def test_contractor_model_key_is_configurable(monkeypatch):
+    """contractor.model は models レジストリのキー参照（設定で差し替え可・直書きなし）。"""
+    runner_calls = []
+    c = contractor_mod.Contractor(
+        _contractor_config(backend="worker_cli", model="sonnet"),
+        escalate_runner=lambda name, prompt: runner_calls.append(name) or GOOD_OUTPUT)
+    validated, _ = c.contract("履歴", "要約", _validate)
+    assert validated is not None
+    assert runner_calls == ["sonnet"]
+
+
+def test_no_runner_means_local_only(monkeypatch):
+    """escalate_runner 未注入（単体テスト・段階導入）はローカルのみで動き、2 回不合格で確定。"""
     monkeypatch.setattr(contractor_mod, "run_ollama", lambda *a, **k: BAD_OUTPUT)
     validated, prov = contractor_mod.Contractor(
         _contractor_config()).contract("履歴", "要約", _validate)
     assert validated is None
     assert len(prov["attempts"]) == 2
+    assert prov["degraded"] is False  # CLI を試していない＝縮退ではない
+
+
+def test_local_backend_config(monkeypatch):
+    """backend=local の明示設定では CLI を呼ばない。"""
+    monkeypatch.setattr(contractor_mod, "run_ollama", lambda *a, **k: GOOD_OUTPUT)
+
+    def _never(name, prompt):
+        raise AssertionError("backend=local で CLI を呼んではならない")
+
+    validated, prov = contractor_mod.Contractor(
+        _contractor_config(backend="local"), escalate_runner=_never
+    ).contract("履歴", "要約", _validate)
+    assert validated is not None
+    assert prov["origin"] == "local"
 
 
 # ── ConversationManager: 昇格ランナーのコマンド組立と来歴の伝搬 ──
@@ -225,7 +239,7 @@ def _manager(tmp_dir):
 
 
 def test_escalation_runner_builds_print_mode_command():
-    """昇格段は `<command> -p <model_flag>` の SSH 単発・プロンプトは stdin（§8.4.x (e)）。"""
+    """CLI 呼び出しは `<command> -p <model_flag>` の SSH 単発・プロンプトは stdin（§8.4）。"""
     mgr = _manager(tempfile.mkdtemp())
     mgr.process_mgr = _FakeSSH()
     out = mgr._contract_escalation_runner("haiku", "PROMPT")
@@ -237,8 +251,8 @@ def test_escalation_runner_builds_print_mode_command():
 
 
 def test_escalation_runner_normalizes_ssh_timeout():
-    """SSH ハング（TimeoutExpired）は RuntimeError へ正規化＝段の失敗として次段へ進める
-    （素通しすると Contractor の捕捉外で会話処理全体が落ちる）。"""
+    """SSH ハング（TimeoutExpired）は RuntimeError へ正規化＝呼び出し失敗として縮退判定に
+    乗せる（素通しすると Contractor の捕捉外で会話処理全体が落ちる）。"""
     import subprocess
 
     mgr = _manager(tempfile.mkdtemp())
@@ -253,7 +267,7 @@ def test_escalation_runner_normalizes_ssh_timeout():
 
 
 def test_escalation_runner_rejects_keychain_and_unknown_models():
-    """keychain 依存 CLI・未登録モデルは例外（Contractor が次段へ進める）。"""
+    """keychain 依存 CLI・未登録モデルは例外（Contractor が呼び出し失敗として扱う）。"""
     mgr = _manager(tempfile.mkdtemp())
     mgr.process_mgr = _FakeSSH()
     with pytest.raises(RuntimeError):
@@ -277,43 +291,53 @@ class _FakeContractor:
         return validated, self.provenance
 
 
-def test_build_contract_records_escalation_origin():
-    """昇格で確定した契約は _contract_origin（来歴）を持つ。ローカル成立は持たない。"""
+def test_build_contract_records_degraded_provenance():
+    """縮退（CLI 呼び出し失敗 → ローカル契約化）は _contract_degraded を持つ（§8.4）。"""
     mgr = _manager(tempfile.mkdtemp())
     mgr.contractor = _FakeContractor(
-        _raw(), {"origin": "haiku", "local_failures": 2, "attempts": []})
-    contract = mgr._build_contract("c1", "要約")
-    assert contract["_contract_origin"] == {"model": "haiku", "local_failures": 2}
+        _raw(), {"origin": "local", "backend": "local", "degraded": True, "attempts": []})
+    contract, _ = mgr._build_contract("c1", "要約")
+    assert contract["_contract_degraded"] is True
 
     mgr.contractor = _FakeContractor(
-        _raw(), {"origin": "local", "local_failures": 0, "attempts": []})
-    contract = mgr._build_contract("c2", "要約")
-    assert "_contract_origin" not in contract
+        _raw(), {"origin": "opus", "backend": "worker_cli", "degraded": False,
+                 "attempts": []})
+    contract, _ = mgr._build_contract("c2", "要約")
+    assert "_contract_degraded" not in contract
 
 
 def test_build_contract_fail_closed_on_none():
-    """Contractor が全段失敗（None）なら契約も None（呼び出し側が人へ差し戻す）。"""
+    """Contractor が不成立（None）なら契約も None（呼び出し側が人へ差し戻す）。"""
     mgr = _manager(tempfile.mkdtemp())
     mgr.contractor = _FakeContractor(
-        {"runbook": "not-a-list"}, {"origin": None, "local_failures": 2, "attempts": []})
-    assert mgr._build_contract("c1", "要約") is None
+        {"runbook": "not-a-list"},
+        {"origin": None, "backend": "worker_cli", "degraded": False, "attempts": []})
+    contract, prov = mgr._build_contract("c1", "要約")
+    assert contract is None
+    assert prov["origin"] is None
 
 
 # ── rest_summary: 検証・分解入力・提示 ──
 
 def test_validate_rest_summary_null_and_string_and_invalid():
-    """null は明示として保持・文字列は strip・型不正はキーごと落とす（縮退・契約は成立）。"""
+    """null は明示として保持・文字列は strip・型不正/キー欠落/空文字列は契約不成立
+    （§8.10f rest_summary 必須化・2026-09-03。旧仕様の「キーごと落として成立」は、
+    分解入力の欠落が黙って確定要約フォールバックへ流れる穴だった）。"""
     v, _ = contract_rules.validate_contract(_raw(rest_summary=None), SOURCE)
     assert v["rest_summary"] is None
     v, _ = contract_rules.validate_contract(_raw(rest_summary=" README を追記 "), SOURCE)
     assert v["rest_summary"] == "README を追記"
+    # 型不正 → 契約不成立（fail-closed）
     v, problems = contract_rules.validate_contract(_raw(rest_summary=123), SOURCE)
-    assert problems == []
-    assert "rest_summary" not in v
+    assert v is None and any("rest_summary" in p for p in problems)
+    # 空文字列 → 契約不成立（null との曖昧化を許さない）
+    v, problems = contract_rules.validate_contract(_raw(rest_summary=""), SOURCE)
+    assert v is None and any("rest_summary" in p for p in problems)
+    # キー欠落 → 契約不成立
     raw = _raw()
     del raw["rest_summary"]
-    v, _ = contract_rules.validate_contract(raw, SOURCE)
-    assert "rest_summary" not in v
+    v, problems = contract_rules.validate_contract(raw, SOURCE)
+    assert v is None and any("rest_summary" in p for p in problems)
 
 
 def _plan_capture(mgr):
@@ -350,18 +374,23 @@ def test_merge_runbook_plan_decomposes_rest_summary_only():
     assert calls[0].startswith("README を追記する")
     assert "要約全体" not in calls[0]
     assert "サブタスクに含めないこと" in calls[0]  # 注意書きは多層として維持
-    assert [s["execution"] for s in plan] == ["runbook", "agent"]
-    assert plan[1]["depends_on"] == [1]  # runbook の後へ直列化
+    # 成果系 push は残り作業（agent）の後ろへ直列化される（§8.10g 成果系の後置・
+    # 2026-09-03 改訂。先行させると空 push になる）
+    assert [s["execution"] for s in plan] == ["agent", "runbook"]
+    assert plan[1]["depends_on"] == [1]  # agent の後へ直列化
 
 
-def test_merge_runbook_plan_falls_back_without_rest_key():
-    """rest_summary キー欠落（旧出力・検証縮退）→ 従来どおり確定要約を分解する。"""
+def test_merge_runbook_plan_no_summary_fallback_without_rest_key():
+    """rest_summary キー欠落（旧レコード）でも確定要約へフォールバックしない（§8.10g
+    分解入力の rest_summary 一本化・2026-09-03。会話脳の言い換え＝確定要約が分解へ
+    入る最後の経路の遮断。契約は validate_contract が rest_summary 必須のため、
+    新規経路でキー欠落はそもそも到達しない）。"""
     mgr = _manager(tempfile.mkdtemp())
     calls = _plan_capture(mgr)
-    mgr._merge_runbook_plan(
+    plan, _ = mgr._merge_runbook_plan(
         [{"kind": "push", "params": {}}], "/Users/dev/r", "要約全体", contract={})
-    assert len(calls) == 1
-    assert calls[0].startswith("要約全体")
+    assert calls == []
+    assert [s["execution"] for s in plan] == ["runbook"]
 
 
 # ── 直近タスクの帰結の実測回答（終端記録＋回答時再検査・§8.10g） ──
@@ -449,8 +478,8 @@ def test_terminal_record_without_probe_says_record_only():
     assert "記録時点の測定" in text
 
 
-def test_format_contract_shows_rest_summary_and_origin():
-    """着手確認の契約提示に「残り作業」と昇格来歴が載る（§8.10f / §8.4.x (e) 可視化）。"""
+def test_format_contract_shows_rest_summary_and_degraded():
+    """着手確認の契約提示に「残り作業」と縮退来歴が載る（§8.10f / §8.4 可視化）。"""
     fmt = ConversationManager._format_contract
     base = {"directive": None, "constraints": [], "acceptance": [],
             "runbook": [{"kind": "push", "params": {}}]}
@@ -458,7 +487,7 @@ def test_format_contract_shows_rest_summary_and_origin():
         {**base, "rest_summary": None})
     assert "残り作業（分解対象）: README を追記する" in fmt(
         {**base, "rest_summary": "README を追記する"})
-    assert "残り作業（分解対象）: 未特定（確定要約の全体を分解）" in fmt(base)
-    text = fmt({**base, "rest_summary": None,
-                "_contract_origin": {"model": "haiku", "local_failures": 2}})
-    assert "契約化: ローカル検証不合格 2 回 → haiku（昇格）" in text
+    # キー欠落（旧レコード）は「旧契約」と明示（確定要約フォールバックは廃止・2026-09-03）
+    assert "残り作業（分解対象）: 未特定（旧契約）" in fmt(base)
+    text = fmt({**base, "rest_summary": None, "_contract_degraded": True})
+    assert "契約化: 縮退モード（ローカル契約化" in text

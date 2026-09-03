@@ -155,6 +155,7 @@ def _handler(tmp):
             "o_moi_alert_dir": os.path.join(tmp, "alerts"),
             "mac_mini_host": "mac-mini",
             "debounce_sec": 1,
+            "alert_digest_window_sec": 60,
             "control_plane_files": [".taka-hook-settings.json"],
         },
         "task_context": {"dir": os.path.join(tmp, "task-context")},

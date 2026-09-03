@@ -204,7 +204,8 @@ class GroundingVerifier:
         return GroundingReport(ok=ok, note=note, text="\n".join(lines), summary=summary,
                                cause=cause)
 
-    def verify_acceptance(self, workspace: str, acceptance: list[dict]) -> GroundingReport:
+    def verify_acceptance(self, workspace: str, acceptance: list[dict],
+                          default_branch: str | None = None) -> GroundingReport:
         """承認された完了条件（§8.10f `acceptance`）を実世界に対して検査する。
 
         検査カタログ（pushed / remote_file / file / head_touches）のコマンド組立はここ
@@ -212,18 +213,34 @@ class GroundingVerifier:
         contract.validate_contract で検証済み）。パラメータは防御的に再検証し、不正は
         当該検査 FAIL に倒す（fail-closed。コマンドには乗せない）。
 
+        default_branch: 契約の `branch`（§8.10f 測定の ref 化）。branch パラメータを取る
+        検査（pushed / file）の省略時既定値になり、全ての実測が契約の指定 ref を対象に
+        する（checkout 中のブランチではなく）。None は従来動作（HEAD / 作業ツリー）。
+
         全 kind PASS のときのみ ok=True。「完了」の語は ok=True のときにしか使えない
         （§8.10f。判定は検査コマンドの rc・実出力のみから機械導出する）。
         """
         ws = shlex.quote(workspace)
-        lines = [f"【完了条件の検査】sa-ru が実行（workspace: {workspace}）"]
+        lines = [f"【完了条件の検査】sa-ru が実行（workspace: {workspace}"
+                 + (f"・対象 ref: {default_branch}" if default_branch else "") + "）"]
         problems: list[str] = []
         causes: list[str] = []
+        # default_branch は上流検証済みだが防御的に再検証する（コマンド文字列に乗るため）
+        if default_branch and (not _ACCEPT_PARAM_RE.match(default_branch)
+                               or ".." in default_branch.split("/")):
+            default_branch = None
 
-        # リポジトリ系検査の前提（git リポジトリであること）を 1 回だけ確認する
+        # リポジトリ系検査の前提（git リポジトリであること）を 1 回だけ確認する。
+        # branch 指定つき file 検査は cat-file（リポジトリ操作）になるため同列に含める
         repo_kinds = {"pushed", "remote_file", "head_touches", "diff_limit", "branch_merged"}
         is_repo = None
-        if any(a.get("kind") in repo_kinds for a in acceptance):
+        head_branch = None  # 遅延解決（file の ref 化判定で 1 回だけ測る）
+        needs_repo_check = (
+            any(a.get("kind") in repo_kinds for a in acceptance)
+            or (default_branch and any(a.get("kind") == "file" for a in acceptance))
+            or any(a.get("kind") == "file" and (a.get("params") or {}).get("branch")
+                   for a in acceptance))
+        if needs_repo_check:
             rc, _ = self._probe(lines, f"git -C {ws} rev-parse --is-inside-work-tree")
             is_repo = (rc == 0)
             if not is_repo:
@@ -237,7 +254,7 @@ class GroundingVerifier:
             # 安全文字の文字列のみ（SSH コマンドに乗るため・fail-closed）
             bad = [v for k, v in params.items()
                    if (not (isinstance(v, int) and not isinstance(v, bool) and v > 0)
-                       if k == "max_lines"
+                       if k in ("max_lines", "min_bytes")
                        else (not isinstance(v, str) or not _ACCEPT_PARAM_RE.match(v)
                              or ".." in v.split("/")))]
             if bad:
@@ -262,12 +279,17 @@ class GroundingVerifier:
                 continue  # 前提不成立は上で計上済み（同じ原因を検査数ぶん重ねない）
 
             if kind == "pushed":
-                branch = params.get("branch")
+                # 省略時既定値は契約の branch（§8.10f 測定の ref 化）。それも無ければ
+                # 従来どおり HEAD のブランチ
+                branch = params.get("branch") or default_branch
                 if not branch:
                     rc, out = self._probe(lines, f"git -C {ws} rev-parse --abbrev-ref HEAD")
                     branch = out if rc == 0 and out else None
                 head = ""
-                rc, out = self._probe(lines, f"git -C {ws} rev-parse HEAD")
+                # ローカル先端は当該ブランチの ref を測る（checkout 中の HEAD ではなく。
+                # 指定 ref が checkout されていない状態でも正しく比較できる）
+                local_ref = shlex.quote(branch) if branch else "HEAD"
+                rc, out = self._probe(lines, f"git -C {ws} rev-parse {local_ref}")
                 if rc == 0 and out:
                     head = out.split()[0]
                 remote = ""
@@ -300,10 +322,66 @@ class GroundingVerifier:
                     causes.append("acceptance_failed:remote_file")
 
             elif kind == "file":
-                rc, _ = self._probe(lines, f"ls -la {ws}/{shlex.quote(params['path'])}")
-                if rc != 0:
-                    problems.append(f"file 未達（{params['path']} が存在しない）")
-                    causes.append("acceptance_failed:file")
+                # branch 指定（検査 params または契約の default_branch）があり、HEAD が
+                # 当該ブランチでないときは、指定 ref 上の存在を cat-file で実測する
+                # （§8.10f 測定の ref 化。checkout 中の別ブランチの作業ツリーを測って
+                # 「存在しない」と誤未達にした 2026-08-29 実障害の是正）
+                branch = params.get("branch") or default_branch
+                use_ref = False
+                if branch and is_repo:
+                    if head_branch is None:
+                        rc, out = self._probe(
+                            lines, f"git -C {ws} rev-parse --abbrev-ref HEAD")
+                        head_branch = out if rc == 0 and out else ""
+                    use_ref = (head_branch != branch)
+                if use_ref:
+                    rc, _ = self._probe(
+                        lines, f"git -C {ws} cat-file -e "
+                               f"{shlex.quote(branch)}:{shlex.quote(params['path'])}")
+                    if rc != 0:
+                        problems.append(
+                            f"file 未達（ブランチ {branch} 上に {params['path']} が存在しない）")
+                        causes.append("acceptance_failed:file")
+                else:
+                    rc, _ = self._probe(lines, f"ls -la {ws}/{shlex.quote(params['path'])}")
+                    if rc != 0:
+                        problems.append(f"file 未達（{params['path']} が存在しない）")
+                        causes.append("acceptance_failed:file")
+
+            elif kind == "file_changed":
+                # 修正系依頼の達成検査（§8.10f）: 着手時に契約へ刻まれた baseline
+                # （blob id）と現在の作業ツリー内容の hash-object を比較する。同一＝
+                # 無作業（未達）。hash-object はリポジトリ外のファイルにも使える
+                baseline = params.get("baseline")
+                rc, out = self._probe(
+                    lines, f"git -C {ws} hash-object {shlex.quote(params['path'])}")
+                current = out.split()[0] if rc == 0 and out else ""
+                if not current:
+                    problems.append(
+                        f"file_changed 未達（{params['path']} の内容を取得できない/不在）")
+                    causes.append("acceptance_failed:file_changed")
+                elif not baseline or current == baseline:
+                    problems.append(
+                        f"file_changed 未達（{params['path']} の内容が実行前と同一 — "
+                        "変更が行われていない）")
+                    causes.append("acceptance_failed:file_changed")
+
+            elif kind == "file_min_bytes":
+                # 生成依頼の最小達成検査（§8.10f）: 実在＋最低サイズの実測。wc -c の実出力
+                # のみで判定する（空ファイル・スタブの「完了」を塞ぐ）
+                rc, out = self._probe(
+                    lines, f"wc -c < {ws}/{shlex.quote(params['path'])}")
+                size = None
+                if rc == 0 and (out or "").strip().isdigit():
+                    size = int(out.strip())
+                if size is None:
+                    problems.append(
+                        f"file_min_bytes 未達（{params['path']} のサイズを取得できない/不在）")
+                    causes.append("acceptance_failed:file_min_bytes")
+                elif size < params["min_bytes"]:
+                    problems.append(
+                        f"file_min_bytes 未達（{size} bytes < 下限 {params['min_bytes']}）")
+                    causes.append("acceptance_failed:file_min_bytes")
 
             elif kind == "head_touches":
                 rc, out = self._probe(

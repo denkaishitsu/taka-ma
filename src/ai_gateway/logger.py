@@ -58,21 +58,53 @@ class YaTaLogger:
         with open(self._log_path(), "a") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
-    def log_contract(self, origin, attempts: list[dict]):
-        """契約化 1 回分の試行列を当日ログに追記する（設計書 §8.4.x (e)）。
+    def log_decompose_call(self, task: str, fallback: bool, reason: str = "",
+                           subtasks: int = 0):
+        """分解 1 呼び出し分の成否を当日ログに追記する（設計書 §8.4.1）。
 
-        昇格ラダーの較正（どのモデルで何が不合格だったか）の一次データ。判定ログと
-        同じファイルに kind で区別して混載する（日付 rotation を二重に持たない）。
+        既存の log_decision はサブタスク単位（1 呼び出しで複数行）のため、呼び出し数を
+        分母とする「分解フォールバック率」（§8.4.1 ローカル脳の換装判断基準）が集計
+        できない。1 呼び出し = 1 行の本エントリを追加し、集計スクリプト
+        （decision_stats.py）の分母・分子をここから機械算出する。
 
         Args:
-            origin: 契約を確定したモデル（"local"=ya-ta ローカル / モデル名=昇格 /
-                None=全段失敗）。
+            task: 分解対象の指示文（先頭 200 字に切り詰めて記録）。
+            fallback: フォールバック（パース不能・構造不正・実行失敗）が発動したか。
+            reason: fallback=True のときの失敗種別。
+            subtasks: 確定したサブタスク数（fallback 時は 1）。
+        """
+        entry = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "kind": "decompose_call",
+            "task": task[:200],
+            "fallback": fallback,
+            "reason": reason,
+            "subtasks": subtasks,
+        }
+        with open(self._log_path(), "a") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def log_contract(self, origin, attempts: list[dict],
+                     backend: str | None = None, degraded: bool = False):
+        """契約化 1 回分の試行列を当日ログに追記する（設計書 §8.4.1）。
+
+        契約化バックエンド換装判断（どのモデルで何が不合格だったか・縮退の頻度）の
+        一次データ。判定ログと同じファイルに kind で区別して混載する（日付 rotation を
+        二重に持たない）。
+
+        Args:
+            origin: 契約を確定したモデル（"local"=ローカル / モデル名=worker CLI /
+                None=不成立）。
             attempts: 試行列 [{"model": 名前, "problems": 不合格理由リスト}, ...]。
+            backend: 確定（または最終試行）のバックエンド（"worker_cli" / "local"）。
+            degraded: CLI 呼び出し失敗によるローカル縮退が起きたか（§8.4）。
         """
         entry = {
             "timestamp": datetime.datetime.now().isoformat(),
             "kind": "contract",
             "origin": origin,
+            "backend": backend,
+            "degraded": degraded,
             "attempts": attempts,
         }
         with open(self._log_path(), "a") as f:

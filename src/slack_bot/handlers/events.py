@@ -8,6 +8,7 @@
 """
 
 import logging
+import re
 
 from services.conversation_queue import (
     derive_conversation_id,
@@ -19,6 +20,22 @@ from services.role_check import authorize, check_role
 from services.session_lookup import is_awaiting_reply
 
 logger = logging.getLogger("u-zu.events")
+
+# メンション本文からユーザー ID メンション（<@U…>）を除いた残りの逐語照合用。
+# `@taka-ma go` のスレッド内明示エスケープ（§8.3 (B) go 記法）の判定に使う。
+_MENTION_TOKEN_RE = re.compile(r"<@[A-Z0-9]+>")
+
+# スレッド会話の明示エスケープ記法（§8.3 (B)）。決定的な逐語一致＝記法であり、語列挙の
+# 言語理解ではない。slash command の `/taka-ma-go` は thread_ts を運ばずスレッド会話を
+# 強制前進できない（2026-08-30 実測: スレッドの会話脳誤出力からの回復手段が無かった）
+# ため、メンション本文がこの集合と一致したとき force_ready で投入する。
+_GO_LITERALS = ("go", "/taka-ma-go")
+
+
+def _is_go_mention(text: str) -> bool:
+    """メンション本文が空白除去後に逐語で go 記法か（§8.3 (B) スレッドの明示エスケープ）。"""
+    stripped = _MENTION_TOKEN_RE.sub("", text).strip()
+    return stripped in _GO_LITERALS
 
 
 def _ack_received(client, channel: str, ts: str):
@@ -66,12 +83,19 @@ def register_events(app):
         # thread_ts: 既存スレッド内の発話ならそれを継続、フラットな新規メンションなら
         # 自身の ts をスレッド起点にする（未指定のままだと sa-ru の返信が通常投稿になり、
         # conversation_id のスレッド単位分離＝設計書 §8.3 が機能しない。実機確認）。
+        # go 記法（§8.3 (B)）: メンション本文が逐語で `go` / `/taka-ma-go` なら、当該
+        # スレッド会話を force_ready で強制前進させる（LLM 判定を待たない明示エスケープ。
+        # slash command は thread_ts を運ばないため、スレッドにはこの記法が唯一の経路）
+        force_ready = _is_go_mention(text)
+        if force_ready:
+            logger.info("go 記法検出（force_ready 投入）: user=%s", user)
         enqueue_conversation_message(
             "slack_mention", text,
             user_id=user,
             team_id=event.get("team", ""),
             channel_id=event.get("channel", ""),
-            thread_ts=event.get("thread_ts") or event.get("ts"))
+            thread_ts=event.get("thread_ts") or event.get("ts"),
+            force_ready=force_ready)
 
     @app.event("message")
     def handle_message(event, body, say, logger, client, context=None):

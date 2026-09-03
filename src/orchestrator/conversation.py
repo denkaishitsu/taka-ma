@@ -78,6 +78,17 @@ _REPO_MENTION_RE = re.compile(
     r"(?:\s*(?:[:：=＝]|は|を|の)\s*|\s+)"
     r"((?:~/|/)[A-Za-z0-9._\-][A-Za-z0-9._/\-]*)",
     re.IGNORECASE)
+# ブランチ指定のマーカー決定的抽出（§8.10f `branch` の契約項目化）。`repo:` と同規律で、
+# マーカー語（ブランチ / branch）に区切りを挟んで続くトークンを拾い、契約 branch の
+# 権威（契約化脳の提案より優先）にする。文字集合は検査パラメータの安全文字と同一
+# （SSH コマンド文字列に乗るため）。2026-08-29 実障害: 発話冒頭の「ブランチ:
+# feature/design-implementation」が契約のどこにも入らず、checkout 中の別ブランチ上で
+# 計画・実行・検査が走った — の是正
+_BRANCH_MENTION_RE = re.compile(
+    r"(?<![A-Za-z0-9_/\-])(?:branch|ブランチ)"
+    r"\s*[:：=＝]\s*"
+    r"([A-Za-z0-9._/\-]+)",
+    re.IGNORECASE)
 
 
 # probe の許可値（§8.3。LLM が選べるのは種別のみ・応答本文はコードが実レコード/実出力から
@@ -89,6 +100,30 @@ _PROBE_KINDS = ("repo_status", "task_status")
 # `grep -n "pending_approval" src/orchestrator/__init__.py src/orchestrator/conversation.py`
 # で両側の一致を確認する。__init__ からの import は循環になるため値を重ねて持つ）
 _ACTIVE_TASK_STATUSES = {"init", "accepted", "in_progress", "pending_approval"}
+
+
+def _extract_prompt_examples(template: str, min_len: int = 8) -> tuple[str, ...]:
+    """converse.md の「判定の例」表から例文（第 1 列の 「」 内）を取り出す（§8.4.1）。
+
+    会話脳がプロンプトの例文をそのまま返信する重大誤出力（例文エコー・2026-08-30 実測）
+    の検出集合。抽出は表の行（`|` 始まり）の第 1 セルに限定する — プロンプト本文の 「」
+    には「この内容で着手します」等の**指示された返信文**も含まれ、無差別に集めると
+    正しい返信まで棄却するため。短い断片（min_len 未満）は偶然一致し得るので除外する。
+    """
+    examples = []
+    for line in template.splitlines():
+        line = line.strip()
+        if not line.startswith("|"):
+            continue
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if not cells:
+            continue
+        first = cells[0]
+        if first.startswith("「") and first.endswith("」"):
+            text = first[1:-1].strip()
+            if len(text) >= min_len:
+                examples.append(text)
+    return tuple(examples)
 
 
 class InvalidWorkspaceError(ValueError):
@@ -151,6 +186,10 @@ class ConversationManager:
         os.makedirs(self.confirm_dir, exist_ok=True)
         # 会話プロンプトは静的なので起動時に 1 度だけ読む（毎ターンの disk I/O を避ける）
         self._prompt_template = (PROMPTS_DIR / "converse.md").read_text()
+        # 例文エコー検出（§8.4.1 ローカル脳の換装判断基準）: プロンプトの「判定の例」表の
+        # 例文が返信に逐語出現したら棄却する。2026-08-30 23:50 実障害: converse.md の例文
+        # 「README の冒頭にインストール手順の節を追加して」がそのまま返信された
+        self._prompt_examples = _extract_prompt_examples(self._prompt_template)
         # 進行主張の選別プロンプト（§8.3 グラウンディングの安全網。言語理解は LLM が担い、
         # 語列挙の正規表現を使わない — 2026-08-25 E2E FAIL の是正）
         self._progress_claim_template = (PROMPTS_DIR / "progress_claim.md").read_text()
@@ -564,16 +603,27 @@ class ConversationManager:
                         msg.get("channel_id"),
                         team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
                     return
-                contract_data = self._build_contract(cid, summary, progress=progress)
+                contract_data, contract_prov = self._build_contract(
+                    cid, summary, progress=progress,
+                    force_ready=bool(msg.get("force_ready")))
                 if contract_data is None:
                     # 契約が確定できない依頼は実行へ進めない（fail-closed・§8.10f）。
                     # 言い直しの返答を待つ（§8.3 (C) 能動昇格）
                     self._set_awaiting(cid, True)
+                    unmapped = contract_prov.get("unmapped") or []
+                    if unmapped:
+                        # スキーマ閉包の検出（§8.10f）: 契約フィールドへ写像できない
+                        # 「実行に影響する指定」。散文で黙って運ばず、扱いを人に確認する
+                        text = ("次の指定を契約のどの項目としても解釈できませんでした"
+                                "（安全のため実行へ進めません）:\n"
+                                + "\n".join(f"- {u}" for u in unmapped)
+                                + "\nこの指定の意図を言い直すか、取り下げてください。")
+                    else:
+                        text = ("実行契約を確定できませんでした（命令・拘束・完了条件の"
+                                "抽出に失敗）。作業リポジトリ（`repo:/絶対パス`）と、"
+                                "何ができたら完了かを明示して言い直してください。")
                     self.slack.notify(
-                        "実行契約を確定できませんでした（命令・拘束・完了条件の抽出に失敗）。"
-                        "作業リポジトリ（`repo:/絶対パス`）と、何ができたら完了かを明示して"
-                        "言い直してください。",
-                        msg.get("channel_id"),
+                        text, msg.get("channel_id"),
                         team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
                     return
                 # workspace: 記法・自然文の明示指定（セッション持続値）が最優先。無ければ
@@ -602,6 +652,14 @@ class ConversationManager:
                         msg.get("channel_id"),
                         team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
                     return
+                # 指定ブランチへの switch 機械付与（§8.10g。契約 branch と HEAD の
+                # 不一致を実測し、runbook 先頭へ既存カタログの switch を置く — 決定的・
+                # LLM 不使用。worker の実行も同じ checkout 上で行われるため、指定
+                # ブランチ上での作業が構造的に保証される）
+                self._ensure_branch_switch(contract_data, workspace)
+                # file_changed 検査の baseline を実測して契約へ刻む（§8.10f。reconcile・
+                # 出口検査より前に確定させる — 対象不在なら file（作成）へ確定）
+                self._capture_file_baselines(contract_data, workspace)
                 # open の過去依頼を世界に対して再検査する（§8.10g。後追い達成の機械検出）
                 self._recheck_open_intents(cid, msg)
                 # ── 再入 reconcile（§8.10g）: 着手確認を出す前に完了条件を実測する。
@@ -653,9 +711,10 @@ class ConversationManager:
             self.slack.notify(
                 reply, msg.get("channel_id"),
                 team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
-            # 実測差し替え時は着手待ちの計画をボタン付きで再提示する（probe 経路と同じ規律）
-            if grounded_replaced:
-                self._represent_pending_plan(msg)
+            # 実測差し替え時の自動再提示は行わない（§8.10b 再提示の限定。2026-08-29
+            # 実障害: 別話題の発話への実測差し替えに乗って stale 計画が承認面へ再提示
+            # された）。再提示は状態質問への probe 応答経路（現在有効な最新 1 件）と
+            # 訂正経路（§10.2.1）のみ
 
     # probe で実行する読み取り専用コマンド（§8.3「確認系質問への実測応答」で固定列挙・
     # §8.10g で拡張）。任意コマンド実行の入り口にしない（脳 LLM が選べるのは probe 種別のみ・
@@ -848,9 +907,11 @@ class ConversationManager:
         if acceptance and workspace and self.process_mgr is not None:
             try:
                 verifier = GroundingVerifier(self.process_mgr.run_ssh_probe)
-                # 検査は 1 件ずつ回す（reconcile と同じ粒度。件数は契約検証で上限済み）
+                # 検査は 1 件ずつ回す（reconcile と同じ粒度。件数は契約検証で上限済み）。
+                # 契約に branch があれば当該 ref を対象に測る（§8.10f 測定の ref 化）
                 for check in acceptance:
-                    report = verifier.verify_acceptance(workspace, [check])
+                    report = verifier.verify_acceptance(
+                        workspace, [check], default_branch=record.get("branch"))
                     params = " ".join(
                         f"{k}={v}" for k, v in (check.get("params") or {}).items())
                     mark = "PASS" if report.ok else "FAIL"
@@ -872,12 +933,16 @@ class ConversationManager:
                 lines.append(f"- 結果（記録・冒頭）: {first[0][:120]}")
         return "\n".join(lines)
 
-    def _task_status_text(self, msg: dict) -> str:
+    def _task_status_text(self, msg: dict, represent: bool = False) -> str:
         """当該会話の実行系タスクの実測テキストを組み立てる（§8.3。LLM 不使用）。
 
         根拠はタスクキューの実レコード・直近タスクの終端記録（§8.10g）・着手待ちの計画
         （pending の確認レコード）のみ。task_status probe の応答本文と、進行主張の
         差し替え/併記の両方で使う。
+
+        represent: 呼び出し側が続けて _represent_pending_plan（ボタン付き再提示）を
+        行う場合のみ True（probe 応答経路・§8.10b 再提示の限定）。False では再提示を
+        予告する文言を出さない（実際に行わないことを言わない）。
         """
         running = self._running_tasks(msg["conversation_id"])
         if running:
@@ -890,11 +955,12 @@ class ConversationManager:
             text += "\n" + self._terminal_task_text(terminal)
         pendings = self._pending_confirms(msg)
         if pendings:
-            # 件数は実数（固定文言「1 件」が実態と食い違った 2026-08-26 E2E 検出の是正）。
-            # ボタンは呼び出し側が _represent_pending_plan で手元に再提示する（文言だけの
-            # 案内で上に流れたボタンを探させない・§8.10b と同じ規律）
-            text += (f"\n着手待ちの計画が {len(pendings)} 件あります。"
-                     "最新の計画を着手ボタン付きで再提示します。")
+            # 件数は実数（固定文言「1 件」が実態と食い違った 2026-08-26 E2E 検出の是正）
+            text += f"\n着手待ちの計画が {len(pendings)} 件あります。"
+            if represent:
+                # ボタンは呼び出し側が _represent_pending_plan で手元に再提示する（文言
+                # だけの案内で上に流れたボタンを探させない・§8.10b と同じ規律）
+                text += "最新の計画を着手ボタン付きで再提示します。"
         return text
 
     def _represent_pending_plan(self, msg: dict):
@@ -925,7 +991,9 @@ class ConversationManager:
         使わない（repo_status probe・§8.9 と同じ規律）。実測結果は会話履歴にも残す。
         """
         cid = msg["conversation_id"]
-        text = self._task_status_text(msg)
+        # probe 応答経路は現在有効な最新 pending をボタン付きで再提示する（§8.10b
+        # 再提示の限定 — この経路と訂正経路のみが再提示を許される）
+        text = self._task_status_text(msg, represent=not self._running_tasks(cid))
         self._append_turn(cid, "assistant", text)
         # 実測応答後もユーザーの続きの発話を待つ（§8.3 (C) 能動昇格）
         self._set_awaiting(cid, True)
@@ -1185,11 +1253,28 @@ class ConversationManager:
                 parsed = json.loads(extract_json(stdout))
             except json.JSONDecodeError:
                 parsed = json.loads(extract_json(repair_json_escapes(stdout)))
+            # 例文エコー検出（§8.4.1）: 返信にプロンプト例文が逐語出現したら、その応答は
+            # 出力契約ではなくプロンプト自体の復唱＝重大誤出力として棄却する（2026-08-30
+            # 23:50 実測: converse.md の例文がそのまま返信された）。棄却は warning ログへ
+            # 残し、換装判断（会話脳の重大誤出力・1 件で検討起票）の実測記録にする
+            # ユーザー自身が例文と同じ文を打った場合、それを復唱する返信は正当なので
+            # 検出から外す（最新発話に無い例文の出現だけをエコーとみなす）
+            reply = parsed.get("reply") or ""
+            examples = getattr(self, "_prompt_examples", ())  # 部分構築のテストスタブ対応
+            echoed = next((ex for ex in examples
+                           if ex in reply and ex not in latest), None)
+            if echoed:
+                logger.warning("会話脳の例文エコー検出（応答を棄却・換装判断の実測記録 "
+                               "§8.4.1）: %r", echoed)
+                return {
+                    "reply": "（応答の生成に失敗しました。もう一度お願いします）",
+                    "ready": False, "summary": None, "error": True,
+                }
             # probe は許可値のみ通す（応答の組み立てはコード側で固定。脳 LLM の
             # 出力を任意コマンド実行・任意動作に接続しない・§8.3「確認系質問への実測応答」）
             probe = parsed.get("probe")
             return {
-                "reply": parsed.get("reply", ""),
+                "reply": reply,
                 "ready": self._coerce_ready(parsed),
                 "summary": parsed.get("summary"),
                 "probe": probe if probe in _PROBE_KINDS else None,
@@ -1234,44 +1319,73 @@ class ConversationManager:
 
     # ── 契約化パス（設計書 §8.10f。ready=true 後の第 2 の構造化呼び出し） ──
 
-    def _build_contract(self, cid: str, summary: str, progress=None) -> dict | None:
+    def _build_contract(self, cid: str, summary: str,
+                        progress=None, force_ready: bool = False
+                        ) -> tuple[dict | None, dict]:
         """会話から実行契約 {directive, constraints, acceptance, runbook, workspace,
-        needs_repo, rest_summary} を得る。
+        branch, target_paths, needs_repo, rest_summary} を得る。(契約 | None, 来歴)。
 
         会話出口契約 {reply, ready, summary} にはキーを足さず、契約化は ya-ta
-        （Contractor・§8.4「契約化の呼び出し」）へ委譲する。sa-ru が渡すのは会話履歴の
-        二窓ビューと確定要約のみで、受理判断（contract_rules.validate_contract —
-        directive / constraints は**ユーザー発話の逐語引用**のみ受理）はこちらの検証
-        関数を注入して行う（権威はフィールド・§8.10f）。ローカル 2 回不合格は昇格
-        ラダー（§8.4.x (e)）が上位 worker モデルで再契約化し、全段失敗のみ None
-        （呼び出し側が fail-closed で人へ差し戻す）。
+        （Contractor・§8.4「契約化の呼び出し」・既定バックエンドは worker CLI の
+        opus）へ委譲する。sa-ru が渡すのは会話履歴の二窓ビュー（発話 id 注記つき）と
+        確定要約のみで、受理判断（contract_rules.validate_contract — 発話由来
+        フィールドは**ユーザー発話の逐語引用**のみ受理・出所束縛込み）はこちらの
+        検証関数を注入して行う（権威はフィールド・§8.10f）。不合格 2 回で None
+        （呼び出し側が fail-closed で人へ差し戻す。来歴 unmapped はスキーマ閉包の
+        検出 = 当該指定の扱いを人に確認する）。
         """
         if self.contractor is None:
             logger.error("契約化が有効なのに Contractor が未構築（構成不整合）")
-            return None
+            return None, {}
         with self._sessions_lock:
             history = self._load_or_create_session(cid)
             snapshot = self._history_view(history)
             # 逐語照合の出典はユーザー発話のみ（summary は脳の言い換えであり出典にしない）
             source_text = "\n".join(t["text"] for t in history if t.get("role") == "user")
-        history_text = "\n".join(
-            f"{'ユーザー' if t['role'] == 'user' else 'sa-ru'}: {t['text']}" for t in snapshot)
+        # 発話 id 注記つきの二窓ビュー（§8.10f 出所束縛）。id はビュー内ユーザー発話の
+        # 決定的な連番（u-zu の会話ペイロードは Slack ts を運ばないため、ターン連番を
+        # 出所識別子にする）。プロンプトの [uN] 注記と検証側 utterances が同じ採番を共有し、
+        # 最後のユーザー発話 = ready を発火させた現在ターン
+        utterances: dict[str, str] = {}
+        lines: list[str] = []
+        for t in snapshot:
+            if t.get("role") == "user":
+                uid = f"u{len(utterances) + 1}"
+                utterances[uid] = t["text"]
+                lines.append(f"[{uid}] ユーザー: {t['text']}")
+            else:
+                lines.append(f"sa-ru: {t['text']}")
+        history_text = "\n".join(lines)
+        # 現在ターン引用規則（§8.10f 出所束縛 (2)）は明示エスケープ（force_ready＝
+        # /taka-ma-go・スレッド go 記法）では適用しない: 現在ターンの発話は逐語 `go` 等の
+        # 定型語のみでどのフィールドも引用できず、規則が構造的に必ず不成立になる
+        # （2026-09-03 E2E 実測）。go は「直近会話をそのまま採用せよ」の人間の明示であり、
+        # stale 束縛防止の目的は人の判断で満たされている。(1) の src 逐語照合は維持する
+        current_id = (None if force_ready
+                      else (f"u{len(utterances)}" if utterances else None))
         validated, provenance = self.contractor.contract(
             history_text, summary,
-            lambda parsed: contract_rules.validate_contract(parsed, source_text),
+            lambda parsed: contract_rules.validate_contract(
+                parsed, source_text, utterances=utterances, current_id=current_id),
             progress=progress)
         if validated is None:
-            return None
+            return None, provenance
+        # ブランチのマーカー決定的抽出（`ブランチ:` / `branch:`・§8.10f）。在れば契約化脳の
+        # 提案より優先する（repo: と同じく、記法の明示指定が権威）。複数あれば最後 = 最新
+        marker = None
+        for text in utterances.values():
+            for m in _BRANCH_MENTION_RE.finditer(text):
+                marker = m.group(1)
+        if marker and ".." not in marker.split("/"):
+            validated["branch"] = marker
         # push を含む依頼で完了条件が空なら既定検査を付与する（§8.10f。脳の
         # 立て損ねで「push の実測検査なしに完了」と言える状態を作らない）
         contract = contract_rules.apply_default_acceptance(validated, summary)
-        # 昇格で確定した契約は来歴を着手確認へ載せる（§8.4.x (e) 可視化。どの脳が
-        # 立てた契約かを人が承認時に見える。"_" 前置きキーは提示専用＝レコードへ運ばない）
-        if provenance.get("origin") not in (None, "local"):
-            contract["_contract_origin"] = {
-                "model": provenance["origin"],
-                "local_failures": provenance.get("local_failures", 0)}
-        return contract
+        # 縮退（CLI 呼び出し失敗 → ローカル契約化・§8.4）は着手確認へ明示する
+        # （"_" 前置きキーは提示専用＝レコードへ運ばない）
+        if provenance.get("degraded"):
+            contract["_contract_degraded"] = True
+        return contract, provenance
 
     def _contract_escalation_runner(self, model_name: str, prompt: str) -> str:
         """昇格ラダーの 1 段: 上位 worker モデルで契約化プロンプトを 1 回だけ実行する。
@@ -1301,6 +1415,92 @@ class ConversationManager:
             # 素通しすると段の失敗でなく会話処理全体を落とす（ハング CLI が 1 段で全体を殺す）
             raise RuntimeError(f"昇格段のタイムアウト: {e}") from e
 
+    def _ensure_branch_switch(self, contract: dict, workspace: str | None):
+        """契約 branch と workspace の HEAD が不一致なら runbook 先頭へ switch を機械付与する。
+
+        設計書 §8.10g「指定ブランチへの switch 機械付与」。判定は HEAD の実測のみ
+        （決定的・LLM 不使用）。付与された step は他の runbook step と同じく着手確認で
+        組立後コマンドが逐語提示され、clean tree 前提の不成立は実測つき失敗で人へ返る
+        （修復しない）。判定不能（SSH 不達等）は付与しない側へ倒す — 実行時の runbook
+        前提実測と出口検査の ref 化が最終防衛。
+        """
+        branch = (contract or {}).get("branch")
+        if not branch or not workspace or self.process_mgr is None:
+            return
+        runbook = contract.get("runbook") or []
+        # 既に当該ブランチへの switch / branch_create があれば重ねない
+        for rb in runbook:
+            params = rb.get("params") or {}
+            if (rb.get("kind") == "switch" and params.get("branch") == branch) or (
+                    rb.get("kind") == "branch_create" and params.get("name") == branch):
+                return
+        try:
+            rc, out = self.process_mgr.run_ssh_probe(
+                f"git -C {shlex.quote(workspace)} rev-parse --abbrev-ref HEAD",
+                runbook_rules.EXEC_TIMEOUT_SEC)
+        except Exception:
+            logger.exception("branch 実測に失敗（switch 付与なしへ縮退）")
+            return
+        head = (out or "").strip()
+        if rc != 0 or not head or head == branch:
+            return
+        contract["runbook"] = [{"kind": "switch", "params": {"branch": branch}}] + runbook
+        logger.info("契約 branch=%s と HEAD=%s の不一致を実測 → switch を機械付与",
+                    branch, head)
+
+    def _capture_file_baselines(self, contract: dict, workspace: str | None):
+        """file_changed 検査の baseline（内容ハッシュ）を実測して契約へ刻む（§8.10f）。
+
+        既定完了検査は file_changed（変更の実測）で立ち、ここで対象の現状を確定する:
+        - 対象が既存 → baseline に blob id を記録（契約 branch が未 checkout なら
+          `rev-parse <branch>:<path>`、それ以外は作業ツリーの `hash-object`。出口検査の
+          hash-object と同じ blob id 系で比較可能）
+        - 対象が不在 → kind を file（作成の実測）へ確定
+        - 実測手段なし（workspace 未解決・SSH なし） → kind を file へ縮退（従来動作）
+        判定は全て実測・LLM 不関与。2026-08-30 E2E 実測（実在検査のみでは無作業でも
+        完了になる）の是正。
+        """
+        acceptance = (contract or {}).get("acceptance") or []
+        targets = [a for a in acceptance
+                   if a.get("kind") == "file_changed"
+                   and not (a.get("params") or {}).get("baseline")]
+        if not targets:
+            return
+        if not workspace or self.process_mgr is None:
+            for a in targets:
+                a["kind"] = "file"
+            return
+        ws = shlex.quote(workspace)
+        branch = (contract or {}).get("branch")
+        head = None
+        try:
+            rc, out = self.process_mgr.run_ssh_probe(
+                f"git -C {ws} rev-parse --abbrev-ref HEAD",
+                runbook_rules.EXEC_TIMEOUT_SEC)
+            head = (out or "").strip() if rc == 0 else None
+        except Exception:
+            head = None
+        for a in targets:
+            path = (a.get("params") or {}).get("path") or ""
+            if branch and head and head != branch:
+                # 指定 ref が未 checkout: 当該 ref 上の blob id を baseline にする
+                # （switch 後の作業ツリー内容と同じ blob id 系・§8.10f 測定の ref 化）
+                cmd = (f"git -C {ws} rev-parse "
+                       f"{shlex.quote(branch)}:{shlex.quote(path)}")
+            else:
+                cmd = f"git -C {ws} hash-object {shlex.quote(path)}"
+            try:
+                rc, out = self.process_mgr.run_ssh_probe(
+                    cmd, runbook_rules.EXEC_TIMEOUT_SEC)
+            except Exception:
+                rc, out = 1, ""
+            h = (out or "").strip().split()[0] if rc == 0 and (out or "").strip() else ""
+            if h:
+                a.setdefault("params", {})["baseline"] = h
+            else:
+                # 対象不在（または取得不能）＝作成の依頼として file（実在の実測）へ確定
+                a["kind"] = "file"
+
     # ── 再入 reconcile（設計書 §8.10g。計画・着手確認の前に世界の実状態を測る） ──
 
     def _reconcile_acceptance(self, cid: str, contract: dict, workspace: str | None,
@@ -1316,14 +1516,17 @@ class ConversationManager:
         acceptance = (contract or {}).get("acceptance") or []
         if not acceptance or not workspace or self.process_mgr is None:
             return []
+        default_branch = (contract or {}).get("branch")
         satisfied: list[str] = []
         evidences: list[str] = []
         try:
             verifier = GroundingVerifier(self.process_mgr.run_ssh_probe)
             # 検査は 1 件ずつ回す（部分 PASS の粒度を得るため。件数は契約検証で
-            # 既定付与上限に抑えられており、SSH 往復の増分は限定的）
+            # 既定付与上限に抑えられており、SSH 往復の増分は限定的）。契約に branch が
+            # あれば当該 ref を対象に測る（§8.10f 測定の ref 化）
             for check in acceptance:
-                report = verifier.verify_acceptance(workspace, [check])
+                report = verifier.verify_acceptance(workspace, [check],
+                                                    default_branch=default_branch)
                 if report.ok:
                     params = " ".join(
                         f"{k}={v}" for k, v in (check.get("params") or {}).items())
@@ -1333,7 +1536,8 @@ class ConversationManager:
             # 完了条件が目標の一部（commit/push）しか捉えていなくても、未実施の
             # runbook 操作（merge 等）が残っていれば「達成済み」と誤抑止しない
             # — 2026-08-28 E2E 実測: マージ未実施の依頼を全 PASS で抑止した欠陥の是正
-            for rb in (contract or {}).get("runbook") or []:
+            runbook = (contract or {}).get("runbook") or []
+            for rb in runbook:
                 done, _ = runbook_rules.step_already_done(
                     self.process_mgr.run_ssh_probe, workspace,
                     rb["kind"], rb["params"])
@@ -1343,7 +1547,16 @@ class ConversationManager:
             # 事前実測の失敗で依頼を堰き止めない（検査は出口でも必ず走る・§8.10f）
             logger.exception("事前実測（reconcile）に失敗（計画提示は継続）")
             return []
-        if len(satisfied) == len(acceptance):
+        # 弁別力規則（§8.10g）: 着手前から PASS の存在型検査（file / remote_file）は
+        # これから行う作業の達成を弁別できない（既存ファイルの修正依頼では実行前から
+        # 必ず PASS する）。全 PASS 停止は、状態遷移型検査を 1 つ以上含むか、契約の
+        # runbook 全 step が済（実測 = 状態遷移の証跡）の場合に限る。存在型のみの
+        # 契約は「済（実測）」注記つきで着手確認へ進む（2026-08-29 実障害:
+        # 不具合報告に対し file 事前 PASS を根拠に実行を拒否した — の是正）
+        has_transition = (any(a.get("kind") in contract_rules.TRANSITION_KINDS
+                              for a in acceptance)
+                          or bool(runbook))
+        if len(satisfied) == len(acceptance) and has_transition:
             text = ("完了条件は既に満たされています（実測）。実行は行いません。"
                     "再実行が必要な場合はその旨を明示してください。\n\n"
                     + "\n\n".join(evidences))
@@ -1372,7 +1585,8 @@ class ConversationManager:
                 if not record.get("acceptance") or not record.get("workspace"):
                     continue
                 report = verifier.verify_acceptance(
-                    record["workspace"], record["acceptance"])
+                    record["workspace"], record["acceptance"],
+                    default_branch=record.get("branch"))
                 if report.ok:
                     intent_store.set_goal_status(
                         intents_dir, record["task_id"], intent_store.GOAL_ACHIEVED)
@@ -1523,16 +1737,31 @@ class ConversationManager:
           渡すと git 操作が入力に残り、注意書き（散文）の遵守頼みでは二重実行
           （runbook と agent step が同じ push/merge を持つ）を構造的に防げない
         - 文字列 → その要約だけを分解する（入力から git 操作を除く＝抑止を構造にする）
-        - キー欠落（旧出力・検証縮退）→ 従来どおり確定要約を分解（縮退動作）
+        - キー欠落（旧レコードのみ。新規契約は validate_contract が必須化済み）→ null と
+          同じく分解省略。確定要約へのフォールバックは廃止（会話脳の言い換えが分解へ
+          入る最後の経路の遮断・2026-09-03 改訂）
         いずれも「runbook が実行する操作をサブタスクに含めない」注意書きは多層として
         維持する（済み step も covered に含める — 分解へ再流入させない）。
         """
+        # 残り作業との順序・済み判定の弁別（§8.10g 2026-09-03 改訂）: 成果系
+        # （commit/push/merge）は残り作業の産物を刻む操作。残り作業（agent step）が
+        # 存在するときは agent の後ろへ直列化し、済み判定も適用しない — 計画時点の
+        # 「対象パスに変更なし」「remote 先端一致」は残り作業の実行前の状態であり、
+        # 済みの証拠にならない（2026-09-03 E2E 実測: クリーンな作業ツリーを
+        # 「コミット済み」と誤判定して commit step が計画から欠落し、head_touches
+        # 未達で終わった）。準備系（switch/branch_create）と残り作業なしの計画は従来どおり
+        rest_summary = (contract or {}).get("rest_summary")
+        has_rest = rest_summary is not None
         plan: list[dict] = []
         covered: list[str] = []
         skipped: list[str] = []
         todo: list[dict] = []
+        post: list[dict] = []
         for rb in rb_steps:
             covered.append(f"{rb['kind']} {rb['params']}")
+            if has_rest and rb["kind"] in runbook_rules.POST_WORK_KINDS:
+                post.append(rb)
+                continue
             done = False
             evidence = ""
             if self.process_mgr is not None:
@@ -1560,13 +1789,11 @@ class ConversationManager:
         k = len(plan)
         note = ("\n\n（注意: 次の git 操作は runbook が別途決定的に実行するため、"
                 "サブタスクに含めないこと: " + "、".join(covered) + "）")
-        if contract is not None and "rest_summary" in contract:
-            rest_summary = contract["rest_summary"]
-            # null = 残り作業なしの明示 → agent 分解を省略（計画は runbook のみ）
-            rest = ([] if rest_summary is None
-                    else self._build_plan(rest_summary + note, progress=progress) or [])
-        else:
-            rest = self._build_plan(summary + note, progress=progress) or []
+        # 分解入力は常に契約の rest_summary（§8.10g。rest_summary は必須キー化済みで、
+        # 確定要約を分解入力に使う縮退経路は廃止 — 会話脳の言い換えを実行系へ入れない。
+        # 2026-09-03 改訂）。キーが無い契約はここへ到達しない（validate_contract が弾く）
+        rest = ([] if rest_summary is None
+                else self._build_plan(rest_summary + note, progress=progress) or [])
         for s in rest:
             s = dict(s)
             s["step"] = s["step"] + k
@@ -1575,6 +1802,20 @@ class ConversationManager:
             # runbook が全て済み（k=0）のときは分解結果の依存をそのまま使う
             s["depends_on"] = deps or ([k] if k else [])
             plan.append(s)
+        # 成果系 runbook を agent step 列の後ろへ直列化する（§8.10g 成果系の後置。
+        # 済み判定は適用済みでない＝全 step を載せ、実行時の前提実測が防衛する）
+        n = len(plan)
+        for j, rb in enumerate(post, start=1):
+            commands = runbook_rules.build_commands(workspace, rb["kind"], rb["params"])
+            plan.append({
+                "step": n + j,
+                "command": " && ".join(commands),
+                "execution": "runbook",
+                "depth": None,
+                "confidence": 1.0,
+                "depends_on": [n + j - 1] if (n + j) > 1 else [],
+                "_runbook": rb,
+            })
         return plan, skipped
 
     def _build_plan(self, summary: str, progress=None) -> list[dict] | None:
@@ -1610,8 +1851,21 @@ class ConversationManager:
         directive = (contract or {}).get("directive")
         rb_steps = (contract or {}).get("runbook") or []
         if directive:
-            plan = [{"step": 1, "command": directive, "execution": "agent",
-                     "depth": None, "confidence": 1.0, "depends_on": []}]
+            # 逐語命令の前にも runbook step（指定ブランチへの switch 機械付与・§8.10g）が
+            # あれば先に決定的実行する。従来は directive 型で runbook が計画から落ち、
+            # 指定ブランチへ切り替えずに逐語命令が実行された（本タスクの自己レビューで検出）。
+            # directive 型契約の分解はしない（rest_summary=None で agent 分解を省略）
+            plan = []
+            if rb_steps and workspace:
+                plan, rb_skipped = self._merge_runbook_plan(
+                    rb_steps, workspace, summary,
+                    contract={"rest_summary": None}, progress=progress)
+                if rb_skipped and contract is not None:
+                    contract.setdefault("_pre_satisfied", []).extend(rb_skipped)
+            k = len(plan)
+            plan.append({"step": k + 1, "command": directive, "execution": "agent",
+                         "depth": None, "confidence": 1.0,
+                         "depends_on": [k] if k else []})
         elif rb_steps and workspace:
             # 定型 git 操作は runbook step（決定的実行）として計画の先頭へ置く（§8.10g）。
             # コマンドはここで組み立てて凍結し、実行側は同じ組立（build_commands）を通る
@@ -1622,7 +1876,14 @@ class ConversationManager:
                                                         progress=progress)
             if rb_skipped and contract is not None:
                 contract.setdefault("_pre_satisfied", []).extend(rb_skipped)
+        elif contract is not None:
+            # runbook 無しの契約も分解入力は rest_summary（§8.10g 一本化・2026-09-03）。
+            # null（残り作業なし）はプレビュー無し提示へ縮退（分解対象が無い）
+            rest_summary = contract.get("rest_summary")
+            plan = (self._build_plan(rest_summary, progress=progress)
+                    if rest_summary else None)
         else:
+            # 契約未構成（`contract:` 無効の従来動作）のみ確定要約を分解する
             plan = self._build_plan(summary, progress=progress)
         record = {
             "exec_request_id": exec_request_id,
@@ -1636,6 +1897,8 @@ class ConversationManager:
             "thread_ts": msg.get("thread_ts"),
             "model_override": models or [],
             "workspace": workspace,
+            "branch": (contract or {}).get("branch"),
+            "target_paths": (contract or {}).get("target_paths") or [],
             "directive": directive,
             "constraints": (contract or {}).get("constraints") or [],
             "acceptance": (contract or {}).get("acceptance") or [],
@@ -1644,6 +1907,10 @@ class ConversationManager:
             "decided_at": None,
             "decided_by": None,
         }
+        # 新しい発話の契約化が成立した時点で、同一会話面の既存 pending を失効させる
+        # （§8.10b「タイムアウトと失効」。stale 計画の自動再提示が別話題の計画を承認面に
+        # 載せた 2026-08-29 実障害の是正。新しい提示より前に行い、失効対象に自分を含めない）
+        self._supersede_pendings(msg)
         path = os.path.join(self.confirm_dir, f"{exec_request_id}.json")
         # 原子書込。u-zu / sa-ru 双方が確認レコードを読むため torn-read を防ぐ（§8.3 書込の原子性）。
         atomic_write_json(path, record)
@@ -1676,10 +1943,52 @@ class ConversationManager:
         self._set_awaiting(msg["conversation_id"], True)
         self.slack.send_exec_confirm_request(exec_request_id, summary, **kwargs)
 
+    def _supersede_pendings(self, msg: dict):
+        """同一会話面の pending 確認レコードを superseded へ失効させる（§8.10b）。
+
+        新しい発話の契約化が成立した（新しい着手確認を出す）時点で呼ぶ。ユーザーの
+        関心は最新の発話にあり、過去の計画が並存すると別話題の計画が承認面へ載る
+        （2026-08-29 実障害）。失効した計画の復活はユーザーの明示発話（再依頼 →
+        新規契約化）による。失敗は提示本体を止めない。
+        """
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        try:
+            # 対象は同一会話面（team_id, channel_id）の全 pending。_pending_confirms は
+            # cid 一致を優先して同一チャンネル別スレッドの pending を返さないため使わない
+            # （現在スレッドに pending があると別スレッドの stale が生き残る — 本タスクの
+            # 自己レビューで検出。2026-08-29 実障害はまさに別スレッドの stale だった）
+            for name in os.listdir(self.confirm_dir):
+                if not name.endswith(".json"):
+                    continue
+                path = os.path.join(self.confirm_dir, name)
+                try:
+                    with open(path) as f:
+                        record = json.load(f)
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if (record.get("status") == "pending"
+                        and record.get("team_id") == msg.get("team_id")
+                        and record.get("channel_id") == msg.get("channel_id")):
+                    record["status"] = "superseded"
+                    record["decided_at"] = now
+                    atomic_write_json(path, record)
+                    logger.info("pending 計画を失効（新しい発話の契約化）: id=%s",
+                                record.get("exec_request_id"))
+        except Exception:
+            logger.exception("pending 計画の失効に失敗（新規提示は継続）")
+
     @staticmethod
     def _format_contract(contract: dict) -> str:
-        """着手確認へ載せる契約の提示文（§8.10f。空欄も「なし」と明示する）。"""
+        """着手確認へ載せる契約の提示文（§8.10f。空欄も「なし」と明示する）。
+
+        本文は契約フィールドのみからコード側で組み立てる（§8.10f 提示文はコード組立。
+        脳の自由散文を承認面に載せない — 2026-08-29 実障害: 契約化脳の内部独白が
+        計画本文にそのまま提示された）。
+        """
         lines = [f"命令（逐語実行）: {contract.get('directive') or 'なし'}"]
+        lines.append(f"ブランチ: {contract.get('branch') or 'なし（HEAD のまま作業）'}")
+        target_paths = contract.get("target_paths") or []
+        lines.append("対象文書: " + ("、".join(target_paths) if target_paths else "なし"))
         constraints = contract.get("constraints") or []
         if constraints:
             lines.append("拘束条件:")
@@ -1693,13 +2002,15 @@ class ConversationManager:
             # 組立後コマンドの逐語は実行計画側に表示される（§8.10g。二重に長文化しない）
             lines.append(f"runbook（決定的実行・worker LLM なし）: {len(runbook)} step "
                          "— 組立後コマンドは実行計画に逐語表示")
-            # 残り作業（runbook 外・agent 分解の入力）は常に提示する（§8.10f rest_summary。
-            # null=分解省略の縮約も人の承認対象にする — 見えていない縮約は承認されない）
-            if "rest_summary" in contract:
-                lines.append("残り作業（分解対象）: "
-                             + (contract["rest_summary"] or "なし（runbook で完結）"))
-            else:
-                lines.append("残り作業（分解対象）: 未特定（確定要約の全体を分解）")
+        # 残り作業（agent 分解の入力）は runbook の有無に依らず常に提示する（§8.10f
+        # rest_summary 必須化・2026-09-03。null=分解省略の縮約も人の承認対象にする）
+        if "rest_summary" in contract:
+            none_label = "なし（runbook で完結）" if runbook else "なし"
+            lines.append("残り作業（分解対象）: "
+                         + (contract["rest_summary"] or none_label))
+        else:
+            # 旧レコード（rest_summary 必須化前）の表示互換
+            lines.append("残り作業（分解対象）: 未特定（旧契約）")
         acceptance = contract.get("acceptance") or []
         if acceptance:
             lines.append("完了条件（完了時に sa-ru が実測検査）:")
@@ -1711,11 +2022,10 @@ class ConversationManager:
         # 事前実測（reconcile・§8.10g）で既に満たされていた検査を明示する
         for line in contract.get("_pre_satisfied") or []:
             lines.append(f"- 済（実測）: {line}")
-        # 昇格で確定した契約の来歴（§8.4.x (e) 可視化。どの脳が立てた契約かを人が見える）
-        origin = contract.get("_contract_origin")
-        if origin:
-            lines.append(f"契約化: ローカル検証不合格 {origin.get('local_failures', 0)} 回"
-                         f" → {origin.get('model')}（昇格）")
+        # 縮退（CLI 呼び出し失敗 → ローカル契約化・§8.4）の可視化。どの脳が立てた
+        # 契約かを人が承認時に見える
+        if contract.get("_contract_degraded"):
+            lines.append("契約化: 縮退モード（ローカル契約化 — worker CLI 呼び出し失敗）")
         return "\n".join(lines)
 
     # ── 着手確認の決着（確認ループから呼ばれる） ──
@@ -1766,7 +2076,7 @@ class ConversationManager:
         if record.get("plan"):
             task["_plan"] = record["plan"]
         # 会話⇄実行の受け渡し契約（§8.10f）。着手確認で人が承認した値だけを実行・検証へ運ぶ
-        for key in ("directive", "constraints", "acceptance"):
+        for key in ("directive", "constraints", "acceptance", "branch", "target_paths"):
             if record.get(key):
                 task[key] = record[key]
         os.makedirs(self.task_dir, exist_ok=True)
@@ -1796,6 +2106,7 @@ class ConversationManager:
                     summary=record["summary"],
                     acceptance=record.get("acceptance") or [],
                     workspace=record.get("workspace") or f"{self.workspace_base}/{task_id}",
+                    branch=record.get("branch"),
                     user_id=record.get("decided_by") or record.get("user_id", ""))
             except OSError:
                 logger.exception("intent レコード作成失敗（タスク実行は継続）: %s", task_id)

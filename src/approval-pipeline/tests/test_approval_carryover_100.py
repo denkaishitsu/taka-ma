@@ -93,8 +93,9 @@ def test_no_carryover_across_tasks():
         assert notifier.sent is not None
 
 
-def test_no_carryover_from_rejected_record():
-    """rejected レコードは引き継ぎの根拠にならない（approved のみが対象）。"""
+def test_rejected_record_carries_over_as_deny():
+    """rejected レコードは「再依頼せず deny」で引き継ぐ（§8.10 却下の粒度・2026-09-03。
+    旧仕様は却下済み操作へ再び承認依頼を出し、同じ操作を人へ二度聞いていた）。"""
     with tempfile.TemporaryDirectory() as tmp:
         _write_done_record(tmp, status="rejected")
         notifier = FakeNotifier()
@@ -104,8 +105,10 @@ def test_no_carryover_from_rejected_record():
         result = _decide(pipeline, pending)
 
         assert not result.allow
-        assert result.hold
-        assert notifier.sent is not None
+        assert not result.hold                          # 保留せず即 deny（worker は次へ進める）
+        assert result.handler == "rejection_carryover"
+        assert "orig-req-1" in result.reason            # 元の人間決定へ遡れること
+        assert notifier.sent is None                    # 却下済み操作を人へ二度聞かない
 
 
 def test_always_deny_beats_carryover():

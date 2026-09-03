@@ -103,9 +103,31 @@ class TaskDecomposer:
                     pass
                 # 生の 2 軸をそのまま残す。迷い（confidence 低）の sonnet 落下・昇格は
                 # orchestrator が写像テーブルで行う（旧 light→heavy 強制を廃止）。
+            # 呼び出し単位の成功記録（§8.4.1）。サブタスク単位の log_decision では呼び出し数
+            # を分母とするフォールバック率が集計できないため、1 呼び出し = 1 行を別途残す
+            try:
+                self.logger.log_decompose_call(
+                    task=command, fallback=False, subtasks=len(subtasks))
+            except Exception:
+                pass
             return subtasks
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError, RuntimeError):
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError, RuntimeError) as e:
             # フォールバック: パースエラー・構造不正・ollama 実行失敗のいずれも、元の指示を
-            # 1 件の execution=agent / depth 省略（＝写像上 sonnet）として扱う（設計書 §8.4）
+            # 1 件の execution=agent / depth 省略（＝写像上 sonnet）として扱う（設計書 §8.4）。
+            # 発動は判定ログへ記録し、失敗率を期間集計できるようにする（§8.4.1。分解・分類を
+            # worker CLI 上位モデルへ移すか — 契約化に続く換装 — の判断材料。実測で決める）
+            try:
+                self.logger.log_decision(
+                    task=command[:200], execution="agent", depth=None, model="",
+                    reason=f"分解フォールバック発動: {type(e).__name__}", confidence=0.0)
+            except Exception:
+                pass
+            # 呼び出し単位の失敗記録（§8.4.1 分解フォールバック率の分子）
+            try:
+                self.logger.log_decompose_call(
+                    task=command, fallback=True,
+                    reason=f"分解フォールバック発動: {type(e).__name__}", subtasks=1)
+            except Exception:
+                pass
             return [{"step": 1, "command": command, "execution": "agent",
                      "depth": None, "confidence": 0.0, "depends_on": []}]

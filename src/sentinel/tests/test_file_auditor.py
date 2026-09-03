@@ -26,6 +26,7 @@ def _handler(tmp, *, ignore_patterns=None, control_plane_files=None, task_contex
         "o_moi_alert_dir": os.path.join(tmp, "alerts"),
         "mac_mini_host": "mac-mini",
         "debounce_sec": 1,
+        "alert_digest_window_sec": 60,
         "control_plane_files": (control_plane_files if control_plane_files is not None
                                 else [".taka-hook-settings.json"]),
     }

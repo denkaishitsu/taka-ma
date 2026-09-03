@@ -34,6 +34,14 @@ RUNBOOK_KINDS = {
     "switch": {"required": {"branch"}, "optional": set()},
 }
 
+# 成果系 runbook（残り作業の産物を刻む操作・§8.10g 成果系の後置）。残り作業（agent step）を
+# 伴う計画では agent の後ろへ直列化し、計画時の済み判定を適用しない — 計画時点の
+# 「変更なし」「remote 一致」は残り作業の実行前の状態で、済みの証拠にならない
+# （2026-09-03 E2E 実測: クリーンな作業ツリーを「コミット済み」と誤判定し commit が計画から
+# 欠落。commit が編集より先に並ぶ順序も同時に是正）。switch / branch_create は準備系
+# （作業の前提を整える操作）で従来どおり前置・済み判定適用
+POST_WORK_KINDS = ("commit_paths", "push", "merge_ff")
+
 # ブランチ名・パスの受理形式。SSH コマンド文字列に乗るため安全文字のみ
 # （contract._SAFE_PARAM_RE と同一規則。テストのファイル直ロードのため import で共有しない —
 # `grep -n "A-Za-z0-9._/" src/orchestrator/contract.py src/orchestrator/runbook.py` で一致を確認する）

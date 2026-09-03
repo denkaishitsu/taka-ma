@@ -94,7 +94,7 @@ def _wire(mgr, monkeypatch, results, verdict):
     monkeypatch.setattr(mgr, "_recheck_detail_question",
                         lambda message_text, reply, progress=None: verdict)
     monkeypatch.setattr(mgr, "_build_contract",
-                        lambda cid, summary, progress=None: dict(_CONTRACT))
+                        lambda cid, summary, progress=None, force_ready=False: (dict(_CONTRACT), {}))
     return stub
 
 
@@ -159,7 +159,7 @@ def test_force_ready_skips_recheck(monkeypatch):
                         lambda history, force, progress=None, detail_retry=False:
                         dict(_READY))
     monkeypatch.setattr(mgr, "_build_contract",
-                        lambda cid, summary, progress=None: dict(_CONTRACT))
+                        lambda cid, summary, progress=None, force_ready=False: (dict(_CONTRACT), {}))
     mgr.handle_message(_msg("やれ", force=True))
     assert not called
 

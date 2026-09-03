@@ -302,18 +302,23 @@ def test_resolve_hold_approved_reinjects_task(tmp_path):
     asyncio.run(_run())
 
 
-def test_resolve_hold_rejected_fails_task(tmp_path):
+def test_resolve_hold_rejected_reinjects_and_continues(tmp_path):
+    """Reject → タスクを failed にせず、当該操作のみ deny（却下 carryover）で再投入する
+    （§8.10 承認却下の粒度。旧仕様: 却下＝タスク全体 failed — 2026-08-30 実測で
+    承認済みの本体書き込みまで巻き添え中止した — の是正）。"""
     async def _run():
         o = _hold_orch(tmp_path)
         _write_approval(o.approval_dir, "req-1", "t1", "rejected")
         path, task = _held_task(tmp_path)
         await o._resolve_hold(path, task)
 
-        archived = os.path.join(str(tmp_path), "done",
-                                datetime.date.today().isoformat(), "t1.json")
-        saved = json.load(open(archived))
-        assert saved["status"] == "failed"
-        assert "却下" in saved["result"]
+        saved = json.load(open(path))
+        assert saved["status"] == "init"                # 継続: dispatcher が拾える状態へ
+        assert saved["_reinject_count"] == 1
+        assert saved["held_approval_id"] == ""
+        # 却下レコードは done/ へ退避される（decide 側の却下 carryover が参照する raw は
+        # 残さず、pending 判定の再発を防ぐ）
+        assert not os.path.exists(os.path.join(o.approval_dir, "req-1.json"))
     asyncio.run(_run())
 
 

@@ -43,6 +43,7 @@ def _build_reviewer(config: dict) -> QueReviewer:
         # ロックパス・審査タイムアウトとも qu-e.yaml が唯一の源（コード既定値なし）
         inference_lock=config["qu-e"]["inference_lock"],
         review_timeout_sec=config["qu-e"]["review_timeout_sec"],
+        keep_alive_sec=config["qu-e"]["keep_alive_sec"],
     )
 
 

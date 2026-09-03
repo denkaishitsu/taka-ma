@@ -28,6 +28,15 @@ _BASE_FLAGS = [
 ]
 
 
+class StreamReadError(RuntimeError):
+    """stream-json の読取失敗（行長上限超過等・インフラ起因）。
+
+    worker（モデル）の能力とは無関係な読取側の障害を表す。呼び出し側（昇格ラダー）は
+    この例外を「難所」と解釈せず、昇格の発動理由にしない（設計 §8.5: 読取エラーが
+    haiku → sonnet → opus の偽昇格を起こした 2026-08-30 実測の恒久対策）。
+    """
+
+
 def build_hook_settings(mini_host: str, decide_client: str, decide_socket: str, *,
                         task_id: str = "", team_id: str | None = None,
                         channel: str | None = None, thread_ts: str | None = None,
@@ -115,17 +124,23 @@ class WorkerHeadlessRunner:
         hook_settings_path: PreToolUse フックを注入する settings JSON のパス（MBP 上のパス）。
                             None なら --settings を付けない（フックなし＝permission-mode default の
                             既定挙動に従う。テスト・段階導入用）。
+        stream_limit_bytes: stream-json 1 行の読取上限（バイト）。asyncio StreamReader の既定
+                            64KB は大きいファイルを読んだ tool_result 1 行で不足する（設計 §8.5）。
+                            運用値は sa-ru.yaml headless.stream_limit_bytes が唯一の源で、ここの
+                            既定値は runner を直接組むテスト・段階導入用。
     """
 
     def __init__(self, instance_id: str, command: str = "claude", model_flag: str = "",
                  ssh_host: str = "mbp", cwd: str | None = None,
-                 hook_settings_path: str | None = None):
+                 hook_settings_path: str | None = None,
+                 stream_limit_bytes: int = 10 * 1024 * 1024):
         self.instance_id = instance_id
         self.command = command
         self.model_flag = model_flag
         self.ssh_host = ssh_host
         self.cwd = cwd
         self.hook_settings_path = hook_settings_path
+        self.stream_limit_bytes = stream_limit_bytes
 
     def _build_argv(self, task: str) -> list[str]:
         """`claude -p <task> ...` の argv を組み立てる（シェル文字列連結を避ける）。
@@ -173,6 +188,10 @@ class WorkerHeadlessRunner:
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            # stream-json は 1 行 1 イベントで、大きいファイルを読んだ tool_result は 1 行で
+            # 数百 KB〜になる。StreamReader 既定の 64KB では行長超過で読取側が落ち、それが
+            # 「難所」と誤解釈されて偽昇格を起こした（設計 §8.5・2026-08-30 実測）。
+            limit=self.stream_limit_bytes,
         )
         try:
             result = await asyncio.wait_for(self._consume_stream(proc), timeout=timeout)
@@ -186,6 +205,22 @@ class WorkerHeadlessRunner:
             # 中止命令（§8.10d）等で worker タスクが cancel された場合もタイムアウトと同じ
             # 資源回収経路に乗せる。ここで殺さないとローカル ssh とリモート claude -p が
             # 孤児化して走り続ける（§8.5 資源回収）。
+            proc.kill()
+            await proc.wait()
+            raise
+        except (asyncio.LimitOverrunError, ValueError) as e:
+            # 拡大後の上限をなお超えた行長超過（readline は LimitOverrunError を
+            # ValueError("Separator is not found...") に包んで送出する）。インフラ起因の
+            # 読取エラーであり worker の難所ではないため、専用例外に変換して昇格ラダーの
+            # 発動理由から外す（設計 §8.5）。プロセスは下の except と同様に確実に畳む。
+            proc.kill()
+            await proc.wait()
+            raise StreamReadError(
+                f"stream-json 読取失敗（行長上限 {self.stream_limit_bytes} bytes 超過等・"
+                f"インフラ起因）: {self.instance_id}: {e}")
+        except Exception:
+            # 読取側がどんな理由で死んでも worker の SSH プロセスを残さない（設計 §8.5:
+            # 読取死亡後に ssh -tt がリークして残留した 2026-08-30 実測の恒久対策）。
             proc.kill()
             await proc.wait()
             raise

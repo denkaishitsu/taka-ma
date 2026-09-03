@@ -15,7 +15,16 @@ from orchestrator import runbook as runbook_rules
 ACCEPTANCE_KINDS = {
     "pushed": {"required": set(), "optional": {"branch"}},
     "remote_file": {"required": {"branch", "path"}, "optional": set()},
-    "file": {"required": {"path"}, "optional": set()},
+    # file の branch: 指定 ref 上の存在を実測する（§8.10f 測定の ref 化。checkout 中の
+    # 別ブランチを測って指定ブランチの実態と食い違う 2026-08-29 実障害の是正）
+    "file": {"required": {"path"}, "optional": {"branch"}},
+    # 修正系依頼の達成検査（§8.10f）。baseline は着手確認の組立時に sa-ru が実測して刻む
+    # 内容ハッシュ（git hash-object / rev-parse <ref>:<path> の blob id・LLM 不関与）。
+    # 実在のみの file では実行前から PASS し無作業でも完了になる（2026-08-30 E2E の是正）
+    "file_changed": {"required": {"path"}, "optional": {"baseline"}},
+    # 生成依頼の最小達成検査（§8.10f）: 実在＋最低サイズ。空ファイル・スタブを「完了」に
+    # しない。形式等のモデル固有検査は生成系モデル登録時に同時追加する（カタログの規約）
+    "file_min_bytes": {"required": {"path", "min_bytes"}, "optional": set()},
     "head_touches": {"required": {"path"}, "optional": set()},
     "diff_limit": {"required": {"max_lines"}, "optional": {"path"}},
     # マージ完了の検査（§8.10g）。「source が target に取り込まれたか」を merge-base で
@@ -27,8 +36,19 @@ ACCEPTANCE_KINDS = {
 # リポジトリ系の検査（§8.10f needs_repo の機械補助: これを含む契約は実リポジトリを要する）
 REPO_KINDS = {"pushed", "remote_file", "head_touches", "diff_limit", "branch_merged"}
 
+# reconcile の弁別力規則（§8.10g）: 着手前から PASS している存在型検査は「これから行う
+# 作業の達成」を弁別できない（既存ファイルの修正依頼では実行前から必ず PASS する）。
+# 「完了条件は既に満たされています」の全 PASS 停止は、状態遷移型検査を 1 つ以上含む
+# 契約に限る（2026-08-29 実障害: 不具合報告への実行拒否 — の是正）
+EXISTENCE_KINDS = {"file", "remote_file"}
+TRANSITION_KINDS = {"pushed", "head_touches", "diff_limit", "branch_merged", "file_changed"}
+
+# 契約 target_paths の上限（§8.10f。列挙の暴走で契約を肥大させない —
+# 既定 file 検査の上限 _MAX_DEFAULT_FILE_CHECKS と同値）
+MAX_TARGET_PATHS = 5
+
 # 整数パラメータ（検査コマンド文字列には乗せず比較にのみ使う）。上限は暴走値の拒否
-_INT_PARAMS = {"max_lines"}
+_INT_PARAMS = {"max_lines", "min_bytes"}
 _MAX_INT_PARAM = 100000
 
 # 環境改変コマンドの既定 deny（§8.10f 事前予防）。worker の勝手な環境改変（push 不能への
@@ -93,44 +113,101 @@ def env_mutation_allows(directive: str | None) -> list[str]:
     return [cmd for cmd in ENV_MUTATION_COMMANDS if cmd in normalized]
 
 
-def validate_contract(raw, source_text: str) -> tuple[dict | None, list[str]]:
+def _split_sourced(value):
+    """発話由来フィールドの値を (本文, 出所 id | None) に分解する（§8.10f 出所束縛）。
+
+    契約化脳は {"text": ..., "src": "<発話 id>"} で出所を付す。旧形式（素の文字列）も
+    受理する（src なし＝出所不明。逐語照合は会話全体に対して行う縮退）。
+    """
+    if isinstance(value, dict):
+        text = value.get("text")
+        src = value.get("src")
+        return (text if isinstance(text, str) else None,
+                src if isinstance(src, str) and src.strip() else None)
+    return (value if isinstance(value, str) else None), None
+
+
+def _verbatim_in(candidate: str, src: str | None, utterances: dict | None,
+                 source_text: str) -> bool:
+    """出所付き逐語照合（§8.10f）。src があれば当該発話に、無ければ会話全体に照合する。
+
+    src が utterances に実在しない id を指す場合は不合格（存在しない発話からの引用）。
+    utterances 未提供（旧呼び出し・単体テスト）は会話全体照合へ縮退する。
+    """
+    if src and utterances is not None:
+        if src not in utterances:
+            return False
+        return is_verbatim(candidate, utterances[src])
+    return is_verbatim(candidate, source_text)
+
+
+def validate_contract(raw, source_text: str, utterances: dict | None = None,
+                      current_id: str | None = None) -> tuple[dict | None, list[str]]:
     """契約化パスの LLM 出力を検証・正規化する。(契約 dict, 逸脱理由リスト) を返す。
 
-    逸脱が 1 つでもあれば契約は None（fail-closed。呼び出し側がリトライ・昇格 /
+    逸脱が 1 つでもあれば契約は None（fail-closed。呼び出し側がリトライ /
     人へ差し戻す）。正規化済み契約は {directive, constraints, acceptance, runbook,
-    workspace, needs_repo(, rest_summary)}。rest_summary キーは入力に在って型が
-    正しいときのみ載る（欠落は「従来どおり確定要約を分解」の縮退印・§8.10g）。
+    workspace, branch, target_paths, needs_repo, rest_summary}。rest_summary は必須キー
+    （欠落・空文字列・型不正は契約不成立 — 分解入力の唯一の源を欠く契約を通さない・§8.10g）。
     workspace はここでは文字列のまま返す（絶対パス検証・~ 展開は conversation.parse_workspace
     と同一規則に通す責務が呼び出し側にある。検証規則を二重に持たない）。
+
+    出所束縛（§8.10f）: utterances（発話 id → 逐語テキスト）と current_id（ready を
+    発火させた現在ターンの id）が与えられたとき、(1) 発話由来フィールドの src 照合、
+    (2) 現在ターンを引用するフィールドが 1 つ以上あること、を検査する。発話由来
+    フィールドが全て空の契約（目標型）は (2) を適用しない（引用すべきものが無い —
+    既知の限界として、その束縛は確定要約側に残る）。
     """
     problems: list[str] = []
     if not isinstance(raw, dict):
         return None, ["契約出力が JSON オブジェクトでない"]
 
+    # unmapped: スキーマ閉包（§8.10f）。契約フィールドへ写像できない「実行に影響する
+    # 指定」の逐語引用列。非空なら契約不成立 — 脳の誤りではなく閉包の正常な検出であり、
+    # 呼び出し側はリトライせず直ちに当該指定の扱いを人に確認する（"unmapped:" 前置きで
+    # 機械判別できる形にする）
+    unmapped = [u.strip() for u in (raw.get("unmapped") or [])
+                if isinstance(u, str) and u.strip()]
+    if unmapped:
+        return None, ["unmapped:" + " / ".join(unmapped)]
+
+    cites_current = False  # 現在ターンを引用するフィールドが 1 つでもあるか
+
+    def _cited(candidate: str, src: str | None) -> None:
+        """現在ターン引用の検出（出所束縛 (2)）。src 一致 or 現在発話に逐語で含まれる。"""
+        nonlocal cites_current
+        if current_id is None or utterances is None:
+            return
+        if src == current_id or is_verbatim(candidate, utterances.get(current_id) or ""):
+            cites_current = True
+
     # directive: null または発話からの逐語引用。機械が判定するのは逐語性のみで、
     # 「実行可能なコマンドか」は判定しない（言語・形での機械判別は場当たりになる。
     # 命令かどうかの最終判断は着手確認の提示で人間が行う・§8.10f）
-    directive = raw.get("directive")
-    if directive is not None:
+    directive, directive_src = _split_sourced(raw.get("directive"))
+    if raw.get("directive") is not None:
         if not isinstance(directive, str) or not directive.strip():
             problems.append("directive が文字列でない")
             directive = None
-        elif not is_verbatim(directive, source_text):
+        elif not _verbatim_in(directive, directive_src, utterances, source_text):
             problems.append("directive が発話の逐語引用でない（原文に無い命令の生成は禁止）")
             directive = None
         else:
             directive = directive.strip()
+            _cited(directive, directive_src)
 
-    # constraints: [{text, forbid, patterns?}] — text は逐語引用のみ
+    # constraints: [{text, forbid, patterns?, src?}] — text は逐語引用のみ
     constraints: list[dict] = []
     for c in raw.get("constraints") or []:
         if not isinstance(c, dict) or not isinstance(c.get("text"), str) or not c["text"].strip():
             problems.append("constraints の要素が {text, forbid} 形式でない")
             continue
         text = c["text"].strip()
-        if not is_verbatim(text, source_text):
+        src = c.get("src") if isinstance(c.get("src"), str) else None
+        if not _verbatim_in(text, src, utterances, source_text):
             problems.append(f"拘束条件が発話の逐語引用でない: {text[:40]}")
             continue
+        _cited(text, src)
         forbid = bool(c.get("forbid"))
         patterns = []
         if forbid:
@@ -140,6 +217,53 @@ def validate_contract(raw, source_text: str) -> tuple[dict | None, list[str]]:
                         and len(p.strip()) >= _MIN_DENY_PATTERN_LEN):
                     patterns.append(p.strip())
         constraints.append({"text": text, "forbid": forbid, "patterns": patterns})
+
+    # branch: 作業対象の git ref（§8.10f）。発話からの逐語抽出のみ（原文に無いブランチ名を
+    # 生成しない）。文字集合は検査パラメータと同一（SSH コマンド文字列に乗るため）
+    branch, branch_src = _split_sourced(raw.get("branch"))
+    if raw.get("branch") is not None:
+        if not isinstance(branch, str) or not branch.strip():
+            problems.append("branch が文字列でない")
+            branch = None
+        else:
+            branch = branch.strip()
+            if not _SAFE_PARAM_RE.match(branch) or ".." in branch.split("/"):
+                problems.append(f"branch 名が不正（安全文字のみ・.. 不可）: {branch[:40]}")
+                branch = None
+            elif not _verbatim_in(branch, branch_src, utterances, source_text):
+                problems.append(f"branch が発話に現れない（原文に無いブランチ名の生成は禁止）: "
+                                f"{branch[:40]}")
+                branch = None
+            else:
+                _cited(branch, branch_src)
+
+    # target_paths: 依頼が名指す成果物・対象文書の相対パス列（§8.10f）。逐語抽出のみ・
+    # 上限 MAX_TARGET_PATHS（既定 file 検査の付与上限と同値）
+    target_paths: list[str] = []
+    raw_targets = raw.get("target_paths") or []
+    if not isinstance(raw_targets, list):
+        problems.append("target_paths が配列でない")
+        raw_targets = []
+    if len(raw_targets) > MAX_TARGET_PATHS:
+        problems.append(f"target_paths が {len(raw_targets)} 件（上限 {MAX_TARGET_PATHS}）")
+        raw_targets = []
+    for t in raw_targets:
+        path, src = _split_sourced(t)
+        if not isinstance(path, str) or not path.strip():
+            problems.append("target_paths の要素が文字列でない")
+            continue
+        path = path.strip()
+        if (not _SAFE_PARAM_RE.match(path) or ".." in path.split("/")
+                or path.startswith("/")):
+            problems.append(f"target_paths のパスが不正（相対・安全文字のみ）: {path[:60]}")
+            continue
+        if not _verbatim_in(path, src, utterances, source_text):
+            problems.append(f"target_paths が発話に現れない（原文に無いパスの生成は禁止）: "
+                            f"{path[:60]}")
+            continue
+        _cited(path, src)
+        if path not in target_paths:
+            target_paths.append(path)
 
     # 脳が runbook の kind（merge_ff 等）を完了条件欄に置く誤りを機械補正する（§8.10g。
     # カタログ名の完全一致のみで判定＝決定的・LLM 不使用。2026-08-28 E2E 実測: qwen が
@@ -200,17 +324,28 @@ def validate_contract(raw, source_text: str) -> tuple[dict | None, list[str]]:
     if rb_problems:
         problems.extend(rb_problems)
 
+    # 出所束縛 (2): 発話由来フィールドが 1 つでも在るのに、現在ターンを引用する
+    # フィールドが無い契約は過去話題への束縛（stale 束縛）として不成立（§8.10f。
+    # 2026-08-29 実障害: 現在の不具合報告に対し過去スレッドの計画へ束縛した契約が
+    # 提示された — 構造検証だけでは検出できなかった意味不正の機械検出）
+    if (current_id is not None and utterances is not None and not cites_current
+            and (directive or constraints or branch or target_paths)):
+        problems.append("現在ターンの発話を引用するフィールドがない（過去話題への束縛）")
+
     if problems:
         return None, problems
 
     # needs_repo: 脳の判定に機械補助を重ねる（§8.10f。directive の git コマンド・
-    # リポジトリ系検査・runbook 列があれば強制 true。脳が false と言っても機械判定が勝つ）
+    # リポジトリ系検査・runbook 列・branch 指定があれば強制 true。脳が false と
+    # 言っても機械判定が勝つ）
     needs_repo = bool(raw.get("needs_repo"))
     if directive and _GIT_CMD_RE.search(directive):
         needs_repo = True
     if any(a["kind"] in REPO_KINDS for a in acceptance):
         needs_repo = True
     if runbook:
+        needs_repo = True
+    if branch:
         needs_repo = True
 
     workspace = raw.get("workspace")
@@ -223,18 +358,24 @@ def validate_contract(raw, source_text: str) -> tuple[dict | None, list[str]]:
         "acceptance": acceptance,
         "runbook": runbook,
         "workspace": workspace,
+        "branch": branch,
+        "target_paths": target_paths,
         "needs_repo": needs_repo,
     }
     # rest_summary: runbook 外の残り作業の要約（§8.10f。計画組立の分解入力専用・
-    # worker / 完了検査へは渡さない）。null は「残り作業なし＝agent 分解を省略」の
-    # 明示。キー欠落・型不正は契約不成立にせずキーを載せない（縮退＝従来どおり
-    # 確定要約を分解する。§8.10g 分解の二重実行抑止）
-    if "rest_summary" in raw:
-        rest = raw["rest_summary"]
-        if rest is None:
-            result["rest_summary"] = None
-        elif isinstance(rest, str) and rest.strip():
-            result["rest_summary"] = rest.strip()
+    # worker / 完了検査へは渡さない）。null は「残り作業なし＝agent 分解を省略」の明示。
+    # **必須キー**（キー欠落・空文字列・型不正は契約不成立）。契約化が opus 既定と
+    # なり安定供給できるため、旧縮退印（欠落＝確定要約を分解）を廃止した — 会話脳の
+    # 言い換えが実行系へ入る最後の分解経路の遮断（2026-09-03 改訂・§8.10g）
+    if "rest_summary" not in raw:
+        return None, ["rest_summary キーが欠落（残り作業の要約。無ければ null を明示）"]
+    rest = raw["rest_summary"]
+    if rest is None:
+        result["rest_summary"] = None
+    elif isinstance(rest, str) and rest.strip():
+        result["rest_summary"] = rest.strip()
+    else:
+        return None, ["rest_summary が文字列でも null でもない（空文字列も不可）"]
     return result, []
 
 
@@ -281,9 +422,11 @@ def apply_default_acceptance(contract: dict, summary: str) -> dict:
 
     - push 既定: push 語を含み acceptance が空なら pushed 検査を付与（push を含まない
       依頼には付与しない — 編集のみのタスクに pushed を課すと誤未達になる）
-    - 成果物 file 既定: 編集系の語と成果物パス（相対・拡張子付き）を含む依頼には、
-      当該パスの file 検査を必ず載せる（既存 acceptance に同一パスの検査があれば重複
-      させない。#153 — 2026-08-25 実障害: 編集タスクが完了検査なしで「完了」と報告）
+    - 成果物 file 既定: 編集系の語を含み成果物パスが特定できる依頼には、当該パスの
+      file 検査を必ず載せる（既存 acceptance に同一パスの検査があれば重複させない。
+      #153 — 2026-08-25 実障害: 編集タスクが完了検査なしで「完了」と報告）。パスの
+      第一入力は契約の target_paths（発話からの逐語抽出・出所束縛つき・§8.10f）で、
+      確定要約からの散文パス検出は target_paths が空のときの補助へ降格
     """
     text = f"{summary}\n{contract.get('directive') or ''}"
     acceptance = contract.get("acceptance") or []
@@ -292,14 +435,20 @@ def apply_default_acceptance(contract: dict, summary: str) -> dict:
     if _EDIT_WORD_RE.search(text):
         covered = {(a.get("params") or {}).get("path") for a in acceptance}
         added = 0
-        for m in _DELIVERABLE_PATH_RE.finditer(text):
-            path = m.group(1)
+        target_paths = contract.get("target_paths") or []
+        candidates = (target_paths if target_paths
+                      else [m.group(1) for m in _DELIVERABLE_PATH_RE.finditer(text)])
+        for path in candidates:
             if path in covered:
                 continue
             # 防御的再検証（検出文字集合は受理形式に閉じているが、規則の独立変更に耐える）
             if not _SAFE_PARAM_RE.match(path) or ".." in path.split("/"):
                 continue
-            acceptance.append({"kind": "file", "params": {"path": path}})
+            # 既定は file_changed（変更の実測）で立てる。baseline の採取と、対象が不在の
+            # 場合の file（作成の実測）への確定は、着手確認の組立時に sa-ru が実測して行う
+            # （conversation._capture_file_baselines・§8.10f。実在のみの file を修正系依頼に
+            # 課すと無作業でも完了になる — 2026-08-30 E2E の是正）
+            acceptance.append({"kind": "file_changed", "params": {"path": path}})
             covered.add(path)
             added += 1
             if added >= _MAX_DEFAULT_FILE_CHECKS:

@@ -55,7 +55,9 @@ class Tier2Handler:
         """qu-e review_cli.py を SSH + subprocess で 1 ショット実行し、JSON を返す（§8.8）。
 
         review_cli の出力: {"decision": approve|deny|escalate, "reason": ..., "risk_score": ...}
-        通信・パース失敗時は安全側で escalate を返す。
+        通信・パース失敗時は安全側で escalate を返す。タイムアウトだけは 1 回再試行する
+        （§8.8 審査の可用性: 一過性の詰まりを人間承認へ波及させない。2026-08-30 実測では
+        3 連続タイムアウトで依頼本体の書き込みまで Tier 3 に格上げされた）。
         """
         context = json.dumps({"context": getattr(pending, "context", "")}, ensure_ascii=False)
         # SSH 非ログインシェルの PATH には素の python が無い（macOS 標準・実機 rc=127 で確認）。
@@ -65,13 +67,27 @@ class Tier2Handler:
             f"/opt/taka-ma-env/bin/python sentinel/review_cli.py --mode command "
             f"--input {shlex.quote(operation_str(pending))} --context {shlex.quote(context)}"
         )
-        try:
-            result = await asyncio.to_thread(
-                subprocess.run, ["ssh", self.ssh_host, remote],
-                capture_output=True, text=True, timeout=self.timeout_sec,
-            )
+        for attempt in (1, 2):
+            try:
+                result = await asyncio.to_thread(
+                    subprocess.run, ["ssh", self.ssh_host, remote],
+                    capture_output=True, text=True, timeout=self.timeout_sec,
+                )
+            except subprocess.TimeoutExpired:
+                if attempt == 1:
+                    continue  # 一過性の詰まり（cold ロード・他モデル競合）は 1 回だけやり直す
+                # 再失敗＝審査不能。Tier 3 の Risk 欄にこの reason がそのまま載るため、
+                # 「危険と判定された」と誤読させない文言で返す（§8.8 文言の是正）。
+                return {"decision": "escalate",
+                        "reason": (f"審査不能（qu-e 応答なし・{self.timeout_sec:.0f} 秒 × 2 回"
+                                   "タイムアウト）のため人間確認")}
+            except Exception as e:
+                return {"decision": "escalate", "reason": f"qu-e review error: {e}"}
             if result.returncode != 0:
                 return {"decision": "escalate", "reason": f"qu-e review SSH failed: {result.stderr.strip()}"}
-            return json.loads(result.stdout)
-        except Exception as e:
-            return {"decision": "escalate", "reason": f"qu-e review error: {e}"}
+            try:
+                return json.loads(result.stdout)
+            except ValueError as e:
+                return {"decision": "escalate", "reason": f"qu-e review error: {e}"}
+        # for が尽きることはない（attempt=2 は必ず return する）が、静的に返り値を保証する
+        return {"decision": "escalate", "reason": "qu-e review error: unreachable"}

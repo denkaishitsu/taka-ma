@@ -7,6 +7,9 @@ qu-e:
   inference_lock: "/opt/taka-ma/data/qu-e-inference.lock"
   review_timeout_sec: 60  # 審査 LLM（ollama HTTP）1 回の応答待ち上限（秒）。file_audit / Tier2 /
                           # コミット前ゲート共通。コード側に既定値なし（SSOT）
+  keep_alive_sec: -1      # 審査モデルの ollama 常駐時間（秒・数値必須。-1=無期限）。cold ロードが
+                          # 審査タイムアウト → Tier 3 濫発を生むため常駐させる（設計 §8.8 審査の可用性。
+                          # §7.1 の常駐予算に算入）。コード側に既定値なし（SSOT）
 
 health_check:
   interval_sec: 30
@@ -38,6 +41,10 @@ file_audit:
     - ".taka-hook-settings.json"   # PreToolUse フック設定（worker 起動ごとに sa-ru が生成・上書き）
   # .gitignore は判定実行時に mtime チェックで再読み込み（A1 §1、mtime のみキャッシュ）
   debounce_sec: 1                  # ノイズ抑制: 同パス連続変更を集約する時間（A1 §1）
+  alert_digest_window_sec: 60      # 同一 task_id の deny/escalate アラートをダイジェスト 1 通に
+                                   # 集約する窓（秒。§8.12。1 件ずつのボタン付き連投が本当に見る
+                                   # べき承認の注意を薄めた 2026-08-30 実測の是正）。コード側に
+                                   # 既定値なし（SSOT）
 
   # 監査ログ（A1 §4）
   log_dir: "/opt/taka-ma/logs/file-audit"           # 出力ディレクトリ

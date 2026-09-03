@@ -241,10 +241,18 @@ class ApprovalPipeline:
         # （G2 グラス等）では人間が何度承認しても実行に反映されない（2026-08-17 T09-B8 実機）。
         # 位置は always_deny の後・always_escalate の前 — 決定論の deny は引き継ぎでも覆せず、
         # escalate 対象でも人間決定済みなら再度聞かない。
-        carry_from = self._find_carryover(task_id, pending)
-        if carry_from:
+        carry_status, carry_from = self._find_carryover(task_id, pending)
+        if carry_status == "approved":
             decision = Decision(allow=True, handler="approval_carryover",
                                 reason=f"carryover: {carry_from}")
+            self._audit(decision, instance_id, command, tier=3, start=start)
+            return decision
+        if carry_status == "rejected":
+            # 却下の引き継ぎ（§8.10 却下の粒度）: 人間が却下した同一操作は再依頼せず deny。
+            # タスクは中止せず、worker は代替 or 当該操作なしの遂行へ進む（deny の帰結規律）
+            decision = Decision(allow=False, handler="rejection_carryover",
+                                reason=f"人間が却下した操作のため拒否（再依頼しません）: "
+                                       f"{carry_from}")
             self._audit(decision, instance_id, command, tier=3, start=start)
             return decision
 
@@ -382,35 +390,39 @@ class ApprovalPipeline:
             "duration_ms": duration_ms,
         })
 
-    def _find_carryover(self, task_id: str, pending: 'PendingApproval') -> str | None:
-        """同一タスク内で承認済みの同一操作を approvals/done/ から探す（§8.10 承認の引き継ぎ）。
+    def _find_carryover(self, task_id: str,
+                        pending: 'PendingApproval') -> tuple[str | None, str | None]:
+        """同一タスク内で決着済みの同一操作を approvals/done/ から探す（§8.10 承認の引き継ぎ）。
 
         照合は task_id・tool_name・tool_input の**完全一致のみ**。正規化・類似一致はしない
-        （内容が変わった操作は別の操作。緩い一致は人間が承認した意図を越えて許可が広がる）。
-        スコープを同一 task_id に限るのは、別タスク・別会話への承認の越境を防ぐため。
+        （内容が変わった操作は別の操作。緩い一致は人間の決定の意図を越えて効果が広がる）。
+        スコープを同一 task_id に限るのは、別タスク・別会話への決定の越境を防ぐため。
         interactive の判定不能プロンプト（tool_name 空）は対象外 — 操作の同一性を主張できない。
-        戻り値は一致した元レコードの request_id（監査ログで人間決定へ遡るために使う）。
+        戻り値は (status, request_id): approved は再承認なしで allow、rejected は再依頼なしで
+        deny（§8.10 却下の粒度 — 同じ操作を二度聞かない、はどちらの決定にも対称に働く）。
+        一致が無ければ (None, None)。
         """
         if not task_id or not pending.tool_name:
-            return None
+            return None, None
         done_dir = os.path.join(self.handlers[3].approval_dir, "done")
         try:
             paths = glob.glob(os.path.join(done_dir, "*.json"))
         except OSError:
-            return None
+            return None, None
         for path in paths:
             try:
                 with open(path) as f:
                     record = json.load(f)
             except (OSError, ValueError):
-                continue  # 壊れたレコードは引き継ぎの根拠にしない（読める approved のみ）
+                continue  # 壊れたレコードは引き継ぎの根拠にしない
             if (isinstance(record, dict)
-                    and record.get("status") == "approved"
+                    and record.get("status") in ("approved", "rejected")
                     and record.get("task_id") == task_id
                     and record.get("tool_name") == pending.tool_name
                     and record.get("tool_input") == pending.tool_input):
-                return record.get("request_id") or os.path.basename(path)[:-len(".json")]
-        return None
+                rid = record.get("request_id") or os.path.basename(path)[:-len(".json")]
+                return record.get("status"), rid
+        return None, None
 
     @staticmethod
     def _match_rule(command: str, rules: list[str]) -> str | None:
