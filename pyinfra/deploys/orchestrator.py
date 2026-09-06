@@ -70,14 +70,15 @@ server.shell(commands=[
 ])
 
 # Step 7: Slack 通知 — 依存パッケージ
+# py-spy はハング診断用（設計書 §8.5「ハング診断の常設」・ADR 0002）。実行時依存ではない
 pip.packages(
-    packages=["slack-sdk", "python-dotenv", "pexpect", "pyyaml", "watchdog"],
+    packages=["slack-sdk", "python-dotenv", "pexpect", "pyyaml", "watchdog", "py-spy"],
     virtualenv="/opt/taka-ma-env",
 )
 record("sa-ru", "pip.packages (sa-ru)",
-       "slack-sdk,python-dotenv,pexpect,pyyaml,watchdog",
+       "slack-sdk,python-dotenv,pexpect,pyyaml,watchdog,py-spy",
        {"op": "pip.uninstall",
-        "packages": ["slack-sdk", "python-dotenv", "pexpect", "pyyaml", "watchdog"],
+        "packages": ["slack-sdk", "python-dotenv", "pexpect", "pyyaml", "watchdog", "py-spy"],
         "virtualenv": "/opt/taka-ma-env"})
 
 # Step 9: 設定ファイルの配置（ホスト共通の静的 YAML。変数置換不要のため files.put で配置）

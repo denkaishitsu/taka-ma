@@ -289,7 +289,7 @@ class _FakeContractor:
         self.history_texts.append(history_text)
         validated, _ = validate(self.parsed)
         return validated, {"origin": "opus", "backend": "worker_cli",
-                           "degraded": False, "attempts": []}
+                           "unreachable": False, "attempts": []}
 
 
 def test_build_contract_marker_overrides_brain_branch():

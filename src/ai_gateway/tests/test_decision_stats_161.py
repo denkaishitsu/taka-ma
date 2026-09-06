@@ -1,7 +1,7 @@
 """Task #161: 判定ログ集計（ローカル脳の換装判断基準・§8.4.1）のテスト。
 
 - YaTaLogger.log_decompose_call: 1 呼び出し = 1 行の成否記録（フォールバック率の分母）
-- decision_stats.collect_stats: 分解フォールバック率・契約化ローカル縮退率の算出
+- decision_stats.collect_stats: 分解フォールバック率・契約化の不達停止率の算出（旧キー degraded も同義）
   （LLM 不使用・JSONL パースのみ）と発動基準の exit code
 """
 
@@ -40,8 +40,10 @@ def test_collect_stats_computes_both_rates(tmp_path):
         {"kind": "decompose_call", "fallback": False},
         {"kind": "decompose_call", "fallback": True},
         {"kind": "decompose_call", "fallback": True},
-        {"kind": "contract", "degraded": False},
-        {"kind": "contract", "degraded": True},
+        {"kind": "contract", "unreachable": False},
+        {"kind": "contract", "unreachable": True},
+        {"kind": "contract", "degraded": True},   # 2026-09-05 以前の記録（同義キー）
+        {"kind": "contract", "unreachable": False},
         # kind 無し（サブタスク単位の log_decision 行）は率の分母に入らない
         {"task": "x", "execution": "agent"},
     ])
@@ -51,15 +53,16 @@ def test_collect_stats_computes_both_rates(tmp_path):
     assert stats["decompose_total"] == 4
     assert stats["decompose_fallback"] == 2
     assert stats["decompose_fallback_rate"] == 0.5
-    assert stats["contract_total"] == 2
-    assert stats["contract_degraded_rate"] == 0.5
+    assert stats["contract_total"] == 4
+    assert stats["contract_unreachable"] == 2
+    assert stats["contract_unreachable_rate"] == 0.5
 
 
 def test_collect_stats_empty_is_none_not_zero(tmp_path):
     """記録なしは N/A（None）— 0% と混同して「健全」と誤読させない。"""
     stats = decision_stats.collect_stats(str(tmp_path), days=7)
     assert stats["decompose_fallback_rate"] is None
-    assert stats["contract_degraded_rate"] is None
+    assert stats["contract_unreachable_rate"] is None
 
 
 def test_collect_stats_skips_broken_lines(tmp_path):

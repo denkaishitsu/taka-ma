@@ -13,8 +13,10 @@ ready 毎 1 回と最低頻度で誤りのコストが最大のため、確実�
   検証関数を受け取って合否を聞くだけで、検証規則を持たない（権威はフィールド）
 - worker CLI の実行手段（SSH）は sa-ru が cli_runner として注入する
   （ya-ta モジュールに SSH・CLI 依存を持ち込まない — ライブラリ方式の維持）
-- 縮退: CLI の呼び出し自体の失敗（SSH 不達・CLI エラー・認証失効。検証不合格は
-  含まない）時のみローカル ya-ta.model で契約化する。検証は同一
+- 不達は fail-closed（ADR 0002）: CLI の呼び出し自体の失敗（SSH 不達・CLI エラー・
+  認証失効）ではローカル ya-ta.model へ縮退せず、不成立（来歴 unreachable=true）を返す。
+  2026-09-04 に縮退契約が誤ったリポジトリ名・完了条件なしの計画を生んだ是正。
+  ローカル契約化は backend=local / escalate_runner 未注入（単体テスト・段階導入）のみ
 """
 
 import json
@@ -51,8 +53,8 @@ def _is_unmapped(problems: list[str]) -> bool:
 class Contractor:
     """会話履歴（二窓ビュー）と確定要約から実行契約 JSON を抽出する（設計書 §8.4）。
 
-    既定は worker CLI（contractor.model・既定 opus）で ATTEMPTS 回試行し、呼び出し
-    自体の失敗が続いたときのみローカル ya-ta.model へ縮退する。どのバックエンドの
+    既定は worker CLI（contractor.model・既定 opus）で ATTEMPTS 回試行する。呼び出し
+    自体の失敗が続いても縮退せず不成立（unreachable）を返す（ADR 0002）。どのバックエンドの
     出力も受理判断は呼び出し元が注入する検証関数（sa-ru の validate_contract）が行う。
     不合格 2 回で (None, 来歴) を返し、呼び出し側が fail-closed で人へ差し戻す。
     """
@@ -63,12 +65,12 @@ class Contractor:
         Args:
             config: sa-ru / ya-ta マージ済み設定。契約化のバックエンドは
                 ya-ta.yaml の contractor.backend / contractor.model（§8.4）。
-                縮退（ローカル実行）は ya-ta.yaml の既存キー（model /
-                llm_timeout_sec / llm_think）を共用する。
+                ローカル実行（backend=local / runner 未注入）は ya-ta.yaml の
+                既存キー（model / llm_timeout_sec / llm_think）を共用する。
             escalate_runner: worker CLI 実行手段（(model_name, prompt) -> 出力
                 テキスト。失敗は例外）。sa-ru が注入する。None なら CLI を呼べない
                 ため、backend 設定にかかわらずローカルのみで動く（単体テスト・
-                段階導入用の縮退）。
+                段階導入用）。
         """
         ya = config["ya-ta"]
         contractor_conf = ya.get("contractor") or {}
@@ -76,7 +78,7 @@ class Contractor:
         # モデル名の直書きをせず、実体は models.<key> の command / model_flag が持つ
         self.backend = contractor_conf.get("backend", "worker_cli")
         self.cli_model = contractor_conf.get("model", "opus")
-        self.model = ya["model"]  # 縮退（ローカル契約化）用
+        self.model = ya["model"]  # ローカル契約化（backend=local / runner 未注入）用
         # 接続先はマージ済み config の sa-ru.ollama_host を唯一の源にする（設計書 §8.4）
         self.ollama_host = config["sa-ru"]["ollama_host"]
         self.llm_timeout = ya["llm_timeout_sec"]
@@ -97,10 +99,11 @@ class Contractor:
             validate: 受理判断（parsed dict -> (検証済み契約 | None, 逸脱理由リスト)）。
                 sa-ru の validate_contract を束ねたもの（出所束縛込み・§8.10f）。
             progress: ハートビート進捗通知（§10.8）へ生成トークン数を届ける共有ホルダー
-                （ローカル縮退時の ollama 呼び出しのみ。CLI の SSH 単発は対象外）。
+                （ローカル契約化の ollama 呼び出しのみ。CLI の SSH 単発は対象外）。
 
         来歴 dict: {"origin": モデル名 | "local" | None, "backend": "worker_cli" | "local",
-                    "degraded": bool, "attempts": [{"model", "problems"}...],
+                    "unreachable": bool（CLI の呼び出し自体の失敗が続き不成立・ADR 0002）,
+                    "attempts": [{"model", "problems"}...],
                     "unmapped": [逐語引用, ...]（スキーマ閉包検出時のみ）}
         origin=None は不成立（呼び出し側が fail-closed で人へ差し戻す）。
         """
@@ -131,12 +134,13 @@ class Contractor:
                 # 検証不合格を含む失敗 = モデルは応答している。最上位で不合格の契約を
                 # ローカルへ落とす意味はない（fail-closed・§8.4）
                 return None, self._provenance(None, "worker_cli", attempts)
-            # 呼び出し自体の失敗のみ → ローカル縮退（§8.4「契約化の呼び出し」縮退）
-            logger.warning("契約化 CLI が %d 回とも呼び出し失敗 → ローカル縮退（%s）",
-                           exec_failures, self.model)
+            # 呼び出し自体の失敗のみ → fail-closed（ローカルへ縮退しない・ADR 0002）。
+            # 呼び出し側は到達不能の固定文で止まる（§8.4「不達は fail-closed」）
+            logger.warning("契約化 CLI が %d 回とも呼び出し失敗 → 不成立（到達不能・縮退しない）",
+                           exec_failures)
+            return None, self._provenance(None, "worker_cli", attempts, unreachable=True)
 
-        # ローカル契約化（縮退・または backend=local / CLI 実行手段なし）
-        degraded = use_cli
+        # ローカル契約化（backend=local / CLI 実行手段なし）
         for _ in range(ATTEMPTS):
             validated, status = self._attempt(
                 self.model, attempts,
@@ -145,21 +149,20 @@ class Contractor:
                                    progress=progress),
                 validate)
             if validated is not None:
-                return validated, self._provenance("local", "local", attempts,
-                                                   degraded=degraded)
+                return validated, self._provenance("local", "local", attempts)
             if status == "unmapped":
                 return None, self._provenance(
-                    None, "local", attempts, degraded=degraded,
+                    None, "local", attempts,
                     unmapped=self._unmapped_items(attempts))
 
         # 不成立 — fail-closed の最終防衛は呼び出し側（着手確認を出さず人へ・§8.10f）。
         # ここへ来るのはローカル試行の後なので、最終試行のバックエンドは常に local
-        return None, self._provenance(None, "local", attempts, degraded=degraded)
+        return None, self._provenance(None, "local", attempts)
 
     def _attempt(self, model_name: str, attempts: list[dict], run, validate):
         """1 回の契約化試行。(検証済み契約 | None, 状態) を返す（attempts へ記録）。
 
-        状態: "ok" / "exec_error"（呼び出し自体の失敗 = 縮退判定の材料）/
+        状態: "ok" / "exec_error"（呼び出し自体の失敗 = 不達判定の材料）/
               "invalid"（検証不合格）/ "unmapped"（スキーマ閉包検出・リトライしない）。
         """
         try:
@@ -196,16 +199,16 @@ class Contractor:
         return []
 
     def _provenance(self, origin, backend: str, attempts: list[dict],
-                    degraded: bool = False, unmapped: list[str] | None = None) -> dict:
+                    unreachable: bool = False, unmapped: list[str] | None = None) -> dict:
         """来歴を組み立て、試行列を判定ログ（§8.4.1）へ記録する（換装判断の実データ）。"""
-        provenance = {"origin": origin, "backend": backend, "degraded": degraded,
+        provenance = {"origin": origin, "backend": backend, "unreachable": unreachable,
                       "attempts": attempts}
         if unmapped:
             provenance["unmapped"] = unmapped
         # ログ書き込み失敗は契約化本体を壊さない（decompose の判定ログと同じ耐障害方針）
         try:
             self.logger.log_contract(origin, attempts, backend=backend,
-                                     degraded=degraded)
+                                     unreachable=unreachable)
         except Exception:
             pass
         return provenance

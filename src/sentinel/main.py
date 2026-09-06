@@ -105,23 +105,36 @@ class TaskContextHandler(FileSystemEventHandler):
             logger.exception("task_context 読み込み失敗: %s", path)
 
 
+def log_health_transition(prev_overall, result: dict):
+    """ヘルス状態を**遷移時のみ** 1 行記録し、新しい状態を返す（ADR 0002 ログ規律）。
+
+    以前は 30 秒ごとに「healthy」を書き 1 日 2,880 行の平常報告でログを埋めていた
+    （2026-09-04 実測）。初回（prev=None）と状態が変わったときだけ書く。非 healthy への
+    遷移は内訳（result）を添える。
+    """
+    overall = result["overall"]
+    if overall != prev_overall:
+        if overall != "healthy":
+            logger.warning("ヘルスチェック: %s（前回 %s）— %s", overall, prev_overall or "初回", result)
+        else:
+            logger.info("ヘルスチェック: healthy（前回 %s）", prev_overall or "初回")
+    return overall
+
+
 async def health_check_loop(checker: HealthChecker, interval: int):
-    """interval 秒間隔でヘルスチェックを実行し、warning/critical 時にログ警告。
+    """interval 秒間隔でヘルスチェックを実行し、状態の遷移時のみログへ記録する。
 
     1 回の反復の例外（設定キー欠落・psutil の一時失敗等）でループを止めない
     （§4.2「常駐ループの堅牢化」）。ループが例外で消滅するとプロセス生存のまま
     監視だけが止まり false healthy になるため、記録して次周期へ継続する。
     """
+    prev_overall = None
     while True:
         try:
             # check_all() は psutil.cpu_percent(interval=1) と subprocess.run(ping) の同期ブロックを含むため
             # asyncio.to_thread で別スレッド実行し、event loop を塞がない。
             result = await asyncio.to_thread(checker.check_all)
-            overall = result["overall"]
-            if overall != "healthy":
-                logger.warning("ヘルスチェック: %s — %s", overall, result)
-            else:
-                logger.info("ヘルスチェック: healthy")
+            prev_overall = log_health_transition(prev_overall, result)
         except asyncio.CancelledError:
             # シャットダウン時の cancel はループ終了の正規経路。握り潰さず伝播する
             raise

@@ -41,6 +41,7 @@ from orchestrator.pty_wrapper import WorkerPtyWrapper
 from orchestrator.headless_runner import (
     StreamReadError, WorkerHeadlessRunner, build_hook_settings)
 from orchestrator.preflight import AuthPreflight, PreflightFailure
+from orchestrator.liveness import Heartbeat, RestartLimiter, start_watchdog_thread
 from orchestrator import contract as contract_rules
 from orchestrator import intent_store
 from orchestrator import runbook as runbook_rules
@@ -414,7 +415,8 @@ class Orchestrator:
                                                  classifier=self.classifier,
                                                  plan_service=self.plan_service,
                                                  process_mgr=self.process_mgr,
-                                                 canceller=self.request_cancel)
+                                                 canceller=self.request_cancel,
+                                                 preflight=self.preflight)
 
         # 会話⇄実行の受け渡し契約（§8.10f）。`contract:` ブロック未構成なら従来動作（段階導入）。
         # intents_dir = 依頼の寿命（goal_status）台帳／ task_deny_dir = 禁止型拘束のタスク別
@@ -468,6 +470,12 @@ class Orchestrator:
             if rm_conf["blender_detection"]
             else None
         )
+        # 死活監視（§8.16.1・ADR 0002）: 心拍 2 探針（イベントループ閉塞・スレッドプール枯渇）と
+        # daemon スレッドの自己終了復帰。運用値は sa-ru.yaml の liveness ブロックが唯一の源
+        lv_conf = config["liveness"]
+        self.liveness = Heartbeat(lv_conf)
+        self.restart_limiter = RestartLimiter(
+            lv_conf["restart_count_path"], lv_conf["restart_limit_per_hour"])
 
     async def run(self):
         """dispatcher + 2ワーカーを並行起動。watchdog Observer は別スレッドで起動（§8.12）。"""
@@ -511,6 +519,12 @@ class Orchestrator:
         # 常駐コルーチン群。各ループは _supervise で包み、1 つの未捕捉例外が gather 経由で全体を
         # 落とさないようにする（異常終了したループだけ再起動＝自己修復）。
         # resource_monitor は blender_detection 有効時のみ加える（§7.1）。
+        # 死活監視の daemon スレッド（§8.16.1）。イベントループ・スレッドプールに依存しないため、
+        # 両方が死んでも心拍の途絶を検出して自己終了できる。通知は既定チャンネルへ
+        start_watchdog_thread(
+            self.liveness, self.restart_limiter,
+            notify=lambda text: self.slack.notify(text),
+            reachability=self._reachability_summary)
         coros = [
             self._supervise(self._dispatcher, "dispatcher"),
             self._supervise(self._worker_inline, "worker_inline"),
@@ -519,6 +533,7 @@ class Orchestrator:
             self._supervise(self._exec_confirmation_loop, "exec_confirmation_loop"),  # 着手確認
             self._supervise(self._control_loop, "control_loop"),             # 制御命令
             self._supervise(self._approval_hold_loop, "approval_hold_loop"), # 承認保留の決着（§8.10）
+            self._supervise(self.liveness.beat_loop, "liveness"),            # 心拍（§8.16.1）
         ]
         if self.resource_monitor is not None:
             coros.append(self._supervise(self.resource_monitor.watch, "resource_monitor"))  # §7.1
@@ -529,6 +544,15 @@ class Orchestrator:
             self.file_audit_observer.join()
             self.resource_observer.stop()
             self.resource_observer.join()
+
+    def _reachability_summary(self) -> str:
+        """死活監視の通知に併記する MBP 到達性（プリフライトの直近実測。§8.16.1）。"""
+        reachable = getattr(self.preflight, "ssh_reachable", None)
+        last_ok = getattr(self.preflight, "last_ssh_ok", None)
+        label = (time.strftime("%m/%d %H:%M", time.localtime(last_ok)) if last_ok
+                 else "起動後の疎通なし")
+        state = {True: "到達可", False: "到達不能", None: "未実測"}[reachable]
+        return f"{state}（最終疎通 {label}）"
 
     async def _supervise(self, make_coro, name: str):
         """常駐ループを監督し、未捕捉例外で死んでも他ループを巻き添えにせず再起動する（自己修復）。

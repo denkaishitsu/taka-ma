@@ -170,7 +170,7 @@ ssh mbp "tail -50 /opt/taka-ma/logs/qu-e.log | grep ヘルスチェック"
 
 | 観点 | 成功 | エラー |
 |------|------|--------|
-| 定期実行ログ | `interval_sec` ごとに `ヘルスチェック` 実行ログが記録される（`main.py` の `health_check_loop()` が出力するログ文言は日本語「ヘルスチェック」であり英語 `health_check` は出力されない） | ログなし |
+| 記録ログ | 起動直後の初回と**状態が遷移したとき**だけ `ヘルスチェック: <状態>（前回 <状態>）` が記録される（`main.py` の `log_health_transition()`。ADR 0002 ログ規律。平常時に毎周期の `healthy` 行は増えない。文言は日本語「ヘルスチェック」であり英語 `health_check` は出力されない） | 初回の記録が無い、毎周期 `healthy` が連投される |
 | 各項目 | CPU / Memory / Disk / Network の 4 項目とも数値あり、`healthy` / `warning` / `critical` のいずれかが判定される | 項目欠落、判定なし |
 
 ## 検証項目

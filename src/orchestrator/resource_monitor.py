@@ -32,6 +32,9 @@ class ResourceMonitor:
         # SSH 先ホスト・タイムアウトも process_mgr が保持する値を共有する（host/timeout の供給元を
         # 1 つに保つ）。process_mgr はキーワード必須＝未注入は構築時に落とし、実行時 AttributeError を防ぐ。
         self.process_mgr = process_mgr
+        # 検知の失敗（SSH 不達等）が続いている状態。ログは状態遷移時のみ（ADR 0002 ログ規律。
+        # 2026-09-04 は同一 traceback を 756 回連投して肝心の沈黙を埋もれさせた）
+        self._failing: bool = False
 
     def detect_blender(self) -> bool:
         """MBP上のBlenderプロセスを検知"""
@@ -65,15 +68,25 @@ class ResourceMonitor:
         """
         logger.info("リソースモニター開始 (間隔: %ds)", self.check_interval)
         while True:
-            try:
-                blender_detected = await asyncio.to_thread(self.detect_blender)
-                if blender_detected and not self.blender_running:
-                    logger.info("Blender検知 — LLM一時停止")
-                    await asyncio.to_thread(self._stop_llms)
-                    self.blender_running = True
-                elif not blender_detected and self.blender_running:
-                    logger.info("Blender終了 — LLM再開")
-                    self.blender_running = False
-            except Exception:
-                logger.exception("ResourceMonitor watch の1巡が失敗。継続します")
+            await self._tick()
             await asyncio.sleep(self.check_interval)
+
+    async def _tick(self) -> None:
+        """監視 1 巡。失敗は状態遷移時のみ記録する（失敗の開始と回復の各 1 行・連投しない）。"""
+        try:
+            blender_detected = await asyncio.to_thread(self.detect_blender)
+            if blender_detected and not self.blender_running:
+                logger.info("Blender検知 — LLM一時停止")
+                await asyncio.to_thread(self._stop_llms)
+                self.blender_running = True
+            elif not blender_detected and self.blender_running:
+                logger.info("Blender終了 — LLM再開")
+                self.blender_running = False
+            if self._failing:
+                logger.info("ResourceMonitor: Blender 検知が回復（MBP への SSH が応答）")
+                self._failing = False
+        except Exception as e:
+            if not self._failing:
+                logger.warning("ResourceMonitor: Blender 検知が失敗（以降、回復まで同一状態は記録しない）: %s",
+                               str(e)[:200])
+                self._failing = True

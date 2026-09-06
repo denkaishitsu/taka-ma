@@ -29,6 +29,23 @@
 - スリープは無効化済み（[01](../procedures/01-common-base.md) `sudo pmset -a sleep 0` / `disablesleep 1`）。停止操作をしない限り、放置でサービスが落ちることはない。
 - MBP の ollama サービスさえ起動していれば、worker は sa-ru が SSH で都度起動するため、MBP 側に worker の手動起動は不要。
 
+## ハング時の手順（沈黙したまま再起動しない）
+
+sa-ru が「プロセスは生きているがログが止まっている」状態（2026-09-04 18:46 の実例）では、**再起動の前にスタックを採取する**。採取せずに再起動すると原因が失われる（[ADR 0002](../../docs/adr/0002-outage-2026-09-04-remediation.md)）。
+
+```bash
+# 1. 沈黙の確認（最終ログ時刻と PID 生存）
+ssh mac-mini "tail -1 /opt/taka-ma/logs/sa-ru.log | cut -c1-19; launchctl list | grep sa-ru"
+# 2. 全スレッドの Python スタックを sa-ru-error.log へ吐かせる（faulthandler・SIGUSR1）
+ssh mac-mini "pkill -USR1 -f 'python -m orchestrator'; sleep 1; tail -80 /opt/taka-ma/logs/sa-ru-error.log"
+# 3. 併せて py-spy でも採取（ネイティブ待ちの内訳まで見える）。
+#    macOS では py-spy の attach に root が必須（実測: "This program requires root on OSX"）。
+#    sudo のパスワード入力に tty が要るため ssh -t で入る
+ssh -t mac-mini "sudo /opt/taka-ma-env/bin/py-spy dump --pid \$(launchctl list | awk '/com.taka-ma.sa-ru/{print \$1}')"
+# 4. 採取後に再起動（KeepAlive が即座に再起動する）
+ssh mac-mini "launchctl kickstart -k gui/\$(id -u)/com.taka-ma.sa-ru"
+```
+
 ## 停止手順
 
 新規タスク受付を止めてから停止する。停止順序は **Mac mini（司令塔）→ MacBook Pro（実行機）**。司令塔を先に止めることで、停止作業中に新しいタスクが MBP worker を起動するのを防ぐ。

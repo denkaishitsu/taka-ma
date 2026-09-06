@@ -59,13 +59,15 @@ class RemoteProcessManager:
             del self.instances[instance_id]
         subprocess.run(
             ["ssh", self.ssh_host, f"tmux kill-session -t {instance_id}"],
-            capture_output=True,
+            capture_output=True, timeout=self.ssh_timeout,
         )
         logger.info("Claude Code 停止: %s", instance_id)
 
     def start_ollama_model(self, model: str):
         """MBP 上で指定 ollama モデルを起動する（明示プリロード用）。"""
-        subprocess.run(["ssh", self.ssh_host, f"ollama run {model}"])
+        # モデルロードは重い操作のため run_ssh_command と同じ既定 120 秒を上限にする
+        # （timeout 無しの ssh は禁止・設計書 §8.5「SSH 呼び出しの上限」）
+        subprocess.run(["ssh", self.ssh_host, f"ollama run {model}"], timeout=120)
 
     def stop_ollama(self) -> dict:
         """MBP で稼働中の ollama モデルを列挙し、各々を停止する（§7.1 GPU/メモリ解放）。

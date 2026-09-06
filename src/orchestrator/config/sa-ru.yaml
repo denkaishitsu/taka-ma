@@ -17,6 +17,18 @@ sa-ru:
 heartbeat:
   interval_sec: 30  # 進捗通知（経過秒＋生成トークン数）を同スレッドへ返す間隔。コード側に既定値なし（SSOT）
 
+# sa-ru の死活監視（§8.16.1・ADR 0002）— orchestrator.liveness が参照。
+# 上の heartbeat（§10.8 進捗通知）とは別物。プロセスが生きたまま止まる沈黙（2026-09-04 18:46）を
+# 心拍の途絶で検出し、自己終了→launchd KeepAlive で復帰する
+liveness:
+  probe_interval_sec: 30        # 心拍の周期（時刻の上書き＋スレッドプール探針）
+  probe_timeout_sec: 10         # to_thread へ投げた空関数の応答上限。超過はスレッドプール枯渇として健全な心拍を止める
+  stale_threshold_sec: 300      # 健全な心拍の途絶をこの秒数超過で沈黙と判定 → CRITICAL 後に自己終了
+  check_interval_sec: 60        # daemon スレッドの確認周期。検出遅延は最悪 stale_threshold_sec + check_interval_sec
+  heartbeat_path: "/opt/taka-ma/data/sa-ru.heartbeat"          # 最新 1 行のみ（増えない）。人と外部監視が読む
+  restart_count_path: "/opt/taka-ma/data/sa-ru.restart-count"  # 自己終了時刻の永続化（直近 1 時間の上限判定）
+  restart_limit_per_hour: 3     # 直近 1 時間の自己終了がこの回数に達したら終了せず CRITICAL＋通知のみ（往復の抑止）
+
 # 会話フロントエンド — ConversationManager / _conversation_loop が参照
 conversation:
   dir: "/opt/taka-ma/data/conversations"  # u-zu が発話を書き込む会話キュー（sa-ru が走査）

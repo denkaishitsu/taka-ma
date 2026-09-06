@@ -107,7 +107,8 @@ class AuthPreflight:
         clock:    現在時刻の供給源（テストで TTL を進めるための注入点）。
     """
 
-    def __init__(self, ssh_host: str, conf: dict, clock=time.monotonic):
+    def __init__(self, ssh_host: str, conf: dict, clock=time.monotonic,
+                 wall_clock=time.time):
         self.ssh_host = ssh_host
         self.ssh_timeout = conf["ssh_timeout_sec"]
         self.git_timeout = conf["git_timeout_sec"]
@@ -120,6 +121,11 @@ class AuthPreflight:
         # キャッシュ未命中の競合で同じプローブ（Anthropic は実推論コスト）と同じ Slack 通知が
         # 多重に走るのを防ぐ（2 本目はロック解放後にキャッシュ命中で即返る）
         self._lock = threading.Lock()
+        # 到達状態（§8.3 到達性の機械付与・ADR 0002）。ssh 検査の直近の実測結果と、
+        # 合格した最新の壁時計時刻（表示用。TTL の clock は monotonic のため別に持つ）
+        self._wall = wall_clock
+        self.ssh_reachable: bool | None = None
+        self.last_ssh_ok: float | None = None
 
     def check(self, workspace: str | None, cli_command: str = "claude") -> None:
         """全検査を実行し、不合格なら PreflightFailure を送出する（合格・対象外は無音）。
@@ -132,6 +138,17 @@ class AuthPreflight:
                 self._checked(f"git:{workspace}", lambda: self._check_git(workspace))
             self._checked(f"anthropic:{cli_command}",
                           lambda: self._check_anthropic(cli_command))
+
+    def check_ssh(self) -> None:
+        """ssh 検査だけを行う（契約化前の到達性ゲート・会話ターン冒頭の到達性実測）。
+
+        git / Anthropic プローブは走らせない（Anthropic は実推論 1 回ぶんのコストを払う）。
+        キャッシュは check() と同じキー "ssh" を共用する — worker 起動前検査で合格していれば
+        ここでも再検査せず、不達の fail_ttl 内は同じ不合格を即時に返す（設計書 §8.4「到達性
+        ゲート」・ADR 0002）。
+        """
+        with self._lock:
+            self._checked("ssh", self._check_ssh)
 
     # ── キャッシュ層 ──
 
@@ -171,7 +188,17 @@ class AuthPreflight:
         return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
 
     def _check_ssh(self) -> None:
-        """sa-ru → worker ホストの SSH 到達性・認証（exit code のみで判定）。"""
+        """sa-ru → worker ホストの SSH 到達性・認証（exit code のみで判定）。到達状態も更新する。"""
+        try:
+            self._probe_ssh()
+        except PreflightFailure:
+            self.ssh_reachable = False
+            raise
+        self.ssh_reachable = True
+        self.last_ssh_ok = self._wall()
+
+    def _probe_ssh(self) -> None:
+        """ssh <host> true の 1 往復（キャッシュ・状態更新を持たない素の検査）。"""
         try:
             r = self._run("true", self.ssh_timeout)
         except subprocess.TimeoutExpired as e:

@@ -713,6 +713,8 @@ sa-ruがBlenderプロセスを検知し、自動でモード切替:
 
 > **設計方針**: 共倒れを防ぐため排他制御を採用。将来的にはマシン追加でレンダリングと開発を物理分離する
 
+> **検知失敗の記録（ADR 0002 ログ規律）**: Blender 検知の SSH が失敗し続けるあいだ（MBP 到達不能）、`ResourceMonitor` は失敗の開始と回復の各 1 行だけを記録し、同一状態の連投（2026-09-04: 756 回×20 行超の traceback）はしない。SSH の上限は §8.5「SSH 呼び出しの上限」が掛ける
+
 > **停止の実装（SSOT）**: LLM停止は「`ollama ps` で稼働モデルを列挙 → 各モデルを `ollama stop <model>` で停止」で行う。引数なしの `ollama stop` は MODEL 必須で何も止めない no-op になるため、必ず稼働モデル名を `ollama ps` から取得して個別に停止する。この停止ロジックは `RemoteProcessManager.stop_ollama()` を唯一の実体とし、Blender 検知による自動停止（`ResourceMonitor`）はこれへ委譲する。将来の手動停止・アイドルスリープも同一実体を共有し、停止挙動の二重実装を避ける。再起動は不要で、停止後に次の推論リクエストが来れば ollama が自動でモデルをロードする。
 
 ### 7.1.1 将来拡張: マシン追加によるスケールアウト
@@ -950,6 +952,8 @@ sa-ru は脳モデル（`sa-ru.model`）で各発話を処理し、`ready=false`
 
 > **契約逸脱（`ready` キー欠落・型不正）の明示処理**: JSON としてはパースできても、契約キー `ready` 自体が欠落した応答や、boolean 以外の値（`"true"` 等の文字列・数値・null）を持つ応答が返ることがある（qwen3.6:35b-a3b・think=false の実測 2026-08-16）。この逸脱は暗黙のフォールバック（欠落 → None → falsy）に任せず、明示コード（`_coerce_ready`）で処理する: いずれの逸脱も**安全側の会話継続（`ready=false`）へ縮退**し（解釈できない応答で実行確認へ進めない。文字列 `"false"` を truthy と誤解釈して実行へ進む事故も同時に塞ぐ）、warning ログへ記録して**発生率を観測可能にする**（プロンプト側の契約記述強化の効果測定に使う）。逸脱応答でも `reply` は通常どおり会話返信へ回し、会話は止めない。ready 判定の基準そのものはプロンプト（converse.md）の責務であり、この処理は値の型・存在の検証のみを行う。
 
+> **到達性の機械付与（ADR 0002）**: 各ターンの冒頭で sa-ru が実行機（MBP）への到達性を `AuthPreflight.check_ssh()`（§8.4 到達性ゲートと同じ TTL キャッシュ）で実測する。不達のあいだは、会話返信と契約不成立の返信の**先頭に固定行「⛔ MBP 到達不能（最終疎通 MM/DD HH:MM）」を機械付与**し、`ready=true` の依頼は契約化を呼ばずに「実行機（MBP）到達不能のため契約化・実行不可。復旧後に再送してください」で止まる。固定行は会話履歴（脳 LLM の文脈）には残さない（システム表示であり会話ではない）。到達性を脳 LLM に推測・創作させない（2026-09-04 実測: 不達中にローカル脳が「会話履歴を閲覧する権限がない」等を創作した）。最終疎通は sa-ru 起動後に ssh 検査が合格した最新時刻（起動後に合格が無ければ「起動後の疎通なし」）。probe（§8.3 確認系質問）の返信は SSH 実行の実失敗をそのまま載せるため対象外
+
 > **計画確認中の発話の扱い（訂正経路）**: 当該 `conversation_id` に `pending` の確認レコード（§8.10b）が在るあいだ、後続の発話は会話ではなく**提示済みプランへの訂正**として先に解釈する（§10.2.1「訂正の入力経路」）。訂正として解釈できた発話は会話履歴を進めず、プランを更新して再提示する。訂正と解釈できない発話は通常の会話処理へ落とす（人間がプランを捨てて話を続けられる経路を塞がない）。
 
 **会話セッション履歴の永続化:**
@@ -1084,7 +1088,7 @@ taka-ma 自身がユーザーへ質問・確認を出して返答を待ってい
 | 方式 | Python ライブラリ import（同一プロセス内） |
 | 呼び出し元 | `src/sa-ru/orchestrator.py` |
 | 呼び出し先 | `src/ya-ta/decomposer.py`, `src/ya-ta/classifier.py`, `src/ya-ta/risk_classifier.py`, `src/ya-ta/contractor.py` |
-| LLM バックエンド | 分解・分類: qwen3.8:27b（dense・ollama localhost HTTP API・正は `ya-ta.yaml` の `model`）／リスク判定: Qwen3.6-35B-A3B（MoE・同 HTTP API。下記「リスク判定のモデル分離」）／契約化: worker CLI 上位モデル（既定 opus・下記「契約化の呼び出し」。CLI 不達時のみローカル dense へ縮退） |
+| LLM バックエンド | 分解・分類: qwen3.8:27b（dense・ollama localhost HTTP API・正は `ya-ta.yaml` の `model`）／リスク判定: Qwen3.6-35B-A3B（MoE・同 HTTP API。下記「リスク判定のモデル分離」）／契約化: worker CLI 上位モデル（既定 opus・下記「契約化の呼び出し」。CLI 不達時は fail-closed・縮退しない — ADR 0002） |
 
 **ya-ta は launchd サービスとしては廃止。** sa-ru が直接 import して関数呼び出しする。これによりクラッシュ問題（exit -15）が構造的に解消される。モジュールとしての独立性は維持する（将来のモデル差し替え対応）。
 
@@ -1186,8 +1190,9 @@ result = risk.classify("Write to: src/app.ts")
 - **設定**: `ya-ta.yaml` の `contractor.backend`（`worker_cli` / `local`）と `contractor.model`（models レジストリのキー参照・既定 opus。モデル名をコードに直書きしない）。分解・分類（`model`）・リスク判定（`risk_model`）の設定は不変
 - **検証は不変**: どのバックエンドの出力も受理判断は sa-ru の `validate_contract`（逐語照合・出所束縛・kind 許可リスト・fail-closed）のみ。上位モデルの出力も信用しない（権威はフィールドの原則）
 - **不合格 2 回で fail-closed**: 既定バックエンドが最上位のため、契約化への昇格ラダー適用（旧 §8.4.x (e) 第 1 号）は廃止する。パース不能・検証不合格が 2 回連続したら着手確認を出さず不足を人に確認する
-- **縮退**: worker CLI の**呼び出し自体の失敗**（SSH 不達・CLI エラー・認証失効。検証不合格は含まない）時のみ、ローカル `ya-ta.model` で契約化する。縮退契約の着手確認には「縮退モード（ローカル契約化）」行を機械付与する（検証は同一）
-- **記録**: 契約化の backend・validate 結果・縮退発生を判定ログ（§8.4.1）へ記録する
+- **到達性ゲート（契約化の前・ADR 0002）**: 契約化を呼ぶ前に sa-ru が `AuthPreflight.check_ssh()`（ssh 検査のみ。§8.5 の worker 起動前検査と同じ TTL キャッシュ `pass_ttl_sec` / `fail_ttl_sec` を共用し、Anthropic プローブは走らせない）を通す。不合格なら契約化を呼ばず、固定文「実行機（MBP）到達不能のため契約化・実行不可。復旧後に再送してください」（先頭に §8.3「到達性の機械付与」の固定行）を返して止まる。負担は実測 0.23〜0.26 秒・合格後 10 分は再検査しない
+- **不達は fail-closed（縮退の廃止・ADR 0002）**: worker CLI の**呼び出し自体の失敗**（SSH 不達・CLI エラー・認証失効。検証不合格は含まない）が `ATTEMPTS` 回続いても、ローカル `ya-ta.model` へは縮退しない。`Contractor` は不成立（origin=None・来歴 `unreachable=true`）を返し、呼び出し側は上記の固定文で止まる。理由: 2026-09-04 に縮退契約が誤ったリポジトリ名・完了条件なしの計画を生み、5 分の待ちとともに障害を隠した（縮退契約は「無い」より悪い）。`contractor.backend: local` と `escalate_runner` 未注入（単体テスト・段階導入）のローカル契約化は従来どおり
+- **記録**: 契約化の backend・validate 結果・不達停止（`unreachable`）を判定ログ（§8.4.1）へ記録する
 
 ```python
 from ya_ta.contractor import Contractor
@@ -1200,7 +1205,7 @@ raw = contractor.contract(history_view, summary)
 ```
 
 - 入力は sa-ru が渡す**会話履歴の二窓ビューと確定要約**のみ（会話セッションの持ち主は sa-ru のまま。ya-ta は状態を持たない）
-- プロンプトは `src/ai_gateway/prompts/contract.md`（契約化専用。orchestrator 側から移動し、重複を残さない）。バックエンド・モデルは上記 `contractor.backend` / `contractor.model` が正。縮退（ローカル実行）時のタイムアウト・think は `ya-ta.yaml` の既存キー（`llm_timeout_sec` / `llm_think`）を共用する
+- プロンプトは `src/ai_gateway/prompts/contract.md`（契約化専用。orchestrator 側から移動し、重複を残さない）。バックエンド・モデルは上記 `contractor.backend` / `contractor.model` が正。ローカル実行（`backend: local`）時のタイムアウト・think は `ya-ta.yaml` の既存キー（`llm_timeout_sec` / `llm_think`）を共用する
 - **受理判断は ya-ta に持たせない**: ya-ta が返すのは抽出結果（パース済み JSON）まで。検証は従来どおり sa-ru 側コード `validate_contract`（逐語照合の出典＝ユーザー発話・kind 許可リスト・fail-closed）が行う — 権威はフィールドの原則（§8.10f）は移管後も不変
 
 **フォールバック（ya-ta 自体の判定エラー時の安全側挙動）:**
@@ -1208,7 +1213,7 @@ raw = contractor.contract(history_view, summary)
 - タスク分解: パースエラー時 → 元の指示をサブタスク1件（`execution: agent` / `depth` 省略 / `confidence: 0.0`）として扱う。これは写像テーブル上 sonnet（中位・万能）へ落ち、かつ agent レーンで実行される安全側の既定
 - タスク分類: パースエラー時 → `{"execution": "agent", "depth": null, "confidence": 0.0}`（安全側に倒す＝sonnet）
 - リスク分類: パースエラー時 → `{"tier": 3}` （人間判断に倒す）
-- 契約化: パースエラー・検証（`validate_contract`）FAIL が 2 回連続 → fail-closed（着手確認を出さず不足を人に確認・§8.10f）。既定バックエンドが最上位（opus）のため昇格ラダーは適用しない。worker CLI の呼び出し自体の失敗はローカル `ya-ta.model` への縮退（上記「契約化の呼び出し」）。分解・分類のような「安全側の既定値」への縮退はしない（推測で埋めた契約は逐語原則に反する）
+- 契約化: パースエラー・検証（`validate_contract`）FAIL が 2 回連続 → fail-closed（着手確認を出さず不足を人に確認・§8.10f）。既定バックエンドが最上位（opus）のため昇格ラダーは適用しない。worker CLI の呼び出し自体の失敗は fail-closed（到達不能の固定文で停止し、ローカルへ縮退しない。上記「到達性ゲート」「不達は fail-closed」・ADR 0002）。分解・分類のような「安全側の既定値」への縮退はしない（推測で埋めた契約は逐語原則に反する）
 - confidence < `routing.confidence_threshold`（既定 0.8）の判定 → 写像テーブル上で自動的に sonnet（迷いの落下先）へ。旧「light → heavy 強制ルーティング」はこの落下で置換された。閾値は設定ファイルで管理し、判定ログの実データで較正する（§2.2「閾値・rubric は実データで較正」）
 
 **LLM 呼び出し・出力の失敗検知（フォールバック発動条件の明確化）:**
@@ -1237,7 +1242,7 @@ live の正規分類経路は `TaskDecomposer.decompose()` である。各サブ
 
 > 注意（来歴）: 旧実装は `classify()` のみに記録を入れたが、`classify()` は live で呼ばれず（live は `decompose()`）、production では判定ログが 1 件も残っていなかった。後続改修で `decompose()` に記録を移し、live で実際に蓄積されるようにした。
 
-**契約化・構造検証の記録（追加）**: 契約化（`Contractor.contract()`）も同ログへ記録する — backend（worker_cli / local 縮退）・モデル・`validate_contract` の合否と不合格理由・縮退発生。あわせて分解・分類の**構造検証の失敗**（パースエラー・必須フィールド欠落によるフォールバック発動）も記録し、失敗率を期間集計できるようにする。この集計が「分解・分類も worker CLI 上位モデルへ移すか（契約化に続く換装）」の判断材料となる（推測ではなく実測で決める）。
+**契約化・構造検証の記録（追加）**: 契約化（`Contractor.contract()`）も同ログへ記録する — backend（worker_cli / local）・モデル・`validate_contract` の合否と不合格理由・不達停止（`unreachable`）。あわせて分解・分類の**構造検証の失敗**（パースエラー・必須フィールド欠落によるフォールバック発動）も記録し、失敗率を期間集計できるようにする。この集計が「分解・分類も worker CLI 上位モデルへ移すか（契約化に続く換装）」の判断材料となる（推測ではなく実測で決める）。
 
 **ローカル脳の換装判断基準（実測駆動）:**
 
@@ -1246,7 +1251,7 @@ live の正規分類経路は `TaskDecomposer.decompose()` である。各サブ
 | 指標 | 導出元 | 発動基準（初期値・実データで較正） |
 |------|--------|--------------------------------|
 | 分解フォールバック率 | `分解フォールバック発動` エントリ / 分解総数 | 7 日間で 5% 超 |
-| 契約化のローカル縮退率 | kind=contract の degraded / 総数 | 7 日間で 20% 超（CLI 側の可用性問題として切り分け） |
+| 契約化の不達停止率 | kind=contract の unreachable / 総数（2026-09-05 以前の記録は `degraded` キーで同義） | 7 日間で 20% 超（CLI 側の可用性問題として切り分け） |
 | 会話脳の重大誤出力 | 実障害の手動記録（例: 2026-08-30 23:50 の converse.md L67 例文オウム返し — プロンプト例文が返信に逐語出現） | 1 件でも再発したら会話脳の換装検討を起票 |
 
 会話脳の例文エコーは機械検出可能（返信がプロンプト例文集合と逐語一致したら棄却・実測ログへ記録）であり、検出器の実装は本基準の運用開始とセットで行う。
@@ -1385,6 +1390,9 @@ worker は SSH 越しに MBP 上で動く。sa-ru 側でタイムアウトや完
 
 - **headless（SSH 越しの `claude -p`）**: タイムアウト時にローカルの SSH クライアントを kill するだけでは、リモートの `claude -p` は切断を知らされず孤児化して走り続ける。SSH に疑似端末を割り当てておき（`-tt`）、セッションが切れたときにリモート側へ SIGHUP が伝播してプロセスが終了するようにする。
 - **interactive(pty)**: 切断耐性のため tmux の detached セッション内で CLI を起動する。タスク終了時にこのセッションを明示的に閉じないと（tmux は attach が切れても detached で生存し続ける設計ゆえ）セッションがリークする。終了処理でセッションを kill する。この後始末に伴う SSH もイベントループを凍結させないよう別スレッドで行う（§10.7）。
+
+- **SSH 呼び出しの上限（全経路共通・ADR 0002）**: 到達不能な相手への `ssh` が無期限に張り付くと、`to_thread` の共有スレッドプールが詰まり sa-ru の全ループが例外なく沈黙する（2026-09-04 実測: MBP 外出中の 7 時間の断のあと 18:46 から翌朝まで沈黙）。上限は 2 層で掛ける。(1) クラスタ用 SSH client 設定（`pyinfra/templates/ssh_config.j2`・配備は手順書 02）に `ConnectTimeout 10` / `ServerAliveInterval 15` / `ServerAliveCountMax 2` / `BatchMode yes` を置き、コードを触らずに約 30 箇所の呼び出しへ一括して効かせる。(2) コード側は `subprocess.run` 等による `ssh` 呼び出しに **必ず `timeout` を付ける**（軽い操作は `sa-ru.yaml` `ssh.timeout_sec`、重い操作は `run_ssh_command` 既定 120 秒）。timeout 無しの `ssh` 呼び出しは AST 回帰テスト（`src/orchestrator/tests/test_ssh_timeout_163.py`）が検出し、混入を機械的に止める
+- **ハング診断の常設（ADR 0002）**: sa-ru は起動時に `faulthandler` を `SIGUSR1` へ登録し（`orchestrator/diagnostics.py`）、沈黙時に `kill -USR1 <pid>` で全スレッドの Python スタックを stderr（`sa-ru-error.log`）へ吐ける。`/opt/taka-ma-env` には `py-spy` を配備する。再起動前にこれらでスタックを採取する手順は運用手順書（`docs/operations/runbook-shutdown-restart.md`）に置く。採取なしに再起動すると原因が失われる（2026-09-04 の教訓）
 
 > **NOTE（agy の認証制約）**: agy の認証は macOS keychain 依存で、素の SSH セッションからは読めない（**SSH 直実行不可**）。**GUI セッション起源の tmux 経由でのみ実行可**（実測 2026-07-03）。agy は subprocess アダプタ（§8.6）で実行する。
 
@@ -2033,7 +2041,7 @@ Slack から MBP の稼働 ollama モデルを手動 unload する経路。停�
 - 計画・workspace に加え、`directive`・`constraints`・`acceptance`・`branch`・`target_paths`・`rest_summary`（runbook を持つ契約）を**常に**提示する（空なら「なし」と明示。見えていない契約は承認されない）。訂正経路（§10.2.1）で修正でき、承認で計画と一緒に凍結される
 - **提示文はコード組立**: 契約を持つ着手確認の本文は、コード側テンプレートが**契約フィールドと計画プレビュー（§10.2.1）のみ**から組み立てる。脳が生成した実行指示の散文を承認面に載せない（2026-08-29 実障害: 契約化脳の内部独白 —「ユーザーが怒っている理由は…」等の自己弁論 — が計画本文にそのまま提示された。語検出での排除はしない — 散文を提示面から構造的に外す）。確定要約（summary）は**意図確認用の表示**として 1 欄で提示するが、実行系（分解入力・worker 指示・完了検査）へは契約フィールドのみが渡る（分解入力は `rest_summary`・§8.10g。`command=確定要約` を実行の権威にしない）
 - `needs_repo=true` かつ `workspace` 未解決の依頼は**着手ボタンを出さない**。「リポジトリ指定が必要」と必要な入力（`repo:/絶対パス`、または使い捨て作業場でよい旨の明示）を質問する。空作業場で走ってから気づく構造を廃する
-- 契約化が縮退モード（ローカル契約化・§8.4）で成立した場合は「縮退モード（ローカル契約化）」行を機械付与する（どの脳が立てた契約かを人が承認時に見える）
+- 縮退モード行は廃止（ADR 0002）。worker CLI に届かない場合は縮退契約を作らず、着手確認自体を出さない（§8.4「到達性ゲート」「不達は fail-closed」）
 
 #### 逐語命令の実行（directive 型）
 
@@ -2383,6 +2391,23 @@ u-zu の Slack 受信（Socket Mode WebSocket）は、ネットワーク瞬断�
 | 誤検出耐性 | 起動直後は初回チェック時刻を起点に閾値分の猶予。ネットワーク長時間断では再起動を繰り返すが、回復と同時に自然復旧する（許容） |
 
 > **用語注意**: §8.15 の「watchdog」は FSEvents によるファイル監視ライブラリを指す。本節の死活監視（実装名 `socket_watchdog`）は受信 liveness の監視であり別物。
+
+#### 8.16.1 sa-ru の死活監視（心拍 2 探針・自己終了復帰・ADR 0002）
+
+sa-ru は「落ちれば launchd `KeepAlive` が再起動し、ループが例外で死ねば `_supervise` が再起動する」設計だったが、**プロセスが生きたままループが止まる沈黙**には何も反応しなかった（2026-09-04 18:46:59 に全 8 ループが例外なく沈黙し、翌朝の手動 kickstart まで復帰せず。推定機序: 到達不能な MBP への timeout 無し `ssh` が `to_thread` の共有スレッドプールを詰まらせた）。§8.16 と同じ型で、沈黙を心拍の途絶として検出し自己終了で復帰する。
+
+| 項目 | 仕様 |
+|------|------|
+| 心拍（発生源） | イベントループ上の専用コルーチン `Heartbeat.beat_loop`（`orchestrator/liveness.py`）が `probe_interval_sec` ごとに 2 探針を打つ。(a) 心拍ファイル `heartbeat_path` へ時刻を**上書き**（イベントループ閉塞の検知。ファイルは常に最新 1 行で増えない）。(b) `to_thread` へ空関数を投げ `probe_timeout_sec` で戻らなければ**スレッドプール枯渇**（9/4 の推定機序）として健全な心拍を止める。各ループの周回は数えない（`queue.get()` で待機中の暇なループを誤検出するため） |
+| 判定 | 「健全な心拍（プール探針が応答した）」の前進が `stale_threshold_sec` を超えて途絶したら沈黙（`Heartbeat.is_stale()`）。起動直後は起動時刻を起点に閾値分の猶予 |
+| 監視主体 | sa-ru プロセス内の daemon スレッド（`run_watchdog`）。イベントループにもスレッドプールにも依存しないため、両方が死んでいても動く。外部 launchd ジョブは追加しない（§8.16 と同じ理由） |
+| 回復 | CRITICAL ログ後に `os._exit(1)` → launchd `KeepAlive` が再起動。プロセス内で「復旧したつもり」を作らない |
+| 再起動の抑制 | 自己終了の時刻を `restart_count_path` へ永続化し、直近 1 時間の回数が `restart_limit_per_hour` に達していたら自己終了せず CRITICAL と Slack 通知に切り替える（長時間の到達不能中に原因側の修正が不十分で再ハングしたときの往復を止める）。到達不能そのものは心拍を止めない（§8.5 SSH 上限が前提） |
+| 通知 | Slack（既定チャンネル）へ**初回の自己終了と打ち切り時のみ**。MBP 到達性（プリフライトの直近実測・最終疎通時刻）を併記する |
+| ログ規律 | 心拍は**ファイル上書きのみでログ 0 行**。ログはプール枯渇の検知・回復・自己終了・打ち切りの各遷移時のみ。あわせて `ResourceMonitor` の検知失敗と qu-e のヘルスチェックも**状態遷移時のみ 1 行**に改める（9/4 は同一 traceback 756 回×20 行超、qu-e は平常報告 1 日 2,880 行で、肝心の沈黙が埋もれた） |
+| 運用値 | sa-ru.yaml `liveness.probe_interval_sec` / `probe_timeout_sec` / `stale_threshold_sec` / `check_interval_sec` / `heartbeat_path` / `restart_count_path` / `restart_limit_per_hour` が唯一の源（コード側既定値なし。キー欠落は起動失敗）。既存の `heartbeat` ブロックは §10.8 の LLM 処理待ち進捗通知であり別物 |
+| 検出遅延 | 最悪 `stale_threshold_sec + check_interval_sec`（既定 360 秒） |
+| 診断との接続 | 自己終了の前にスタックを採る仕組みは持たない（沈黙中の自己診断は信用できない）。原因の確定は §8.5「ハング診断の常設」（SIGUSR1 / py-spy）を人が runbook に従って行う |
 
 ### 8.17 G2（Even Realities AR グラス）チャネル — Claude リレー方式
 

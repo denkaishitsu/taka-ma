@@ -9,3 +9,9 @@ Host {{ peer_alias }}
     IdentityFile {{ identity_file }}
     IdentitiesOnly yes
     StrictHostKeyChecking accept-new
+    # 到達不能な相手へ無期限に張り付かない（ADR 0002・設計書 §8.5「SSH 呼び出しの上限」）。
+    # 接続確立 10 秒、確立後の無応答は 15 秒 x 2 で切断、対話認証待ちは禁止。
+    ConnectTimeout 10
+    ServerAliveInterval 15
+    ServerAliveCountMax 2
+    BatchMode yes

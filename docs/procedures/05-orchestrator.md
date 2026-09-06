@@ -108,6 +108,7 @@ ssh mac-mini "tail -20 /opt/taka-ma/logs/sa-ru.log"
 |------|------|--------|
 | `launchctl list` の出力 | `com.taka-ma.sa-ru` 行があり、PID が数値、Status が `0` | サービス未登録、PID 欄が `-`、Status が非ゼロ |
 | `sa-ru.log` の出力 | 起動メッセージが記録されている、Python Traceback なし | 起動ログ無し、Traceback、エラーメッセージ |
+| 死活監視（§8.16.1） | `sa-ru.log` に「死活監視の心拍を開始」「死活監視スレッドを開始」が 1 回ずつあり、`/opt/taka-ma/data/sa-ru.heartbeat` の `ts` が `liveness.probe_interval_sec` ごとに更新される（`ssh mac-mini "cat /opt/taka-ma/data/sa-ru.heartbeat"` を 2 回、間隔を空けて比較）。平常時に心拍のログ行は増えない | 心拍ファイルが無い／更新されない、`pool_ok: false` が続く、「心拍途絶」の CRITICAL |
 
 ### 2. タスクキュー動作確認（light タスク）
 

@@ -17,6 +17,7 @@ from pathlib import Path
 import yaml
 
 from orchestrator import Orchestrator
+from orchestrator.diagnostics import install_hang_diagnostics
 
 # launchd 配下では stdout がそのままサービスログ（plist の StandardOutPath=sa-ru.log）になるため、
 # 全ロガーの出力を標準出力へ集約する。u-zu（slack_bot/main.py）と同一方針。これが無いと
@@ -37,5 +38,9 @@ config = {
     **yaml.safe_load(ya_ta_path.read_text()),
     **yaml.safe_load(sa_ru_path.read_text()),
 }
+
+# ハング診断: SIGUSR1 で全スレッドの Python スタックを stderr（sa-ru-error.log）へ吐く
+# （設計書 §8.5「ハング診断の常設」・ADR 0002）。イベントループ起動前に登録する。
+install_hang_diagnostics()
 
 asyncio.run(Orchestrator(config).run())

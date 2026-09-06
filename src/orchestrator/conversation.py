@@ -44,6 +44,7 @@ from orchestrator import intent_store
 from orchestrator import runbook as runbook_rules
 from orchestrator.file_queue import atomic_write_json
 from orchestrator.grounding import GroundingVerifier
+from orchestrator.preflight import PreflightFailure
 
 logger = logging.getLogger("sa-ru.conversation")
 
@@ -67,6 +68,12 @@ _SAFE_WORKSPACE_RE = re.compile(r"\A/[A-Za-z0-9._/\-]+\Z")
 # 人向け返信に内部 JSON を 1 断片も見せないため、キー 1 つの出現でも縮退する（安全側・
 # #taka-ma/142。実害は 2026-08-10 Slack DM インシデント F2 の生 JSON 漏出）。
 _CONTRACT_KEY_RE = re.compile(r"""["'](?:reply|ready|summary)["']\s*:""")
+
+# 到達性の機械付与（§8.3・ADR 0002）。実行機（MBP）に届かないあいだ、会話返信の先頭へ置く
+# 固定行と、ready 依頼を止める固定文。脳 LLM に到達性を推測・創作させない（2026-09-04 実測:
+# 不達中にローカル脳が「会話履歴を閲覧する権限がない」等を創作した）
+UNREACHABLE_NOTICE_FMT = "⛔ MBP 到達不能（最終疎通 {last_ok}）"
+UNREACHABLE_STOP_TEXT = "実行機（MBP）到達不能のため契約化・実行不可。復旧後に再送してください"
 # 自然文のリポジトリ指定（§8.13 / #143）。インシデント発端の `#Repo ~/DevDev/...` のように、
 # 人間は `repo:` 記法ではなくマーカー語＋パスで指定する現実がある（2026-08-10 インシデント
 # 根本原因 1）。マーカー語（repo / repository / リポジトリ）に区切り（: ： = は を の・空白）を
@@ -139,7 +146,7 @@ class ConversationManager:
     """
 
     def __init__(self, config, slack_notifier, task_dir: str, classifier=None,
-                 plan_service=None, process_mgr=None, canceller=None):
+                 plan_service=None, process_mgr=None, canceller=None, preflight=None):
         """会話マネージャを構築する。
 
         Args:
@@ -161,9 +168,14 @@ class ConversationManager:
                 注入する（発話 msg を受け、同一会話面の計画/タスクを停止して停止結果 dict を
                 返す同期呼び出し。会話処理は to_thread 上のため同期でよい）。None なら
                 制御判定を行わない（単体テスト・段階導入用）。
+            preflight: 実行機（MBP）への到達性の実測手段（AuthPreflight。§8.3「到達性の
+                機械付与」・§8.4「到達性ゲート」・ADR 0002）。各ターン冒頭で check_ssh() を
+                通し、不達なら返信先頭へ固定行を前置し ready 依頼は契約化を呼ばず止める。
+                None なら到達性を見ない（単体テスト・段階導入用）。
         """
         self.config = config
         self.process_mgr = process_mgr
+        self.preflight = preflight
         # probe の対象 workspace の既定 base（Orchestrator._workspace_for と同じ解決規則）
         self.workspace_base = config.get("task_context", {}).get(
             "workspace_base", "/opt/taka-ma/work")
@@ -528,6 +540,11 @@ class ConversationManager:
             # 再ロックする。永続化側は丸めない（全履歴保持）
             history_snapshot = self._history_view(history)
 
+        # 到達性の実測（§8.3 到達性の機械付与・ADR 0002）。不達なら以降の返信に固定行を
+        # 前置し、ready 依頼は契約化を呼ばずに止める（脳 LLM に到達性を推測させない）。
+        # 検査は TTL キャッシュ共用のため通常は即時（実測 0.25 秒・合格後 10 分は再検査なし）
+        unreachable_notice = self._reachability_notice()
+
         if msg.get("force_ready"):
             # /taka-ma-go: LLM 判定を待たず要約させて強制的に締める
             result = self._invoke_llm(history_snapshot, force=True, progress=progress)
@@ -565,6 +582,14 @@ class ConversationManager:
         if result.get("ready") and result.get("summary"):
             summary = result["summary"]
             self._append_turn(cid, "assistant", summary)
+            if unreachable_notice:
+                # 実行機に届かない依頼は契約化・実行へ進めない（fail-closed・§8.4 到達性
+                # ゲート・ADR 0002）。縮退契約を作らず固定文で止め、復旧後の再送を待つ
+                self._set_awaiting(cid, True)
+                self.slack.notify(
+                    f"{unreachable_notice}\n{UNREACHABLE_STOP_TEXT}", msg.get("channel_id"),
+                    team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
+                return
             # workspace はセッション持続値を採る（このターンの指定は上で反映済み。§8.13 / #143）。
             # `:opus` 等の明示モデル指定は要約（脳 LLM の言い換え）には残らないため、要約対象の
             # 生文から直接抽出する（設計書「ユーザーモデル指定」）。repo: を先に除去した
@@ -611,7 +636,11 @@ class ConversationManager:
                     # 言い直しの返答を待つ（§8.3 (C) 能動昇格）
                     self._set_awaiting(cid, True)
                     unmapped = contract_prov.get("unmapped") or []
-                    if unmapped:
+                    if contract_prov.get("unreachable"):
+                        # 到達性ゲート合格後（pass_ttl 内）に CLI 不達へ転じた場合（ADR 0002）。
+                        # 抽出失敗の定型（言い直しの要求）で誤誘導せず、到達不能の固定文で止める
+                        text = UNREACHABLE_STOP_TEXT
+                    elif unmapped:
                         # スキーマ閉包の検出（§8.10f）: 契約フィールドへ写像できない
                         # 「実行に影響する指定」。散文で黙って運ばず、扱いを人に確認する
                         text = ("次の指定を契約のどの項目としても解釈できませんでした"
@@ -708,8 +737,10 @@ class ConversationManager:
             # 会話継続 = ユーザーの次の発話を待つ（§8.3 (C) 能動昇格。エラー由来も
             # 言い直しを求めており返答待ち）
             self._set_awaiting(cid, True)
+            # 到達不能の固定行は表示にだけ前置する（履歴には残さない = 脳の文脈にしない）
             self.slack.notify(
-                reply, msg.get("channel_id"),
+                f"{unreachable_notice}\n{reply}" if unreachable_notice else reply,
+                msg.get("channel_id"),
                 team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
             # 実測差し替え時の自動再提示は行わない（§8.10b 再提示の限定。2026-08-29
             # 実障害: 別話題の発話への実測差し替えに乗って stale 計画が承認面へ再提示
@@ -1381,11 +1412,30 @@ class ConversationManager:
         # push を含む依頼で完了条件が空なら既定検査を付与する（§8.10f。脳の
         # 立て損ねで「push の実測検査なしに完了」と言える状態を作らない）
         contract = contract_rules.apply_default_acceptance(validated, summary)
-        # 縮退（CLI 呼び出し失敗 → ローカル契約化・§8.4）は着手確認へ明示する
-        # （"_" 前置きキーは提示専用＝レコードへ運ばない）
-        if provenance.get("degraded"):
-            contract["_contract_degraded"] = True
         return contract, provenance
+
+    def _reachability_notice(self) -> str | None:
+        """実行機（MBP）への到達性を実測し、不達なら返信先頭の固定行を返す（§8.3・ADR 0002）。
+
+        AuthPreflight.check_ssh() の TTL キャッシュを共用するため、合格後 10 分は再検査せず
+        即時に None、不達の fail_ttl 内は即時に固定行を返す。preflight 未注入は到達性を
+        見ない（None）。検査自体の想定外エラーは記録して None（判定不能を不達と偽らない。
+        不達なら後段の SSH 実行がその実失敗を返す）。
+        """
+        preflight = getattr(self, "preflight", None)   # 部分構築（テスト）でも落ちない
+        if preflight is None:
+            return None
+        try:
+            preflight.check_ssh()
+            return None
+        except PreflightFailure:
+            last_ok = getattr(preflight, "last_ssh_ok", None)
+            label = (time.strftime("%m/%d %H:%M", time.localtime(last_ok))
+                     if last_ok else "起動後の疎通なし")
+            return UNREACHABLE_NOTICE_FMT.format(last_ok=label)
+        except Exception:
+            logger.exception("到達性の実測に失敗（判定不能・固定行は付けない）")
+            return None
 
     def _contract_escalation_runner(self, model_name: str, prompt: str) -> str:
         """昇格ラダーの 1 段: 上位 worker モデルで契約化プロンプトを 1 回だけ実行する。
@@ -2022,10 +2072,6 @@ class ConversationManager:
         # 事前実測（reconcile・§8.10g）で既に満たされていた検査を明示する
         for line in contract.get("_pre_satisfied") or []:
             lines.append(f"- 済（実測）: {line}")
-        # 縮退（CLI 呼び出し失敗 → ローカル契約化・§8.4）の可視化。どの脳が立てた
-        # 契約かを人が承認時に見える
-        if contract.get("_contract_degraded"):
-            lines.append("契約化: 縮退モード（ローカル契約化 — worker CLI 呼び出し失敗）")
         return "\n".join(lines)
 
     # ── 着手確認の決着（確認ループから呼ばれる） ──

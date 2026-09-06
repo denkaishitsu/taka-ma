@@ -38,10 +38,10 @@ ya-ta:
                               # 上位モデルを既定にする。ready 毎 1 回の最低頻度・誤りコスト最大の
                               # 1 点に確実なモデルを使う配分。分解・分類・リスク判定はローカル維持
     backend: "worker_cli"     # worker_cli（既定）/ local。CLI の呼び出し自体の失敗（SSH 不達・
-                              # 認証失効）時は自動でローカル（上の model）へ縮退し、着手確認に
-                              # 縮退モードを明示する（検証 validate_contract は同一）
+                              # 認証失効）ではローカルへ縮退せず fail-closed で止まる（到達不能の
+                              # 固定文を返す・ADR 0002）。local は単体テスト・段階導入用
     model: "opus"             # models レジストリのキー参照（モデル実体は models.opus が持つ。
-                              # 直書きしない）。契約化の失敗率・縮退頻度は判定ログ §8.4.1 で実測
+                              # 直書きしない）。契約化の失敗率・不達停止率は判定ログ §8.4.1 で実測
 
 # ルーティング写像（light/heavy 2値 → execution × depth 直交2軸）
 # ya-ta は execution/depth/confidence の生判定のみ返し、モデルへの写像は orchestrator が

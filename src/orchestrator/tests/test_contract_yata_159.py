@@ -126,7 +126,7 @@ def test_cli_primary_success_never_calls_local(monkeypatch):
     assert "要約する" in runner_calls[0][1]
     assert prov["origin"] == "opus"
     assert prov["backend"] == "worker_cli"
-    assert prov["degraded"] is False
+    assert prov["unreachable"] is False
 
 
 def test_cli_invalid_twice_fails_closed_without_local(monkeypatch):
@@ -142,19 +142,26 @@ def test_cli_invalid_twice_fails_closed_without_local(monkeypatch):
     assert [a["model"] for a in prov["attempts"]] == ["opus", "opus"]
 
 
-def test_cli_exec_failure_degrades_to_local(monkeypatch):
-    """CLI の呼び出し自体の失敗（SSH 不達等）が続いたときのみローカルへ縮退する。"""
-    monkeypatch.setattr(contractor_mod, "run_ollama", lambda *a, **k: GOOD_OUTPUT)
+def test_cli_exec_failure_fails_closed_without_local(monkeypatch):
+    """CLI の呼び出し自体の失敗（SSH 不達等）が続いても縮退しない（ADR 0002・§8.4）。
+
+    2026-09-04 に縮退契約が誤リポ名・完了条件なしの計画を生んだ是正。ローカルを呼ばず
+    不成立（origin=None・unreachable=True）を返し、呼び出し側が到達不能の固定文で止まる。
+    """
+    def _no_local(*a, **k):
+        raise AssertionError("CLI 不達でローカルへ縮退してはならない（ADR 0002）")
+    monkeypatch.setattr(contractor_mod, "run_ollama", _no_local)
 
     def _dead_cli(name, prompt):
         raise RuntimeError("SSH command failed")
 
     validated, prov = contractor_mod.Contractor(
         _contractor_config(), escalate_runner=_dead_cli).contract("履歴", "要約", _validate)
-    assert validated is not None
-    assert prov["origin"] == "local"
-    assert prov["degraded"] is True
-    assert [a["model"] for a in prov["attempts"]] == ["opus", "opus", "local-dummy"]
+    assert validated is None
+    assert prov["origin"] is None
+    assert prov["backend"] == "worker_cli"
+    assert prov["unreachable"] is True
+    assert [a["model"] for a in prov["attempts"]] == ["opus", "opus"]
     assert prov["attempts"][0]["problems"][0].startswith("実行失敗")
 
 
@@ -176,7 +183,7 @@ def test_no_runner_means_local_only(monkeypatch):
         _contractor_config()).contract("履歴", "要約", _validate)
     assert validated is None
     assert len(prov["attempts"]) == 2
-    assert prov["degraded"] is False  # CLI を試していない＝縮退ではない
+    assert prov["unreachable"] is False  # CLI を試していない＝不達ではない
 
 
 def test_local_backend_config(monkeypatch):
@@ -291,18 +298,13 @@ class _FakeContractor:
         return validated, self.provenance
 
 
-def test_build_contract_records_degraded_provenance():
-    """縮退（CLI 呼び出し失敗 → ローカル契約化）は _contract_degraded を持つ（§8.4）。"""
+def test_build_contract_never_marks_degraded():
+    """縮退モードは廃止（ADR 0002）: 来歴に何が在っても _contract_degraded を立てない。"""
     mgr = _manager(tempfile.mkdtemp())
     mgr.contractor = _FakeContractor(
-        _raw(), {"origin": "local", "backend": "local", "degraded": True, "attempts": []})
-    contract, _ = mgr._build_contract("c1", "要約")
-    assert contract["_contract_degraded"] is True
-
-    mgr.contractor = _FakeContractor(
-        _raw(), {"origin": "opus", "backend": "worker_cli", "degraded": False,
+        _raw(), {"origin": "opus", "backend": "worker_cli", "unreachable": False,
                  "attempts": []})
-    contract, _ = mgr._build_contract("c2", "要約")
+    contract, _ = mgr._build_contract("c1", "要約")
     assert "_contract_degraded" not in contract
 
 
@@ -311,7 +313,7 @@ def test_build_contract_fail_closed_on_none():
     mgr = _manager(tempfile.mkdtemp())
     mgr.contractor = _FakeContractor(
         {"runbook": "not-a-list"},
-        {"origin": None, "backend": "worker_cli", "degraded": False, "attempts": []})
+        {"origin": None, "backend": "worker_cli", "unreachable": False, "attempts": []})
     contract, prov = mgr._build_contract("c1", "要約")
     assert contract is None
     assert prov["origin"] is None
@@ -489,5 +491,6 @@ def test_format_contract_shows_rest_summary_and_degraded():
         {**base, "rest_summary": "README を追記する"})
     # キー欠落（旧レコード）は「旧契約」と明示（確定要約フォールバックは廃止・2026-09-03）
     assert "残り作業（分解対象）: 未特定（旧契約）" in fmt(base)
+    # 縮退モード行は廃止（ADR 0002）: 旧キーが残っていても表示しない
     text = fmt({**base, "rest_summary": None, "_contract_degraded": True})
-    assert "契約化: 縮退モード（ローカル契約化" in text
+    assert "縮退モード" not in text

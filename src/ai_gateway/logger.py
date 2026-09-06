@@ -85,10 +85,10 @@ class YaTaLogger:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
     def log_contract(self, origin, attempts: list[dict],
-                     backend: str | None = None, degraded: bool = False):
+                     backend: str | None = None, unreachable: bool = False):
         """契約化 1 回分の試行列を当日ログに追記する（設計書 §8.4.1）。
 
-        契約化バックエンド換装判断（どのモデルで何が不合格だったか・縮退の頻度）の
+        契約化バックエンド換装判断（どのモデルで何が不合格だったか・不達停止の頻度）の
         一次データ。判定ログと同じファイルに kind で区別して混載する（日付 rotation を
         二重に持たない）。
 
@@ -97,14 +97,15 @@ class YaTaLogger:
                 None=不成立）。
             attempts: 試行列 [{"model": 名前, "problems": 不合格理由リスト}, ...]。
             backend: 確定（または最終試行）のバックエンド（"worker_cli" / "local"）。
-            degraded: CLI 呼び出し失敗によるローカル縮退が起きたか（§8.4）。
+            unreachable: CLI の呼び出し自体の失敗が続き不成立になったか（§8.4・ADR 0002。
+                2026-09-05 以前の記録は同義のキー degraded）。
         """
         entry = {
             "timestamp": datetime.datetime.now().isoformat(),
             "kind": "contract",
             "origin": origin,
             "backend": backend,
-            "degraded": degraded,
+            "unreachable": unreachable,
             "attempts": attempts,
         }
         with open(self._log_path(), "a") as f:

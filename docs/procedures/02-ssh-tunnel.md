@@ -137,6 +137,7 @@ pyinfra @local \
 - Tailscale が導入済み（既存アプリには触れない）。
 - 相手機の公開鍵が `~/.ssh/authorized_keys` に登録される（相手機は自分の秘密鍵で接続可能）。
 - `ssh <相手 alias>` で相手機へ接続できる（IdentityFile=自機鍵。設定は既存 `~/.ssh/config` を壊さず Include で追加）。
+- 相手機が到達不能でも `ssh <相手 alias>` は **10 秒で失敗**し、確立済み接続の無応答は約 30 秒で切れる（`ConnectTimeout 10` / `ServerAliveInterval 15` / `ServerAliveCountMax 2`。`BatchMode yes` で対話認証待ちも起きない）。理由は [ADR 0002](../adr/0002-outage-2026-09-04-remediation.md)。
 - sshd がパスワード認証無効・root ログイン禁止・公開鍵のみに設定される。設定は専用ドロップイン `/etc/ssh/sshd_config.d/taka-ma-cluster.conf` に置き、**既存 `/etc/ssh/sshd_config` 本体は一切変更しない**（macOS 既定の `Include /etc/ssh/sshd_config.d/*` がドロップインを読み込む）。deploy は既定 Include の存在のみ確認し、無ければ fail-fast する（その場合のみ手動で `Include /etc/ssh/sshd_config.d/*` を `/etc/ssh/sshd_config` に追記）。
 
 > ソースは `pyinfra/deploys/` 配下が正本。手順書は**操作コマンドと得られる状態**を示し、実装はソースへリンクする（重複させない）。
@@ -220,6 +221,7 @@ tailscale ping mbp
 - [ ] iperf3 帯域テスト（~9.4 Gbps）
 - [ ] Mac mini → MBP: `ssh mbp` でログイン成功
 - [ ] MBP → Mac mini: `ssh mac-mini` でログイン成功
+- [ ] 到達不能ホストへの `ssh` が 10 秒で失敗すること（例: `time ssh -F ~/.ssh/config.d/taka-ma-cluster -o HostName=10.255.255.1 mbp true` が約 10 秒で `Operation timed out`）
 - [ ] `ssh mbp-direct` / `ssh mac-mini-direct` でログイン成功
 - [ ] `tailscale ping` で在宅時に direct path が選択されていること
 - [ ] パスワード認証が無効であること（`ssh -o PasswordAuthentication=yes` で拒否される）
