@@ -125,14 +125,22 @@ def test_parse_workspace_rejects_multiple_distinct():
 
 # ── repo: と :モデル名 の共存（handle_message 経由の end-to-end） ──
 
+class _IntentStub:
+    def __init__(self, action="execute"):
+        self.action = action
+
+    def classify(self, history_text, latest_text):
+        return {"action": self.action, "confidence": 1.0, "evidence": latest_text[:10],
+                "origin": "stub", "escalated": False, "fail_closed": False}
+
+
 def test_handle_message_carries_workspace_and_model_into_task(monkeypatch):
     """repo: を先に除去した上で :opus 抽出が効き、両方が確定タスクへ伝播する。"""
     tmp = tempfile.mkdtemp()
     mgr = _manager(tmp)
     msg = {"conversation_id": "c1", "text": "repo:/Users/u/DevDev/xxx を直して :opus",
            "user_id": "U1", "team_id": "T1", "channel_id": "C1", "thread_ts": "1.2"}
-    monkeypatch.setattr(mgr, "_invoke_llm", lambda history, force, progress=None: {
-        "ready": True, "summary": "xxx リポジトリのバグ修正", "reply": ""})
+    mgr.intent = _IntentStub("execute")
 
     mgr.handle_message(msg)
 
@@ -158,7 +166,7 @@ def test_handle_message_invalid_workspace_notifies_and_skips_confirm(monkeypatch
     mgr = _manager(tmp)
     msg = {"conversation_id": "c2", "text": "repo:~/DevDev/xxx を直して",
            "user_id": "U1", "team_id": "T1", "channel_id": "C1", "thread_ts": "2.3"}
-    monkeypatch.setattr(mgr, "_invoke_llm", lambda history, force, progress=None: {
+    monkeypatch.setattr(mgr, "_invoke_llm", lambda history, progress=None: {
         "ready": True, "summary": "xxx リポジトリのバグ修正", "reply": ""})
 
     mgr.handle_message(msg)

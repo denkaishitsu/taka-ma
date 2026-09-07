@@ -91,14 +91,24 @@ def _manager(tmp_dir, sessions_dir=None, worker_home=WORKER_HOME):
                                classifier=classifier)
 
 
-def _ready(mgr, monkeypatch, summary="要件定義の作成"):
-    monkeypatch.setattr(mgr, "_invoke_llm", lambda history, force, progress=None: {
-        "ready": True, "summary": summary, "reply": ""})
+class _IntentStub:
+    def __init__(self, action="execute"):
+        self.action = action
+
+    def classify(self, history_text, latest_text):
+        return {"action": self.action, "confidence": 1.0, "evidence": latest_text[:10],
+                "origin": "stub", "escalated": False, "fail_closed": False}
+
+
+def _ready(mgr, monkeypatch, summary=None):
+    """execute 判定にする（summary は発話逐語のため引数は互換用・未使用）。"""
+    mgr.intent = _IntentStub("execute")
 
 
 def _not_ready(mgr, monkeypatch):
-    monkeypatch.setattr(mgr, "_invoke_llm", lambda history, force, progress=None: {
-        "ready": False, "summary": None, "reply": "了解しました"})
+    mgr.intent = _IntentStub("chat")
+    monkeypatch.setattr(mgr, "_invoke_llm", lambda history, progress=None: {
+        "reply": "了解しました"})
 
 
 def _msg(text, cid="c1"):

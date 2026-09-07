@@ -311,9 +311,18 @@ def _msg(text, cid="c1", force=False):
             "user_id": "U1", "team_id": "T1", "channel_id": "C1", "thread_ts": "1.2"}
 
 
-def _ready(mgr, monkeypatch, summary="要約"):
-    monkeypatch.setattr(mgr, "_invoke_llm", lambda history, force, progress=None: {
-        "ready": True, "summary": summary, "reply": ""})
+class _IntentStub:
+    def __init__(self, action="execute"):
+        self.action = action
+
+    def classify(self, history_text, latest_text):
+        return {"action": self.action, "confidence": 1.0, "evidence": latest_text[:10],
+                "origin": "stub", "escalated": False, "fail_closed": False}
+
+
+def _ready(mgr, monkeypatch, summary=None):
+    """execute 判定にする（summary は発話逐語）。"""
+    mgr.intent = _IntentStub("execute")
 
 
 def _records(tmp_dir):
@@ -465,13 +474,11 @@ def test_invoke_llm_repairs_invalid_backtick_escape(monkeypatch):
     """脳が markdown 癖で `\\`` を出力しても、修復パースで ready 判定まで到達する。"""
     tmp = tempfile.mkdtemp()
     mgr = _manager(tmp)
-    broken = ('{"reply": "着手します", "ready": true, '
-              '"summary": "実行方法は \\`npm run test:e2e\\`\\. を追記", "probe": null}')
+    broken = ('{"reply": "実行方法は \\`npm run test:e2e\\`\\. を追記しました"}')
     monkeypatch.setattr(conversation, "run_ollama",
                         lambda *a, **k: broken)
-    result = mgr._invoke_llm([{"role": "user", "text": "x"}], force=False)
-    assert result["ready"] is True
-    assert "npm run test:e2e" in result["summary"]
+    result = mgr._invoke_llm([{"role": "user", "text": "x"}])
+    assert "npm run test:e2e" in result["reply"]
 
 
 # ── headless の実行コマンド採取（遵守照合の材料） ──

@@ -377,6 +377,15 @@ def _handle_manager(tmp_dir):
     return conversation.ConversationManager(config, _FakeNotifier(), task_dir=tmp_dir)
 
 
+class _IntentStub:
+    def __init__(self, action="execute"):
+        self.action = action
+
+    def classify(self, history_text, latest_text):
+        return {"action": self.action, "confidence": 1.0, "evidence": latest_text[:10],
+                "origin": "stub", "escalated": False, "fail_closed": False}
+
+
 def _reconcile_msg(force):
     return {"conversation_id": "c1", "text": "repo:/Users/dev/r もう一度やって",
             "force_ready": force,
@@ -388,8 +397,7 @@ def _drive_reconcile(monkeypatch, force):
     (reconcile 呼び出し回数, 着手確認提示回数) を返す。"""
     import tempfile
     mgr = _handle_manager(tempfile.mkdtemp())
-    monkeypatch.setattr(mgr, "_invoke_llm", lambda history, force, progress=None: {
-        "ready": True, "summary": "要約", "reply": ""})
+    mgr.intent = _IntentStub("execute")
     monkeypatch.setattr(mgr, "_build_contract", lambda cid, summary, progress=None, force_ready=False: ({
         "directive": None, "constraints": [],
         "acceptance": [{"kind": "file", "params": {"path": "a.md"}}],

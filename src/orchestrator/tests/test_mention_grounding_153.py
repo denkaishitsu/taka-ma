@@ -57,6 +57,15 @@ class _FakeNotifier:
         self.plan_updates.append({"exec_request_id": exec_request_id, "body": body})
 
 
+class _IntentStub:
+    def __init__(self, action="execute"):
+        self.action = action
+
+    def classify(self, history_text, latest_text):
+        return {"action": self.action, "confidence": 1.0, "evidence": latest_text[:10],
+                "origin": "stub", "escalated": False, "fail_closed": False}
+
+
 def _manager(tmp_dir):
     sessions_dir = tempfile.mkdtemp(prefix="sessions-")
     config = {
@@ -84,7 +93,7 @@ def _session_data(mgr, cid="c1"):
 
 
 def _reply(mgr, monkeypatch, reply):
-    monkeypatch.setattr(mgr, "_invoke_llm", lambda history, force, progress=None: {
+    monkeypatch.setattr(mgr, "_invoke_llm", lambda history, progress=None: {
         "ready": False, "summary": None, "reply": reply})
 
 
@@ -103,8 +112,7 @@ def test_awaiting_true_on_plan_presentation_false_on_start(monkeypatch):
     """計画提示（着手/訂正待ち）で true、着手（確定タスク生成）で false になる。"""
     tmp = tempfile.mkdtemp()
     mgr = _manager(tmp)
-    monkeypatch.setattr(mgr, "_invoke_llm", lambda history, force, progress=None: {
-        "ready": True, "summary": "要約", "reply": ""})
+    mgr.intent = _IntentStub("execute")
     monkeypatch.setattr(mgr, "_build_contract", lambda cid, summary, progress=None, force_ready=False: ({
         "directive": None, "constraints": [], "acceptance": [],
         "workspace": None, "needs_repo": False}, {}))
@@ -168,8 +176,7 @@ def test_probe_task_status_answers_with_measured(monkeypatch):
     """probe="task_status" は脳の reply を使わず実測（実レコード）で答える（一次経路）。"""
     tmp = tempfile.mkdtemp()
     mgr = _manager(tmp)
-    monkeypatch.setattr(mgr, "_invoke_llm", lambda history, force, progress=None: {
-        "ready": False, "summary": None, "reply": "作業中です", "probe": "task_status"})
+    mgr.intent = _IntentStub("probe_task")
     mgr.handle_message(_msg("進捗どう？"))
     note = mgr.slack.notes[-1]
     assert "タスクは走っていません" in note
@@ -177,16 +184,17 @@ def test_probe_task_status_answers_with_measured(monkeypatch):
     assert _session_data(mgr)["awaiting_reply"] is True
 
 
-def test_invoke_llm_probe_whitelist(monkeypatch):
-    """probe は許可値（repo_status / task_status）のみ通す。未知の値は None に落とす。"""
+def test_unknown_intent_action_falls_to_chat(monkeypatch):
+    """未知の action（IntentClassifier のスキーマ検証をすり抜けた想定外値）は chat へ倒す
+    （任意動作への接続を許さない安全側。probe 許可値の検証は intent 側スキーマが担う）。"""
     tmp = tempfile.mkdtemp()
     mgr = _manager(tmp)
-    monkeypatch.setattr(conversation, "run_ollama", lambda *a, **k: json.dumps(
-        {"reply": "", "ready": False, "summary": None, "probe": "task_status"}))
-    assert mgr._invoke_llm([{"role": "user", "text": "x"}], force=False)["probe"] == "task_status"
-    monkeypatch.setattr(conversation, "run_ollama", lambda *a, **k: json.dumps(
-        {"reply": "", "ready": False, "summary": None, "probe": "run_command"}))
-    assert mgr._invoke_llm([{"role": "user", "text": "x"}], force=False)["probe"] is None
+    mgr.intent = _IntentStub("run_command")
+    monkeypatch.setattr(mgr, "_invoke_llm",
+                        lambda history, progress=None: {"reply": "承知しました"})
+    _claims(mgr, monkeypatch, False)
+    mgr.handle_message(_msg("x"))
+    assert mgr.slack.notes[-1] == "承知しました"
 
 
 def test_progress_claim_without_tasks_replaced_by_measured(monkeypatch):
@@ -267,8 +275,7 @@ def test_task_status_probe_represents_pending_plan(monkeypatch):
     """probe 経路でも、着手待ちの計画があればボタン付き再提示が付く。無ければ出ない。"""
     tmp = tempfile.mkdtemp()
     mgr = _manager(tmp)
-    monkeypatch.setattr(mgr, "_invoke_llm", lambda history, force, progress=None: {
-        "ready": False, "summary": None, "reply": "", "probe": "task_status"})
+    mgr.intent = _IntentStub("probe_task")
     mgr.handle_message(_msg("進捗どう？"))
     assert mgr.slack.plan_updates == []  # pending なし → 再提示なし
     with open(os.path.join(tmp, "confirm1.json"), "w") as f:
@@ -289,11 +296,10 @@ def test_progress_claim_grounded_via_llm_selector(monkeypatch):
     """
     tmp = tempfile.mkdtemp()
     mgr = _manager(tmp)
+    mgr.intent = _IntentStub("chat")
     outs = [json.dumps({"reply": "現在、基本設計書 `docs/02-basic-design.md` の更新"
                                  "（B1: D4とB2: D6の反映）を実施しています。"
-                                 "完了次第、結果をお伝えします。",
-                        "ready": False, "summary": None, "probe": None}),
-            '{"verdict": "other"}',
+                                 "完了次第、結果をお伝えします。"}),
             '{"claims_progress": true}']
     monkeypatch.setattr(conversation, "run_ollama", lambda *a, **k: outs.pop(0))
     mgr.handle_message(_msg("今の作業状況は？"))

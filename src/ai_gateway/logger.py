@@ -84,6 +84,30 @@ class YaTaLogger:
         with open(self._log_path(), "a") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
+    def log_intent(self, action, confidence, origin, escalated: bool,
+                   fail_closed: bool, first_action=None, mismatch: bool = False,
+                   escalate_reason: str | None = None):
+        """意図判定 1 回分を当日ログに追記する（設計書 §8.4「意図判定の呼び出し」）。
+
+        一次モデル（ya-ta.model）の判定誤り率の一次データ。escalated かつ mismatch=True の
+        行は「一次と二次の判定が食い違った」実測であり、一次モデルの換装判断（§8.4.1）の
+        材料になる。判定ログと同じファイルに kind=intent で混載する。
+        """
+        entry = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "kind": "intent",
+            "action": action,
+            "confidence": confidence,
+            "origin": origin,
+            "escalated": escalated,
+            "fail_closed": fail_closed,
+            "first_action": first_action,
+            "mismatch": mismatch,
+            "escalate_reason": (escalate_reason or "")[:300],
+        }
+        with open(self._log_path(), "a") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
     def log_contract(self, origin, attempts: list[dict],
                      backend: str | None = None, unreachable: bool = False):
         """契約化 1 回分の試行列を当日ログに追記する（設計書 §8.4.1）。

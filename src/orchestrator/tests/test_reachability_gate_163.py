@@ -137,6 +137,15 @@ class _MustNotContract:
         raise AssertionError("不達中に契約化を呼んではならない（§8.4 到達性ゲート）")
 
 
+class _IntentStub:
+    def __init__(self, action="execute"):
+        self.action = action
+
+    def classify(self, history_text, latest_text):
+        return {"action": self.action, "confidence": 1.0, "evidence": latest_text[:10],
+                "origin": "stub", "escalated": False, "fail_closed": False}
+
+
 def _manager(preflight, llm_result):
     tmp = tempfile.mkdtemp(prefix="conv-")
     config = {
@@ -151,9 +160,10 @@ def _manager(preflight, llm_result):
         "contract": {"intents_dir": tempfile.mkdtemp(prefix="intents-")},
     }
     mgr = ConversationManager(config, _Notifier(), task_dir=tmp, preflight=preflight)
-    mgr._invoke_llm = lambda *a, **k: dict(llm_result)
+    # 判定は IntentClassifier。旧 llm_result の ready から intent を組み立てる
+    mgr.intent = _IntentStub("execute" if llm_result.get("ready") else "chat")
+    mgr._invoke_llm = lambda *a, **k: {"reply": llm_result.get("reply", "")}
     mgr._claims_check = lambda *a, **k: {"progress": False, "state": False}
-    mgr._recheck_detail_question = lambda *a, **k: "other"
     mgr.contractor = _MustNotContract()
     return mgr
 

@@ -85,15 +85,15 @@ def test_llm_prompt_contains_head_and_marker(tmp_path, monkeypatch):
 
     def fake_run(model, prompt, **kw):
         prompts.append(prompt)
-        return json.dumps({"reply": "了解", "ready": False})
+        return json.dumps({"reply": "了解"})
 
     monkeypatch.setattr(conv_mod, "run_ollama", fake_run)
     m = make_manager(tmp_path, head=2, tail=4)
     for i in range(10):
         m.handle_message(msg(f"発話{i}"))
     # run_ollama には会話プロンプト以外（進行主張の選別・§8.3 安全網）も流れるため、
-    # 会話プロンプト（判定指示を含むもの）だけを対象に取る
-    last = [p for p in prompts if "毎ターン行う判定" in p][-1]
+    # 会話プロンプト（converse.md 由来のもの）だけを対象に取る（判定指示は intent.md にある）
+    last = [p for p in prompts if "返信文の生成だけ" in p][-1]
     assert "発話0" in last, "冒頭プロンプトが LLM 入力に残っていない（F3 再発）"
     assert "中略" in last, "省略が明示されていない"
     assert "発話4" not in last, "中間ターンが丸められていない"
@@ -114,7 +114,7 @@ def test_passive_appends_without_llm_or_reply(tmp_path, monkeypatch):
 
     def fake_run(*a, **kw):
         calls["n"] += 1
-        return json.dumps({"reply": "了解", "ready": False})
+        return json.dumps({"reply": "了解"})
 
     monkeypatch.setattr(conv_mod, "run_ollama", fake_run)
     m = make_manager(tmp_path)

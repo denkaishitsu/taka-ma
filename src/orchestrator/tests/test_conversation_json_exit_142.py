@@ -52,6 +52,15 @@ def msg(text, cid="T1:C1:111.222"):
             "channel_id": "C1", "team_id": "T1", "thread_ts": "111.222"}
 
 
+class _IntentStub:
+    def __init__(self, action="execute"):
+        self.action = action
+
+    def classify(self, history_text, latest_text):
+        return {"action": self.action, "confidence": 1.0, "evidence": latest_text[:10],
+                "origin": "stub", "escalated": False, "fail_closed": False}
+
+
 def _run_with_stdout(tmp_path, monkeypatch, stdout):
     """脳 LLM の生 stdout を固定して 1 発話を処理し、マネージャを返す。"""
     monkeypatch.setattr(conv_mod, "run_ollama", lambda *a, **kw: stdout)
@@ -125,8 +134,10 @@ def test_valid_contract_json_unchanged(tmp_path, monkeypatch):
     assert m.slack.sent[-1] == "どの repo ですか？"
 
 
-def test_valid_ready_summary_still_presents_confirm(tmp_path, monkeypatch):
-    """正常な ready=true + summary は従来どおり着手確認を提示する（無退行）。"""
-    raw = json.dumps({"reply": "", "ready": True, "summary": "X を実装する"})
-    m = _run_with_stdout(tmp_path, monkeypatch, raw)
+def test_execute_intent_still_presents_confirm(tmp_path, monkeypatch):
+    """execute 判定（判定は IntentClassifier）は従来どおり着手確認を提示する。"""
+    monkeypatch.setattr(conv_mod, "run_ollama", lambda *a, **kw: "{}")
+    m = make_manager(tmp_path)
+    m.intent = _IntentStub("execute")
+    m.handle_message(msg("X を実装する"))
     assert "exec_confirm" in m.slack.sent

@@ -118,6 +118,33 @@ grep 'Propagating selected model override' /tmp/a.log   # → label="Gemini 3.1 
 | [停止・再起動](../operations/runbook-shutdown-restart.md) | Mac mini / MBP の graceful な停止・再起動と、再起動後の自動復帰前提・稼働確認 |
 | [u-zu（Slack Bot）運用情報](../operations/u-zu/slack-bot.md) | サービス管理・アクセス制御・タスク投入操作 |
 
+### コード変更後の再配備（配備対象は変更ファイルから決める）
+
+初期構築は 01〜08 を順に流すが、**コード変更後の再配備は「変更されたディレクトリに対応する deploy だけを、依存順に」流す**。配備対象を記憶や過去の手順から選んではならない。実際に変更されたファイルから機械的に導く。
+
+```bash
+git diff --name-only <前回配備コミット>..HEAD | cut -d/ -f1-2 | sort -u
+```
+
+| 変更されたディレクトリ | 流す deploy | 配備先 |
+|---|---|---|
+| `src/ai_gateway/` | `pyinfra/deploys/ai_gateway.py` | `/opt/taka-ma/ya-ta/ai_gateway/` |
+| `src/orchestrator/` | `pyinfra/deploys/orchestrator.py` | `/opt/taka-ma/sa-ru/orchestrator/` |
+| `src/slack_bot/` | `pyinfra/deploys/slack_bot.py` | `/opt/taka-ma/u-zu/slack_bot/` |
+| `src/sentinel/` | `pyinfra/deploys/sentinel.py` | `/opt/taka-ma/qu-e/sentinel/`（MBP） |
+| `src/approval-pipeline/` | `pyinfra/deploys/approval_pipeline.py` | `/opt/taka-ma/sa-ru/approval-pipeline/` |
+
+**依存順（厳守）**: ya-ta（`ai_gateway`）→ sa-ru（`orchestrator`）。sa-ru は ya-ta をライブラリとして import するため、ya-ta を先に置かないと sa-ru が `ModuleNotFoundError` で起動できない。`ai_gateway.py` の deploy は ya-ta 自身しか再起動しないので、**sa-ru へ反映するには orchestrator.py を必ず後段で流す**（この launchd 再起動が sa-ru の反映点）。
+
+**配備後の確認（省略しない）**:
+
+```bash
+launchctl list | grep taka-ma          # PID が数字であること（"-" は起動失敗）
+tail -5 /opt/taka-ma/logs/sa-ru-error.log
+```
+
+> 2026-09-07 実障害: ai_gateway と orchestrator の両方に跨る変更で orchestrator だけを配備し、sa-ru が `ModuleNotFoundError: No module named 'ai_gateway.intent_classifier'` で停止した。原因は配備対象を差分から導かず手順書のコマンドをそのまま打ったこと。
+
 ## アンインストール方法と仕組み
 
 本システムは pyinfra による冪等デプロイで構築される（[01](01-common-base.md)〜[08](08-approval-pipeline.md)）。構築の各ステップ（**pyinfra の自動操作・ユーザーの手動操作の両方**）は、完了ごとに **インストール・マニフェスト** へ構造的に記録される。アンインストールはこのマニフェストを **逆順（LIFO）で再生** して撤去する。**常駐サービスの停止を最優先** に行う（launchd の `KeepAlive` で自動再起動するため、プロセスを kill するだけでは復活する）。

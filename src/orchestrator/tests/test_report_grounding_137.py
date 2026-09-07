@@ -342,35 +342,33 @@ def test_answer_probe_reports_missing_workspace_as_fact(tmp_path):
     assert "実測確認を実行できません" in cm.slack.sent[0]
 
 
+class _IntentStub:
+    def __init__(self, action="execute"):
+        self.action = action
+
+    def classify(self, history_text, latest_text):
+        return {"action": self.action, "confidence": 1.0, "evidence": latest_text[:10],
+                "origin": "stub", "escalated": False, "fail_closed": False}
+
+
 def test_handle_message_routes_probe_instead_of_llm_reply(tmp_path):
     # F2 の再現: 脳が「今すぐ実行し結果のみ報告します」と宣言しても、それは送らず実出力を返す
     responses = {"remote -v": (0, "origin\tgit@github.com:u/r.git (push)"),
                  "abbrev-ref": (0, "main"), "ls -la": (0, "REQ.md")}
     cm = _cm(tmp_path, types.SimpleNamespace(run_ssh_probe=_probe_factory(responses)))
     cm._last_workspace[_MSG["conversation_id"]] = "/opt/taka-ma/work/t1"
-    cm._invoke_llm = lambda history, force, progress=None: {
-        "reply": "今すぐ git remote -v を実行し結果のみ報告します", "ready": False,
-        "summary": None, "probe": "repo_status"}
+    cm.intent = _IntentStub("probe_repo")
     cm.handle_message(dict(_MSG))
     assert len(cm.slack.sent) == 1
     assert "git@github.com" in cm.slack.sent[0]
     assert "報告します" not in cm.slack.sent[0]
 
 
-def test_invoke_llm_accepts_only_allowlisted_probe(tmp_path, monkeypatch):
-    import orchestrator.conversation as conv_mod
-    cm = _cm(tmp_path)
-    cm.model = "m"
-    cm.ollama_host = "h"
-    cm.timeout = 5
-    cm.think = None
-    cm._prompt_template = "{history}|{message}"
-    monkeypatch.setattr(conv_mod, "run_ollama", lambda *a, **k: json.dumps(
-        {"reply": "x", "ready": False, "summary": None, "probe": "repo_status"}))
-    assert cm._invoke_llm([{"role": "user", "text": "q"}], force=False)["probe"] == "repo_status"
-    monkeypatch.setattr(conv_mod, "run_ollama", lambda *a, **k: json.dumps(
-        {"reply": "x", "ready": False, "summary": None, "probe": "rm -rf /"}))
-    assert cm._invoke_llm([{"role": "user", "text": "q"}], force=False)["probe"] is None
+def test_probe_commands_are_code_fixed(tmp_path):
+    """probe で実行されるコマンドはコード固定列挙のみ（判定の移管後も不変）。判定値の検証は
+    IntentClassifier のスキーマ検証（test_intent_classifier_166）が担う。"""
+    from orchestrator.conversation import ConversationManager
+    assert all(cmd.startswith(("git ", "ls ")) for cmd in ConversationManager._PROBE_COMMANDS)
 
 
 def test_last_workspace_persists_across_restart(tmp_path):

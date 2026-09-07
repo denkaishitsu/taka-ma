@@ -205,13 +205,11 @@ def test_invoke_llm_rejects_example_echo(tmp_path, monkeypatch):
     """返信にプロンプト例文が逐語出現したら棄却する（2026-08-30 23:50 実測の是正）。"""
     import orchestrator.conversation as conv_mod
     cm = _echo_cm(tmp_path)
+    cm._prompt_examples = ("README の冒頭にインストール手順の節を追加して",)
     monkeypatch.setattr(conv_mod, "run_ollama", lambda *a, **k: json.dumps(
-        {"reply": "README の冒頭にインストール手順の節を追加して",
-         "ready": False, "summary": None, "probe": None}))
-    out = cm._invoke_llm([{"role": "user", "text": "残りの mermaid を直してコミットしろ"}],
-                         force=False)
+        {"reply": "README の冒頭にインストール手順の節を追加して"}))
+    out = cm._invoke_llm([{"role": "user", "text": "残りの mermaid を直してコミットしろ"}])
     assert out["error"] is True
-    assert out["ready"] is False
     assert "README" not in out["reply"]  # エコーを人へ見せない
 
 
@@ -219,14 +217,12 @@ def test_invoke_llm_allows_echo_when_user_typed_it(tmp_path, monkeypatch):
     """ユーザー自身が例文と同じ文を打った場合の復唱は正当（誤棄却しない）。"""
     import orchestrator.conversation as conv_mod
     cm = _echo_cm(tmp_path)
+    cm._prompt_examples = ("README の冒頭にインストール手順の節を追加して",)
     monkeypatch.setattr(conv_mod, "run_ollama", lambda *a, **k: json.dumps(
-        {"reply": "「README の冒頭にインストール手順の節を追加して」ですね、着手します",
-         "ready": True, "summary": "README 追記", "probe": None}))
+        {"reply": "「README の冒頭にインストール手順の節を追加して」ですね、承知しました"}))
     out = cm._invoke_llm([{"role": "user",
-                           "text": "README の冒頭にインストール手順の節を追加して"}],
-                         force=False)
+                           "text": "README の冒頭にインストール手順の節を追加して"}])
     assert "error" not in out
-    assert out["ready"] is True
 
 
 # ── file_min_bytes（§8.10f 生成依頼の最小達成検査） ──

@@ -119,6 +119,15 @@ def test_present_summary_without_model_marker_leaves_model_none():
     assert task["_model"] is None
 
 
+class _IntentStub:
+    def __init__(self, action="execute"):
+        self.action = action
+
+    def classify(self, history_text, latest_text):
+        return {"action": self.action, "confidence": 1.0, "evidence": latest_text[:10],
+                "origin": "stub", "escalated": False, "fail_closed": False}
+
+
 def test_handle_message_invalid_model_notifies_and_skips_confirm(monkeypatch):
     """未登録モデル指定は着手確認を提示せず、エラーを通知して止める。"""
     tmp = tempfile.mkdtemp()
@@ -126,9 +135,7 @@ def test_handle_message_invalid_model_notifies_and_skips_confirm(monkeypatch):
     msg = {"conversation_id": "c3", "text": "READMEを直して :gpt5", "user_id": "U1",
            "team_id": "T1", "channel_id": "C1", "thread_ts": "333.444"}
 
-    monkeypatch.setattr(mgr, "_invoke_llm", lambda history, force, progress=None: {
-        "ready": True, "summary": "READMEの誤字を修正する", "reply": "",
-    })
+    mgr.intent = _IntentStub("execute")
 
     mgr.handle_message(msg)
 
