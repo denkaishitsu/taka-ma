@@ -31,6 +31,14 @@ ACCEPTANCE_KINDS = {
     # 実測する。2026-08-28 E2E 実測: この語彙が無く、マージを含む依頼の完了条件が
     # commit/push しか表せなかった（脳が操作名 merge_ff で代用しようとする誘因にもなった)
     "branch_merged": {"required": {"source", "target"}, "optional": set()},
+    # 回答型依頼（教えて・確認して・調べて）の達成検査（§8.10f 依頼の一生・工程 (5)）。
+    # (1) worker の回答本文が min_chars 以上、(2) 完了通知の送信成功が記録されている
+    # （届けの検証・工程 (4)）、(3) 作業ツリーが tree_baseline（着手確認の組立時に
+    # sa-ru が実測する git status --porcelain の内容ハッシュ・workspace 無しは "-"）から
+    # 不変 — 回答だけを頼まれた依頼で頼まれていない成果物を残さない（2026-09-07 実測:
+    # 「一覧を教えて」への 36KB 文書の勝手な作成の是正）。人の明示からのみ立てる
+    # （契約化脳による依頼型の推測付与は禁止・§8.10f 完了条件の必須化）
+    "answered": {"required": set(), "optional": {"min_chars", "tree_baseline"}},
 }
 
 # リポジトリ系の検査（§8.10f needs_repo の機械補助: これを含む契約は実リポジトリを要する）
@@ -41,14 +49,16 @@ REPO_KINDS = {"pushed", "remote_file", "head_touches", "diff_limit", "branch_mer
 # 「完了条件は既に満たされています」の全 PASS 停止は、状態遷移型検査を 1 つ以上含む
 # 契約に限る（2026-08-29 実障害: 不具合報告への実行拒否 — の是正）
 EXISTENCE_KINDS = {"file", "remote_file"}
-TRANSITION_KINDS = {"pushed", "head_touches", "diff_limit", "branch_merged", "file_changed"}
+# answered は遷移型: 回答本文は実行前には存在せず、着手前から PASS することはない
+TRANSITION_KINDS = {"pushed", "head_touches", "diff_limit", "branch_merged",
+                    "file_changed", "answered"}
 
 # 契約 target_paths の上限（§8.10f。列挙の暴走で契約を肥大させない —
 # 既定 file 検査の上限 _MAX_DEFAULT_FILE_CHECKS と同値）
 MAX_TARGET_PATHS = 5
 
 # 整数パラメータ（検査コマンド文字列には乗せず比較にのみ使う）。上限は暴走値の拒否
-_INT_PARAMS = {"max_lines", "min_bytes"}
+_INT_PARAMS = {"max_lines", "min_bytes", "min_chars"}
 _MAX_INT_PARAM = 100000
 
 # 環境改変コマンドの既定 deny（§8.10f 事前予防）。worker の勝手な環境改変（push 不能への

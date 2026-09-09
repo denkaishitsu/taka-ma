@@ -266,11 +266,15 @@ def test_intent_lifecycle_open_until_pass():
     assert intent_store.list_open(d, "c1") == []
 
 
-def test_intent_without_acceptance_is_closed_at_creation():
+def test_intent_without_acceptance_stays_open_at_creation():
+    """acceptance 空でも生成時に achieved で閉じない（§8.10f 工程 (5)。
+
+    無検査の達成扱いの廃止 — 2026-09-07 実測: 空 acceptance の依頼が生成直後に
+    achieved で記録され、実行結果を一度も検査せずに閉じられた。"""
     d = tempfile.mkdtemp(prefix="intents-")
     intent_store.create(d, task_id="t-2", conversation_id="c1", summary="S",
                         acceptance=[], workspace="/repo")
-    assert intent_store.load(d, "t-2")["goal_status"] == intent_store.GOAL_ACHIEVED
+    assert intent_store.load(d, "t-2")["goal_status"] == intent_store.GOAL_OPEN
 
 
 # ── ConversationManager（契約化パスのゲート群） ──

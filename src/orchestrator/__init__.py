@@ -165,6 +165,22 @@ DEFAULT_DISCRETION_NOTE = (
     "作業を妨げる前提の欠落（対象の不在等）がある場合のみ、作業せず理由を報告して"
     "ください）")
 
+# 回答型依頼（契約の acceptance に answered を含む）用の既定裁量（§8.10f 配布規則）。
+# 「成果物を作成してください」の無条件付与は、回答だけを頼まれた依頼で worker に
+# 頼まれていないファイル作成を促した（2026-09-07 実測: 36KB 文書の勝手な作成）。
+# どちらを付けるかは契約の acceptance からの決定的分岐（LLM 判定なし）。指示は
+# 遵守頼みで破られ得るため、answered 検査の作業ツリー不変（出口実測）と二層にする
+# worker ホスト上のフック settings 置き場（依頼者の workspace の外・§8.10f 配布規則。
+# workspace 直下に置くと依頼者のリポジトリを汚し、answered の作業ツリー検査を
+# ハーネス自身が誤検知させる — 2026-09-09 実機 E2E 実測）
+_HOOK_SETTINGS_DIR = "/tmp/taka-ma-hooks"
+
+ANSWER_DISCRETION_NOTE = (
+    "\n\n（この実行は非対話です。確認の質問への回答は届きません。"
+    "成果物は回答の本文です。workspace のファイル作成・変更・コミットを行わないで"
+    "ください。回答のみを報告してください。作業を妨げる前提の欠落（対象の不在等）が"
+    "ある場合のみ、作業せず理由を報告してください）")
+
 
 def _escalate_reason(output: str) -> str | None:
     """worker 出力に ESCALATE 自己申告があれば理由文字列を返す（無ければ None）。
@@ -1231,7 +1247,8 @@ class Orchestrator:
                 # SSH の同期実行を含むため to_thread でループから切り離す（§10.7）。
                 all_outputs = "\n".join(str(v) for v in results.values())
                 if task.get("acceptance"):
-                    grounding = await asyncio.to_thread(self._ground_acceptance, task)
+                    grounding = await asyncio.to_thread(
+                        self._ground_acceptance, task, all_outputs)
                 else:
                     grounding = await asyncio.to_thread(
                         self._ground_result, task, all_outputs)
@@ -1262,11 +1279,19 @@ class Orchestrator:
                 else:
                     header = (f"⚠ タスク未完了: {grounding.note}"
                               f"（結果ファイル: {result_path}）。worker の報告:")
-                await self._notify_chunked(header, final_result,
-                                           channel, team_id=team_id, thread_ts=thread_ts)
+                delivered = await self._notify_chunked(
+                    header, final_result,
+                    channel, team_id=team_id, thread_ts=thread_ts)
                 await self._notify_chunked("実測確認（sa-ru がコマンド実行で裏取り）:",
                                            grounding.text,
                                            channel, team_id=team_id, thread_ts=thread_ts)
+                # 届けの検証（§8.10f 工程 (4)）: 完了通知の送信成否を終端記録へ刻む。
+                # answered（回答型）は届いていなければ達成にしない（下の _finalize_goal）
+                try:
+                    await asyncio.to_thread(
+                        self._record_delivery, result_path, bool(delivered))
+                except Exception:
+                    logger.exception("届けの記録に失敗: %s", result_path)
                 # 完了結果を発生元の会話セッションへ還流する（§8.9「会話への還流」）。
                 # グラウンディング判定を先頭に併記し、worker の自己申告を会話脳が事実として
                 # 引き継がないようにする。ファイル I/O とロック取得を含むため to_thread で
@@ -1277,7 +1302,8 @@ class Orchestrator:
                     grounding.workspace)
                 # 依頼の寿命の更新（§8.10f）: 当該 goal の決着・失敗原因の会話記録・
                 # 同一会話の open 目標の再検査。SSH を含むため to_thread（§10.7）
-                await asyncio.to_thread(self._finalize_goal, task, grounding)
+                await asyncio.to_thread(self._finalize_goal, task, grounding,
+                                        delivered=bool(delivered))
             else:
                 cause = self._chain_failure_cause(futures)
                 # 失敗の実測証跡は終端記録（正本）と通知の両方へ載せる（§8.10g。
@@ -1347,11 +1373,13 @@ class Orchestrator:
             return
         await asyncio.to_thread(record, task, cause)
 
-    def _ground_acceptance(self, task: dict) -> GroundingReport:
+    def _ground_acceptance(self, task: dict, result_text: str = "") -> GroundingReport:
         """承認された完了条件（§8.10f acceptance）を実世界に対して検査する（同期・to_thread で呼ぶ）。
 
         検証自体の想定外の失敗で完了通知は止めないが fail-open にはしない（_ground_result と
         同じ規律）: 検査を実行できなかったことを ok=False・原因コード付きで返す。
+
+        result_text: worker の回答本文（answered 検査 (1) の実体・§8.10f）。
         """
         workspace = None
         try:
@@ -1359,7 +1387,9 @@ class Orchestrator:
             verifier = GroundingVerifier(self.process_mgr.run_ssh_probe)
             # 契約に branch があれば当該 ref を対象に測る（§8.10f 測定の ref 化）
             report = verifier.verify_acceptance(workspace, task.get("acceptance") or [],
-                                                default_branch=task.get("branch"))
+                                                default_branch=task.get("branch"),
+                                                answered_ctx={
+                                                    "result_chars": len(result_text or "")})
             report.workspace = workspace
             return report
         except Exception as e:
@@ -1371,14 +1401,45 @@ class Orchestrator:
                 summary=f"（完了条件の検査の結果、未達: {note}）",
                 workspace=workspace, cause="grounding_unverified")
 
-    def _finalize_goal(self, task: dict, grounding: GroundingReport):
+    def _hook_settings_path(self, instance_id: str) -> str:
+        """worker ホスト上のフック settings の一時パス（§8.10f 配布規則）。
+
+        依頼者の workspace の外に置く。instance_id はコード生成の uuid + step + モデル名
+        （安全文字のみ）で、SSH コマンド文字列に乗せられる。
+        """
+        return f"{_HOOK_SETTINGS_DIR}/{instance_id}.json"
+
+    def _record_delivery(self, result_path: str, delivered: bool):
+        """完了通知の送信成否を終端記録へ刻む（届けの検証・§8.10f 工程 (4)・同期）。
+
+        記録は事実の追記のみ（status は変えない）。answered の achieved 判定は
+        _finalize_goal が delivered 引数で行い、ここは後から参照できる証跡を残す。
+        """
+        with open(result_path) as f:
+            record = json.load(f)
+        record["delivery_ok"] = delivered
+        atomic_write_json(result_path, record)
+
+    def _finalize_goal(self, task: dict, grounding: GroundingReport,
+                       delivered: bool = True):
         """依頼の寿命の更新（§8.10f・同期・to_thread で呼ぶ）。
 
         (a) 失敗原因コードを会話セッションへ記録（反復停止判定の材料）、(b) 当該 intent の
         goal_status を検査結果で更新（PASS のときだけ achieved。宣言では閉じない）、
         (c) 同一会話の open 目標を世界に対して再検査し、満たされたものだけ閉じる（後続
         タスクによる達成の機械検出）。intent 側の失敗は実行結果へ波及させない。
+
+        delivered: 完了通知の送信成否（届けの検証・§8.10f 工程 (4)）。acceptance に
+        answered（回答型）を含む依頼は、回答が届いていなければ検査 PASS でも
+        achieved にしない（回答が成果物である以上、届かない達成は無い）。
         """
+        answer_type = any(a.get("kind") == "answered"
+                          for a in (task.get("acceptance") or []))
+        if answer_type and not delivered:
+            grounding.ok = False
+            grounding.note = (((grounding.note + "・") if grounding.note else "")
+                              + "回答の送信が失敗（届いていない）")
+            grounding.cause = grounding.cause or "acceptance_failed:answered"
         cause = None if grounding.ok else (grounding.cause or "grounding_unverified")
         record = getattr(getattr(self, "conversation", None), "record_task_outcome", None)
         if record is not None:
@@ -1553,7 +1614,7 @@ class Orchestrator:
         別スレッド（to_thread）へ逃がして await する。イベントループ外（watchdog スレッド等）は
         従来どおり self.slack.notify を直接呼んでよい。
         """
-        await asyncio.to_thread(
+        return await asyncio.to_thread(
             self.slack.notify, text, channel, team_id=team_id, thread_ts=thread_ts)
 
     async def _run_with_heartbeat(self, label, func, *args,
@@ -1600,14 +1661,23 @@ class Orchestrator:
                   for i in range(0, len(body), self.NOTIFY_CHUNK_CHARS)] or [""]
         truncated = len(chunks) > self.NOTIFY_MAX_CHUNKS
         chunks = chunks[:self.NOTIFY_MAX_CHUNKS]
+        delivered = True
         for i, chunk in enumerate(chunks):
             prefix = header + "\n" if i == 0 else f"（続き {i + 1}/{len(chunks)}）\n"
-            await self._notify(f"{prefix}```{chunk}```", channel,
-                               team_id=team_id, thread_ts=thread_ts)
+            ok = await self._notify(f"{prefix}```{chunk}```", channel,
+                                    team_id=team_id, thread_ts=thread_ts)
+            if ok is False:
+                # 届けの検証（§8.10f 工程 (4)）: 送信失敗（明示 False）のチャンクは
+                # 1 回だけ再送。なお失敗なら delivered=False（answered の achieved 判定に
+                # 使う）。None（成否を返さない旧スタブ・別実装）は失敗と断定しない
+                ok = await self._notify(f"{prefix}```{chunk}```", channel,
+                                        team_id=team_id, thread_ts=thread_ts)
+            delivered = delivered and (ok is not False)
         if truncated:
             await self._notify(
                 "（本文が長いため以降の送信を省略しました。全文は上記の結果ファイルを参照してください）",
                 channel, team_id=team_id, thread_ts=thread_ts)
+        return delivered
 
     async def _notify_failure(self, task, subtasks, results, failed_steps, channel,
                               team_id=None, thread_ts=None, result_path=None):
@@ -1707,8 +1777,13 @@ class Orchestrator:
             if constraints_block:
                 command = constraints_block + command
             # 既定裁量の定型（§8.10f 配布規則）: runbook はこの地点より前で return 済みの
-            # ため、付与対象は agent / inline の全 worker step に構造的に限られる
-            command = command + DEFAULT_DISCRETION_NOTE
+            # ため、付与対象は agent / inline の全 worker step に構造的に限られる。
+            # 文面は契約の acceptance から決定的に分岐（回答型 = answered を含む依頼は
+            # 「回答が成果物・ファイルを作らない」。LLM 判定なし・§8.10f 依頼の一生 工程 (3)）
+            answer_type = any(a.get("kind") == "answered"
+                              for a in (task.get("acceptance") or []))
+            command = command + (ANSWER_DISCRETION_NOTE if answer_type
+                                 else DEFAULT_DISCRETION_NOTE)
 
             await self._notify(f"  サブタスク {step}: {_axis_label(subtask)}", channel,
                               team_id=task.get("team_id"), thread_ts=task.get("thread_ts"))
@@ -2290,19 +2365,31 @@ class Orchestrator:
             task_id=task_id, team_id=team_id, channel=channel, thread_ts=thread_ts,
             instance_id=instance_id, timeout_sec=hcfg["hook_timeout_sec"],
             python_bin=hcfg["python_bin"])
-        # settings を MBP 上の workspace に書き込む（_push_task_context と同じ ssh の cat > 方式）。
-        # claude -p --settings がこのファイルを読んでフックを有効化する。
-        settings_path = f"{workspace}/.taka-hook-settings.json"
+        # settings は worker ホストの一時ディレクトリへ書く（依頼者の workspace には
+        # 置かない・§8.10f 配布規則）。旧来は workspace 直下に置き去りにしており、
+        # (1) 依頼者のリポジトリを毎実行汚す（2026-09-08 に人手で除去）、
+        # (2) answered 検査 (3)（作業ツリー不変）をハーネス自身の生成物が誤検知させる
+        # （2026-09-09 実機 E2E で実測: worker はファイルを作らなかったのに未達判定）
+        # の 2 つの実害を確認した。claude -p --settings は絶対パスで足りる
+        settings_path = self._hook_settings_path(instance_id)
         await asyncio.to_thread(
             self.process_mgr.run_ssh_command,
-            f"mkdir -p {workspace} && cat > {settings_path}",
+            f"mkdir -p {_HOOK_SETTINGS_DIR} && mkdir -p {workspace} && cat > {settings_path}",
             stdin_text=json.dumps(settings, ensure_ascii=False))
         # SSH 越しに claude -p を起動し、stream-json を解析して最終出力を得る。
         runner = WorkerHeadlessRunner(
             instance_id, command=cli_command, model_flag=model_flag,
             ssh_host=self._mbp_host, cwd=workspace, hook_settings_path=settings_path,
             stream_limit_bytes=hcfg["stream_limit_bytes"])
-        result = await runner.run(command, timeout=hcfg["run_timeout_sec"])
+        try:
+            result = await runner.run(command, timeout=hcfg["run_timeout_sec"])
+        finally:
+            # 一時 settings の後始末（失敗しても実行結果へ波及させない）
+            try:
+                await asyncio.to_thread(
+                    self.process_mgr.run_ssh_command, f"rm -f {settings_path}")
+            except Exception:
+                logger.warning("フック settings の削除に失敗（残置）: %s", settings_path)
         # 実行された Bash コマンドを遵守照合（§8.10f）用に記録する。タスク終端
         # （_execute_chain の finally）で必ず破棄されるため肥大しない
         commands = getattr(result, "commands", None)  # 偽 result（テスト）は持たないことがある

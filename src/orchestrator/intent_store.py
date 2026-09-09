@@ -35,9 +35,9 @@ def create(intents_dir: str, *, task_id: str, conversation_id: str | None,
            branch: str | None = None, user_id: str = "") -> None:
     """確定タスク生成と同時に intent レコードを作る（§8.10e。初期要件は承認済み確定要約 1 件）。
 
-    acceptance が空の依頼は検査で閉じる根拠が無いため、goal_status を持つ意味がない —
-    それでもレコードは作る（要件の記録は完了条件の有無と独立）。goal_status は
-    acceptance が有るときのみ open、無ければ achieved（検査対象なし＝終端で閉じる従来動作）。
+    goal_status は常に open で作る（§8.10f 依頼の一生・工程 (5): 検査 PASS まで閉じない。
+    acceptance 空の無検査 achieved は廃止 — 完了条件の必須化により空契約は成立せず、
+    到達した場合も open のまま構成不備として顕在化させる）。
     """
     path = _path(intents_dir, task_id)
     if path is None:
@@ -55,7 +55,11 @@ def create(intents_dir: str, *, task_id: str, conversation_id: str | None,
         "acceptance": acceptance or [],
         "workspace": workspace,   # 再検査（後続タスク完了時の open 目標の再評価）の対象
         "branch": branch,         # 再検査の対象 ref（§8.10f 測定の ref 化。None=HEAD）
-        "goal_status": GOAL_OPEN if acceptance else GOAL_ACHIEVED,
+        # acceptance 空を無検査で achieved にしない（§8.10e / §8.10f 依頼の一生・工程 (5)。
+        # 完了条件の必須化により空 acceptance の契約は成立しないため本来到達しないが、
+        # 到達した場合も open のまま残して構成不備を顕在化させる — 2026-09-07 実測:
+        # 空 acceptance の依頼が生成直後に achieved で記録され、無検査で閉じられた）
+        "goal_status": GOAL_OPEN,
         "created_at": now,
         "updated_at": now,
     })

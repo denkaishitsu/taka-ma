@@ -205,7 +205,8 @@ class GroundingVerifier:
                                cause=cause)
 
     def verify_acceptance(self, workspace: str, acceptance: list[dict],
-                          default_branch: str | None = None) -> GroundingReport:
+                          default_branch: str | None = None,
+                          answered_ctx: dict | None = None) -> GroundingReport:
         """承認された完了条件（§8.10f `acceptance`）を実世界に対して検査する。
 
         検査カタログ（pushed / remote_file / file / head_touches）のコマンド組立はここ
@@ -216,6 +217,13 @@ class GroundingVerifier:
         default_branch: 契約の `branch`（§8.10f 測定の ref 化）。branch パラメータを取る
         検査（pushed / file）の省略時既定値になり、全ての実測が契約の指定 ref を対象に
         する（checkout 中のブランチではなく）。None は従来動作（HEAD / 作業ツリー）。
+
+        answered_ctx: `answered` 検査（回答型依頼・§8.10f）の文脈。
+        {"result_chars": worker 回答本文の文字数}。answered を含む acceptance で
+        None のとき（回答本文へ到達できない再検査経路等）は answered の (1) を
+        判定不能 = FAIL に倒す（fail-closed）。(2) 送信成否は完了通知の後にしか
+        確定しないため、ここでは判定せず呼び出し側（届けの検証）が achieved 判定に
+        含める。(3) 作業ツリー不変は tree_baseline と現状の実測で判定する。
 
         全 kind PASS のときのみ ok=True。「完了」の語は ok=True のときにしか使えない
         （§8.10f。判定は検査コマンドの rc・実出力のみから機械導出する）。
@@ -254,7 +262,7 @@ class GroundingVerifier:
             # 安全文字の文字列のみ（SSH コマンドに乗るため・fail-closed）
             bad = [v for k, v in params.items()
                    if (not (isinstance(v, int) and not isinstance(v, bool) and v > 0)
-                       if k in ("max_lines", "min_bytes")
+                       if k in ("max_lines", "min_bytes", "min_chars")
                        else (not isinstance(v, str) or not _ACCEPT_PARAM_RE.match(v)
                              or ".." in v.split("/")))]
             if bad:
@@ -432,6 +440,37 @@ class GroundingVerifier:
                         f"branch_merged 未達（{params['source']} は {params['target']} に"
                         "取り込まれていない）")
                     causes.append("acceptance_failed:branch_merged")
+
+            elif kind == "answered":
+                # 回答型依頼の達成検査（§8.10f）。(1) 回答本文の実在と最低文字数、
+                # (3) 作業ツリー不変（頼まれていない成果物を残していない）。
+                # (2) 送信成否は完了通知の後にしか確定しないため、呼び出し側の
+                # 届けの検証（achieved 判定）が担う — ここでは判定しない
+                min_chars = params.get("min_chars") or 1
+                chars = (answered_ctx or {}).get("result_chars")
+                if chars is None:
+                    problems.append("answered 判定不能（回答本文へ到達できない）")
+                    causes.append("acceptance_failed:answered")
+                elif chars < min_chars:
+                    problems.append(
+                        f"answered 未達（回答本文 {chars} 字 < 最低 {min_chars} 字）")
+                    causes.append("acceptance_failed:answered")
+                else:
+                    lines.append(f"$ (回答本文の実在) {chars} 字 >= {min_chars} 字 (PASS)")
+                baseline = params.get("tree_baseline")
+                if baseline and baseline != "-":
+                    rc, out = self._probe(
+                        lines, f"git -C {ws} status --porcelain | shasum -a 256")
+                    current = (out or "").split()[0] if out else ""
+                    if rc != 0 or not current:
+                        problems.append("answered 未達（作業ツリー状態を実測できない）")
+                        causes.append("acceptance_failed:answered")
+                    elif current != baseline:
+                        problems.append(
+                            "answered 未達（作業ツリーが着手時から変化 — 回答型依頼で"
+                            "頼まれていない成果物が作られた可能性）")
+                        causes.append("acceptance_failed:answered")
+                lines.append("（送信成否は完了通知後に記録し achieved 判定に含める・届けの検証）")
 
             else:
                 problems.append(f"未知の検査 kind: {kind}")

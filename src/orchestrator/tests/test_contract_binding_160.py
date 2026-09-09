@@ -296,7 +296,8 @@ def test_build_contract_marker_overrides_brain_branch():
     """`ブランチ:` マーカーの決定的抽出は契約化脳の提案より優先される（§8.10f）。"""
     mgr = _manager(tempfile.mkdtemp())
     mgr._append_turn("c1", "user", "ブランチ: feature/design-implementation で直せ")
-    mgr.contractor = _FakeContractor(_raw())
+    mgr.contractor = _FakeContractor(
+        _raw(acceptance=[{"kind": "pushed", "params": {}}]))
     contract, _ = mgr._build_contract("c1", "修正する")
     assert contract["branch"] == "feature/design-implementation"
 

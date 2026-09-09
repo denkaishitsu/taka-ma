@@ -56,20 +56,24 @@ class SlackNotifier:
         return self.default_channel
 
     def notify(self, text: str, channel: str | None = None, team_id: str | None = None,
-               thread_ts: str | None = None):
+               thread_ts: str | None = None) -> bool:
         """送信元ワークスペース（team_id）の送信元 channel_id に結果を返す。未指定時はデフォルト。
 
         thread_ts を渡すと当該スレッドへ返信する（会話フロントエンドの返信に使う）。
+        戻り値は送信の成否（§8.10f 届けの検証 — 完了通知の呼び出し側が「届いた」を
+        成否で判定できるようにする。失敗は従来どおりログにも残す）。
         """
         target = self._channel_for(team_id, channel)
         try:
             self._client_for(team_id).chat_postMessage(channel=target, text=text, thread_ts=thread_ts)
             logger.info("Slack通知送信 (ws=%s to %s): %s", team_id or "default", target, text[:80])
+            return True
         except Exception:
             # text を含めずログすると、失敗した通知が何を伝えようとしていたか
             # （例: "opus 障害: ..." 等の再試行トリガー元メッセージ）が追跡不能になる
             # （実機検証で診断が阻害される欠陥を確認・是正）。
             logger.exception("Slack通知送信失敗 (ws=%s to %s): %s", team_id or "default", target, text[:200])
+            return False
 
     # 計画プレビュー 1 ブロックの本文上限（Slack の section text 上限 3000 字より余裕を持つ）
     PLAN_CHUNK_CHARS = 2800

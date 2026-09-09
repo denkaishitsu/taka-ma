@@ -302,8 +302,9 @@ def test_build_contract_never_marks_degraded():
     """縮退モードは廃止（ADR 0002）: 来歴に何が在っても _contract_degraded を立てない。"""
     mgr = _manager(tempfile.mkdtemp())
     mgr.contractor = _FakeContractor(
-        _raw(), {"origin": "opus", "backend": "worker_cli", "unreachable": False,
-                 "attempts": []})
+        _raw(acceptance=[{"kind": "pushed", "params": {}}]),
+        {"origin": "opus", "backend": "worker_cli", "unreachable": False,
+         "attempts": []})
     contract, _ = mgr._build_contract("c1", "要約")
     assert "_contract_degraded" not in contract
 
@@ -454,13 +455,18 @@ def test_terminal_record_recheck_fail_prefers_current_measurement():
     assert "現在の実測は未達" in text
 
 
-def test_terminal_record_pure_generation_shows_result_only():
-    """完了検査の無いタスク（純生成）は終端記録の実在と結果冒頭が実測の上限。"""
+def test_terminal_record_pure_generation_shows_full_result():
+    """結果を問われたら記録の実体（result 全文）で答える（§8.10f 工程 (5) 補則）。
+
+    冒頭 1 行 120 字の切り出しは「どこに何ができたか・完遂したか」に答えられない
+    （2026-09-08 実測）ため廃止。複数行の本文が丸ごと出ることを固定する。"""
     mgr = _manager(tempfile.mkdtemp())
     _write_terminal_record(mgr, "c1", "t1", acceptance=[],
                            result="要約: 本文の要点は 3 つ。\n詳細…")
     text = mgr._task_status_text({"conversation_id": "c1"})
-    assert "結果（記録・冒頭）: 要約: 本文の要点は 3 つ。" in text
+    assert "結果（記録の全文）:" in text
+    assert "要約: 本文の要点は 3 つ。" in text
+    assert "詳細…" in text            # 2 行目以降が切り捨てられない
     assert "再検査" not in text
 
 

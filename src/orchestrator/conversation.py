@@ -673,6 +673,16 @@ class ConversationManager:
                     # 到達性ゲート合格後（pass_ttl 内）に CLI 不達へ転じた場合（ADR 0002）。
                     # 抽出失敗の定型（言い直しの要求）で誤誘導せず、到達不能の固定文で止める
                     text = UNREACHABLE_STOP_TEXT
+                elif contract_prov.get("empty_acceptance"):
+                    # 完了条件の必須化（§8.10f 依頼の一生・工程 (2)）: 完了条件を
+                    # 立てられない依頼は実行へ進めない。聞き返しは「完了条件を含めた
+                    # 依頼全体の言い直し」を求める — 完了条件だけの短い補足返答は
+                    # 意図判定で chat に落ち、契約化へ再入しない経路があり得るため
+                    text = ("この依頼の完了条件（何ができたら完了か）を契約に立てられ"
+                            "ませんでした（完了条件の無い実行は行いません）。\n"
+                            "完了条件を含めて、依頼全体を言い直してください。\n"
+                            "例: 「…を確認して、結果の一覧を回答で返して。一覧が"
+                            "届いたら完了」")
                 elif unmapped:
                     # スキーマ閉包の検出（§8.10f）: 契約フィールドへ写像できない
                     # 「実行に影響する指定」。散文で黙って運ばず、扱いを人に確認する
@@ -722,6 +732,8 @@ class ConversationManager:
             # file_changed 検査の baseline を実測して契約へ刻む（§8.10f。reconcile・
             # 出口検査より前に確定させる — 対象不在なら file（作成）へ確定）
             self._capture_file_baselines(contract_data, workspace)
+            # answered 検査の tree_baseline（作業ツリー不変の基準点・§8.10f 工程 (2)）
+            self._capture_tree_baseline(contract_data, workspace)
             # open の過去依頼を世界に対して再検査する（§8.10g。後追い達成の機械検出）
             self._recheck_open_intents(cid, msg)
             # ── 再入 reconcile（§8.10g）: 着手確認を出す前に完了条件を実測する。
@@ -975,14 +987,17 @@ class ConversationManager:
         lines = [f"直近タスク（終端記録）: {status}（{when}）"]
         acceptance = record.get("acceptance") or []
         workspace = record.get("workspace")
+        body = (record.get("result") or "").strip()
         if acceptance and workspace and self.process_mgr is not None:
             try:
                 verifier = GroundingVerifier(self.process_mgr.run_ssh_probe)
                 # 検査は 1 件ずつ回す（reconcile と同じ粒度。件数は契約検証で上限済み）。
-                # 契約に branch があれば当該 ref を対象に測る（§8.10f 測定の ref 化）
+                # 契約に branch があれば当該 ref を対象に測る（§8.10f 測定の ref 化）。
+                # answered の回答本文は終端記録の result が実体（判定不能に落とさない）
                 for check in acceptance:
                     report = verifier.verify_acceptance(
-                        workspace, [check], default_branch=record.get("branch"))
+                        workspace, [check], default_branch=record.get("branch"),
+                        answered_ctx={"result_chars": len(body)})
                     params = " ".join(
                         f"{k}={v}" for k, v in (check.get("params") or {}).items())
                     mark = "PASS" if report.ok else "FAIL"
@@ -996,12 +1011,12 @@ class ConversationManager:
                 lines.append("- 再検査は実行不能（実測手段の失敗）。上記は記録時点の測定")
         elif acceptance:
             lines.append("- 再検査手段なし（workspace 未特定）。上記は記録時点の測定")
-        else:
-            # 完了検査の無いタスク（純生成等）は終端記録の実在と結果が実測の上限。
-            # それ以上は断言しない（測れないものは出さない・§8.10g）
-            first = (record.get("result") or "").strip().splitlines()
-            if first:
-                lines.append(f"- 結果（記録・冒頭）: {first[0][:120]}")
+        # 結果を問われたら記録の実体で答える（§8.10f 依頼の一生・工程 (5) 補則。
+        # 完了報告と同じ内容 = 終端記録の result 全文）。冒頭 1 行の切り出しは
+        # 「どこに何ができたか・完遂したか」に答えられない（2026-09-08 実測）ため廃止
+        if body:
+            lines.append("- 結果（記録の全文）:")
+            lines.append(body)
         return "\n".join(lines)
 
     def _task_status_text(self, msg: dict, represent: bool = False) -> str:
@@ -1068,9 +1083,15 @@ class ConversationManager:
         self._append_turn(cid, "assistant", text)
         # 実測応答後もユーザーの続きの発話を待つ（§8.3 (C) 能動昇格）
         self._set_awaiting(cid, True)
-        self.slack.notify(
-            text, msg.get("channel_id"),
-            team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
+        # 結果全文（工程 (5) 補則）を含むため分割送信する（完了通知と同じ規律・
+        # 3,500 字/通。切り詰めない — 冒頭切り出しの廃止と対）
+        chunk = 3500
+        parts = [text[i:i + chunk] for i in range(0, len(text), chunk)] or [text]
+        for i, part in enumerate(parts):
+            prefix = "" if i == 0 else f"（続き {i + 1}/{len(parts)}）\n"
+            self.slack.notify(
+                prefix + part, msg.get("channel_id"),
+                team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
         # 実行系タスクが無く着手待ちの計画があるときは、ボタンの実体を手元に出す
         # （文言だけの案内でボタンを探させない・§8.10b）
         if not self._running_tasks(cid):
@@ -1355,6 +1376,12 @@ class ConversationManager:
         # push を含む依頼で完了条件が空なら既定検査を付与する（§8.10f。脳の
         # 立て損ねで「push の実測検査なしに完了」と言える状態を作らない）
         contract = contract_rules.apply_default_acceptance(validated, summary)
+        # 完了条件の必須化（§8.10f 依頼の一生・工程 (2)）: 既定付与を経ても acceptance が
+        # 空の契約は不成立。何をもって達成かが無い契約は、worker の逸脱を検出できず・
+        # 検査が走らず・後から結果を照合できない（2026-09-07 実測）。脳の誤りではなく
+        # 完了条件の欠落なのでリトライせず、呼び出し側が完了条件を人に聞き返す
+        if not contract.get("acceptance"):
+            return None, {**provenance, "empty_acceptance": True}
         return contract, provenance
 
     def _reachability_notice(self) -> str | None:
@@ -1493,6 +1520,33 @@ class ConversationManager:
             else:
                 # 対象不在（または取得不能）＝作成の依頼として file（実在の実測）へ確定
                 a["kind"] = "file"
+
+    def _capture_tree_baseline(self, contract: dict, workspace: str | None):
+        """answered 検査の tree_baseline を実測して契約へ刻む（§8.10f 依頼の一生・工程 (2)）。
+
+        回答型依頼の出口検査 (3)「作業ツリーが着手時から不変」の基準点。着手確認の
+        組立時に `git status --porcelain` の内容ハッシュを採る（LLM 不関与・
+        _capture_file_baselines と同じ規律）。workspace 無し・実測不能は "-"（出口で
+        当該項目をスキップ — 測れないものを FAIL に偽らない。回答本文と送信成否の
+        検査は残る）。
+        """
+        targets = [a for a in ((contract or {}).get("acceptance") or [])
+                   if a.get("kind") == "answered"
+                   and not (a.get("params") or {}).get("tree_baseline")]
+        if not targets:
+            return
+        h = "-"
+        if workspace and self.process_mgr is not None:
+            try:
+                rc, out = self.process_mgr.run_ssh_probe(
+                    f"git -C {shlex.quote(workspace)} status --porcelain | shasum -a 256",
+                    runbook_rules.EXEC_TIMEOUT_SEC)
+                cand = (out or "").strip().split()[0] if rc == 0 else ""
+                h = cand or "-"
+            except Exception:
+                h = "-"
+        for a in targets:
+            a.setdefault("params", {})["tree_baseline"] = h
 
     # ── 再入 reconcile（設計書 §8.10g。計画・着手確認の前に世界の実状態を測る） ──
 
