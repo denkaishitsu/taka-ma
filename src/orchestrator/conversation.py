@@ -1524,25 +1524,27 @@ class ConversationManager:
     def _capture_tree_baseline(self, contract: dict, workspace: str | None):
         """answered 検査の tree_baseline を実測して契約へ刻む（§8.10f 依頼の一生・工程 (2)）。
 
-        回答型依頼の出口検査 (3)「作業ツリーが着手時から不変」の基準点。着手確認の
-        組立時に `git status --porcelain` の内容ハッシュを採る（LLM 不関与・
-        _capture_file_baselines と同じ規律）。workspace 無し・実測不能は "-"（出口で
-        当該項目をスキップ — 測れないものを FAIL に偽らない。回答本文と送信成否の
+        回答型依頼の出口検査 (3)「作業ツリーに約束の外の変化がない」の基準点。着手確認の
+        組立時に `git status --porcelain` の行集合（正規化テキスト）を採る（LLM 不関与・
+        _capture_file_baselines と同じ規律。パス単位の差分判定に行が要るためハッシュで
+        なく行を保持する）。クリーンなツリーは空文字列。workspace 無し・実測不能は "-"
+        （出口で当該項目をスキップ — 測れないものを FAIL に偽らない。回答本文と送信成否の
         検査は残る）。
         """
         targets = [a for a in ((contract or {}).get("acceptance") or [])
                    if a.get("kind") == "answered"
-                   and not (a.get("params") or {}).get("tree_baseline")]
+                   and (a.get("params") or {}).get("tree_baseline") is None]
         if not targets:
             return
         h = "-"
         if workspace and self.process_mgr is not None:
             try:
                 rc, out = self.process_mgr.run_ssh_probe(
-                    f"git -C {shlex.quote(workspace)} status --porcelain | shasum -a 256",
+                    f"git -C {shlex.quote(workspace)} status --porcelain",
                     runbook_rules.EXEC_TIMEOUT_SEC)
-                cand = (out or "").strip().split()[0] if rc == 0 else ""
-                h = cand or "-"
+                if rc == 0:
+                    h = "\n".join(sorted(
+                        ln.rstrip() for ln in (out or "").splitlines() if ln.strip()))
             except Exception:
                 h = "-"
         for a in targets:

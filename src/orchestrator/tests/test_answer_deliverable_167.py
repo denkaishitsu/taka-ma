@@ -43,16 +43,16 @@ def test_validate_contract_accepts_answered():
 # ── 工程 (5) 検査: GroundingVerifier の answered 分岐 ──
 
 class _Probe:
-    """SSH probe スタブ。コマンド → (rc, out) を差し替え可能にする。"""
+    """SSH probe スタブ。git status --porcelain の現状出力を差し替え可能にする。"""
 
-    def __init__(self, status_hash="abc123"):
-        self.status_hash = status_hash
+    def __init__(self, status_out=""):
+        self.status_out = status_out
         self.commands = []
 
     def __call__(self, cmd, timeout):
         self.commands.append(cmd)
         if "status --porcelain" in cmd:
-            return 0, f"{self.status_hash}  -\n"
+            return 0, self.status_out
         return 0, ""
 
 
@@ -62,11 +62,11 @@ def _verify(acceptance, ctx, probe=None):
 
 
 def test_answered_passes_with_body_and_unchanged_tree():
-    """回答本文が閾値以上・作業ツリー不変なら PASS。"""
+    """回答本文が閾値以上・作業ツリー不変（クリーン→クリーン）なら PASS。"""
     report = _verify(
         [{"kind": "answered",
-          "params": {"min_chars": 10, "tree_baseline": "abc123"}}],
-        {"result_chars": 500})
+          "params": {"min_chars": 10, "tree_baseline": ""}}],
+        {"result_chars": 500}, probe=_Probe(status_out=""))
     assert report.ok
 
 
@@ -87,13 +87,65 @@ def test_answered_fails_on_short_body():
 
 
 def test_answered_fails_when_tree_changed():
-    """作業ツリーが着手時から変化 = 頼まれていない成果物の検出（2026-09-07 の是正）。"""
+    """約束の外のファイル出現 = 頼まれていない成果物の検出（2026-09-07 の是正）。"""
     report = _verify(
         [{"kind": "answered",
-          "params": {"min_chars": 1, "tree_baseline": "OLDHASH0"}}],
-        {"result_chars": 500}, probe=_Probe(status_hash="NEWHASH1"))
+          "params": {"min_chars": 1, "tree_baseline": ""}}],
+        {"result_chars": 500}, probe=_Probe(status_out="?? junk/unrequested.md\n"))
     assert not report.ok
-    assert "作業ツリー" in report.note
+    assert "約束の外の変化" in report.note
+
+
+def test_answered_allows_promised_file_creation():
+    """複合依頼: 契約が約束したファイル（file 系検査の path）の作成は正当な差分として
+    許す（§8.10f 検査 (3) の一般化。kind 単発の「不変」判定が複合依頼で正当な成果物を
+    誤検知した 2026-09-09 の欠陥の是正）。"""
+    report = _verify(
+        [{"kind": "answered", "params": {"min_chars": 1, "tree_baseline": ""}},
+         {"kind": "file", "params": {"path": "docs/90-review.md"}}],
+        {"result_chars": 500},
+        probe=_Probe(status_out="?? docs/90-review.md\n"))
+    # file 検査自体は実在プローブが 0/"" を返すスタブでは通らないため、answered の
+    # 判定行だけを見る（約束パスの変化が「約束の外」に数えられていないこと）
+    assert "約束の外の変化" not in report.note
+
+
+def test_answered_no_closure_with_modification_promise():
+    """回答＋変える約束（file_changed 等）はツリー閉包を課さない（§8.10f 4 行表）。
+
+    「直して、教えて」型で worker の正当な波及（未約束ファイルへの修正）を
+    誤検知しない。ファイル側の規律は file 系検査・遵守照合が担保する。"""
+    report = _verify(
+        [{"kind": "answered", "params": {"min_chars": 1, "tree_baseline": ""}},
+         {"kind": "file_changed", "params": {"path": "src/x.py", "baseline": "abc0"}}],
+        {"result_chars": 500},
+        probe=_Probe(status_out=" M src/x.py\n M src/helper.py\n"))
+    assert "約束の外の変化" not in report.note
+    assert "ツリー閉包は課さない" in report.text
+
+
+def test_answered_closure_forced_off_by_caller_ctx():
+    """呼び出し側の閉包判定（runbook 含む契約全体からの決定）が最優先。"""
+    from orchestrator import tree_closure_applies
+    acc = [{"kind": "answered", "params": {"min_chars": 1, "tree_baseline": ""}}]
+    assert tree_closure_applies(acc) is True
+    assert tree_closure_applies(acc, runbook=[{"kind": "push", "params": {}}]) is False
+    v = GroundingVerifier(_Probe(status_out="?? junk.md\n"))
+    report = v.verify_acceptance("/repo", acc,
+                                 answered_ctx={"result_chars": 10, "closure": False})
+    assert report.ok        # 閉包 off なら junk があっても answered は落ちない
+
+
+def test_answered_fails_on_mixed_promised_and_unpromised():
+    """約束したファイルと約束外ファイルが混在 → 約束外の行だけを理由に未達。"""
+    report = _verify(
+        [{"kind": "answered", "params": {"min_chars": 1, "tree_baseline": ""}},
+         {"kind": "file", "params": {"path": "docs/90-review.md"}}],
+        {"result_chars": 500},
+        probe=_Probe(status_out="?? docs/90-review.md\n?? stray.tmp\n"))
+    assert "約束の外の変化" in report.note
+    assert "stray.tmp" in report.note
+    assert "90-review.md" not in report.note.split("約束の外の変化")[1].split("—")[0]
 
 
 def test_answered_skips_tree_check_without_baseline():
@@ -106,13 +158,47 @@ def test_answered_skips_tree_check_without_baseline():
     assert not any("status --porcelain" in c for c in probe.commands)
 
 
+def test_answered_checks_empty_baseline():
+    """クリーンなツリーの baseline（空文字列）はスキップせず検査する（"-" とは別物）。"""
+    probe = _Probe(status_out="?? new.md\n")
+    report = _verify(
+        [{"kind": "answered", "params": {"min_chars": 1, "tree_baseline": ""}}],
+        {"result_chars": 10}, probe=probe)
+    assert not report.ok
+    assert any("status --porcelain" in c for c in probe.commands)
+
+
 # ── 工程 (3) 実行: worker 指示の決定的分岐 ──
 
-def test_discretion_notes_differ_by_deliverable():
-    """回答型は「ファイルを作らない」、それ以外は従来文。定数レベルで固定する。"""
-    assert "成果物を作成してください" in DEFAULT_DISCRETION_NOTE
-    assert "ファイル作成・変更・コミットを行わない" in ANSWER_DISCRETION_NOTE
-    assert "成果物は回答の本文" in ANSWER_DISCRETION_NOTE
+def test_discretion_note_derived_from_acceptance_set():
+    """既定裁量は acceptance 集合全体から 4 分岐で導く（§8.10f 配布規則・決定的）。
+
+    kind 単発（answered の有無だけ）の分岐は、複合依頼で「ファイルを作るな」と
+    file 系完了条件が正面衝突する欠陥だった（2026-09-09 検討で検出）。閉包文言は
+    ツリー閉包が適用される契約（回答のみ・回答＋作る約束のみ）にだけ付き、
+    指示（事前）と検査（事後）が同じ境界を語る。"""
+    from orchestrator import (MIXED_DISCRETION_NOTE,
+                              MODIFY_ANSWER_DISCRETION_NOTE, _discretion_note)
+    file_only = {"acceptance": [{"kind": "file", "params": {"path": "a.md"}}]}
+    answer_only = {"acceptance": [{"kind": "answered", "params": {}}]}
+    create_mix = {"acceptance": [{"kind": "answered", "params": {}},
+                                 {"kind": "file_min_bytes",
+                                  "params": {"path": "a.md", "min_bytes": 100}}]}
+    modify_mix = {"acceptance": [{"kind": "answered", "params": {}},
+                                 {"kind": "file_changed",
+                                  "params": {"path": "src/x.py"}}]}
+    runbook_mix = {"acceptance": [{"kind": "answered", "params": {}}],
+                   "runbook": [{"kind": "commit_paths",
+                                "params": {"paths": ["a.md"], "message": "m"}}]}
+    assert _discretion_note(file_only) is DEFAULT_DISCRETION_NOTE
+    assert _discretion_note(answer_only) is ANSWER_DISCRETION_NOTE
+    assert _discretion_note(create_mix) is MIXED_DISCRETION_NOTE
+    assert _discretion_note(modify_mix) is MODIFY_ANSWER_DISCRETION_NOTE
+    assert _discretion_note(runbook_mix) is MODIFY_ANSWER_DISCRETION_NOTE
+    assert "約束にないファイルは作らない" in MIXED_DISCRETION_NOTE
+    assert "あわせて回答を報告" in MIXED_DISCRETION_NOTE
+    assert "約束にないファイル" not in MODIFY_ANSWER_DISCRETION_NOTE
+    assert "あわせて回答を報告" in MODIFY_ANSWER_DISCRETION_NOTE
 
 
 # ── 工程 (4) 届け: 送信成否の伝搬と再送 1 回 ──
@@ -260,19 +346,33 @@ def test_capture_tree_baseline_stamps_dash_without_workspace():
     assert contract["acceptance"][0]["params"]["tree_baseline"] == "-"
 
 
-def test_capture_tree_baseline_stamps_hash_with_workspace():
-    """workspace があるときは git status --porcelain のハッシュを基準点として刻む。"""
+def test_capture_tree_baseline_stamps_sorted_lines_with_workspace():
+    """workspace があるときは git status --porcelain の行集合（整列テキスト）を刻む。"""
     mgr = _manager()
 
     class _SSH:
         def run_ssh_probe(self, cmd, timeout):
             assert "status --porcelain" in cmd
-            return 0, "abcd1234  -\n"
+            return 0, "?? b.md\n M a.md\n"
 
     mgr.process_mgr = _SSH()
     contract = {"acceptance": [{"kind": "answered", "params": {}}]}
     mgr._capture_tree_baseline(contract, "/repo")
-    assert contract["acceptance"][0]["params"]["tree_baseline"] == "abcd1234"
+    assert contract["acceptance"][0]["params"]["tree_baseline"] == " M a.md\n?? b.md"
+
+
+def test_capture_tree_baseline_clean_tree_is_empty_string():
+    """クリーンなツリーは空文字列（"-" ではない = 出口で検査される）。"""
+    mgr = _manager()
+
+    class _SSH:
+        def run_ssh_probe(self, cmd, timeout):
+            return 0, ""
+
+    mgr.process_mgr = _SSH()
+    contract = {"acceptance": [{"kind": "answered", "params": {}}]}
+    mgr._capture_tree_baseline(contract, "/repo")
+    assert contract["acceptance"][0]["params"]["tree_baseline"] == ""
 
 
 # ── 工程 (3): ハーネス自身が workspace を汚さない（フック settings の配置） ──

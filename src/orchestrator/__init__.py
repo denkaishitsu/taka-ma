@@ -181,6 +181,65 @@ ANSWER_DISCRETION_NOTE = (
     "ください。回答のみを報告してください。作業を妨げる前提の欠落（対象の不在等）が"
     "ある場合のみ、作業せず理由を報告してください）")
 
+# 複合依頼（回答＋ファイル/git 操作・§8.10f 配布規則 (c)）用の既定裁量。依頼は成果物を
+# 複数持てるため、文面は個々の kind でなく契約の acceptance 集合全体から決定的に導く。
+# kind 単発（answered の有無だけ）の分岐は、複合依頼で「ファイルを作るな」と file 系
+# 完了条件が正面衝突する欠陥だった（2026-09-09 検討で検出・実装前に是正）
+MIXED_DISCRETION_NOTE = (
+    "\n\n（この実行は非対話です。確認の質問への回答は届きません。"
+    "約束された成果物を作り、あわせて回答を報告してください。"
+    "**約束にないファイルは作らないでください。**実装の細部（内容・文言・書式・命名等）は"
+    "妥当な既定で自ら決めてください。作業を妨げる前提の欠落（対象の不在等）が"
+    "ある場合のみ、作業せず理由を報告してください）")
+
+# 作る約束 / 変える約束の kind 分類（§8.10f answered 検査 (3) のツリー閉包適用表と、
+# 配布規則の 4 分岐が共有する分岐材料。種別は着手時 baseline 採取の実測で確定済み —
+# 対象が実在すれば file_changed（変える）・不在なら file（作る）へ kind が倒れている）
+CREATION_KINDS = frozenset({"file", "file_min_bytes", "remote_file"})
+MODIFICATION_KINDS = frozenset(
+    {"file_changed", "head_touches", "diff_limit", "pushed", "branch_merged"})
+
+# (d) 回答＋変える約束（§8.10f 配布規則）。閉包文言を付けない — 変える約束の検査は
+# 最低達成の確認点であって触るファイルの目録ではなく、修正の正当な波及を禁じられない
+MODIFY_ANSWER_DISCRETION_NOTE = (
+    "\n\n（この実行は非対話です。確認の質問への回答は届きません。実装の細部"
+    "（内容・文言・書式・命名等）は妥当な既定で自ら決めて成果物を作り、"
+    "**あわせて回答を報告してください。**作業を妨げる前提の欠落（対象の不在等）が"
+    "ある場合のみ、作業せず理由を報告してください）")
+
+
+def tree_closure_applies(acceptance: list, runbook=None) -> bool:
+    """ツリー閉包（answered 検査 (3)）の適用可否（§8.10f の 4 行表・決定的・LLM 不関与）。
+
+    answered を含み、かつ変える約束（MODIFICATION_KINDS・runbook の git 操作）を
+    含まない契約にのみ課す。回答のみ／回答＋作る約束のみが True。
+    """
+    kinds = {a.get("kind") for a in (acceptance or [])}
+    if "answered" not in kinds:
+        return False
+    return not (kinds & MODIFICATION_KINDS) and not runbook
+
+
+def _discretion_note(task: dict) -> str:
+    """契約の acceptance 集合全体から既定裁量を決定的に導く（§8.10f 配布規則・LLM 判定なし）。
+
+    (a) 成果物のみ → 従来文（成果物を作る）
+    (b) 回答のみ → 回答が成果物・ファイルを作らない
+    (c) 回答＋作る約束のみ → 約束の成果物＋回答・約束外は作らない（閉包と対）
+    (d) 回答＋変える約束あり → 従来の裁量＋回答も報告（閉包文言なし・検査 (3) の適用表と一致）
+    """
+    kinds = {a.get("kind") for a in (task.get("acceptance") or [])}
+    has_answer = "answered" in kinds
+    if not has_answer:
+        return DEFAULT_DISCRETION_NOTE
+    has_artifact = bool(kinds & (CREATION_KINDS | MODIFICATION_KINDS)) \
+        or bool(task.get("runbook"))
+    if not has_artifact:
+        return ANSWER_DISCRETION_NOTE
+    if tree_closure_applies(task.get("acceptance"), task.get("runbook")):
+        return MIXED_DISCRETION_NOTE
+    return MODIFY_ANSWER_DISCRETION_NOTE
+
 
 def _escalate_reason(output: str) -> str | None:
     """worker 出力に ESCALATE 自己申告があれば理由文字列を返す（無ければ None）。
@@ -1386,10 +1445,15 @@ class Orchestrator:
             workspace = self._resolve_workspace(task)
             verifier = GroundingVerifier(self.process_mgr.run_ssh_probe)
             # 契約に branch があれば当該 ref を対象に測る（§8.10f 測定の ref 化）
-            report = verifier.verify_acceptance(workspace, task.get("acceptance") or [],
-                                                default_branch=task.get("branch"),
-                                                answered_ctx={
-                                                    "result_chars": len(result_text or "")})
+            # 約束パス集合（§8.10f answered 検査 (3)）: acceptance の file 系 path は
+            # verifier 側が自ら集める。runbook のコミット対象はここで渡す
+            report = verifier.verify_acceptance(
+                workspace, task.get("acceptance") or [],
+                default_branch=task.get("branch"),
+                answered_ctx={
+                    "result_chars": len(result_text or ""),
+                    "closure": tree_closure_applies(task.get("acceptance"),
+                                                    task.get("runbook"))})
             report.workspace = workspace
             return report
         except Exception as e:
@@ -1776,14 +1840,11 @@ class Orchestrator:
                 task.get("constraints") or [])
             if constraints_block:
                 command = constraints_block + command
-            # 既定裁量の定型（§8.10f 配布規則）: runbook はこの地点より前で return 済みの
-            # ため、付与対象は agent / inline の全 worker step に構造的に限られる。
-            # 文面は契約の acceptance から決定的に分岐（回答型 = answered を含む依頼は
-            # 「回答が成果物・ファイルを作らない」。LLM 判定なし・§8.10f 依頼の一生 工程 (3)）
-            answer_type = any(a.get("kind") == "answered"
-                              for a in (task.get("acceptance") or []))
-            command = command + (ANSWER_DISCRETION_NOTE if answer_type
-                                 else DEFAULT_DISCRETION_NOTE)
+            # 既定裁量の定型（§8.10f 配布規則）: runbook step はこの地点より前で return
+            # 済みのため、付与対象は agent / inline の全 worker step に構造的に限られる。
+            # 文面は契約の acceptance 集合全体から決定的に導く（_discretion_note・
+            # 3 分岐・LLM 判定なし・§8.10f 依頼の一生 工程 (3)）
+            command = command + _discretion_note(task)
 
             await self._notify(f"  サブタスク {step}: {_axis_label(subtask)}", channel,
                               team_id=task.get("team_id"), thread_ts=task.get("thread_ts"))

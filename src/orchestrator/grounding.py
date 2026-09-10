@@ -61,6 +61,25 @@ _PROBE_OUTPUT_MAX_CHARS = 1500
 _ACCEPT_PARAM_RE = re.compile(r"\A[A-Za-z0-9._/\-]+\Z")
 
 
+def _tree_changes_outside_promise(baseline: str, current: str,
+                                  promised: set) -> list[str]:
+    """作業ツリー差分のうち約束パス集合の外にある行を返す（§8.10f answered 検査 (3)）。
+
+    baseline / current は `git status --porcelain` の出力テキスト。行集合の対称差を
+    取り、各行のパス（`XY path`・rename は `XY old -> new` の両側）が promised に
+    含まれなければ「約束の外の変化」。パースできない行は安全側で外扱い（fail-closed）。
+    判定は行集合と固定パス照合のみ・LLM 不関与。
+    """
+    norm = lambda text: {ln.rstrip() for ln in (text or "").splitlines() if ln.strip()}
+    outside = []
+    for line in sorted(norm(baseline) ^ norm(current)):
+        body = line[3:] if len(line) > 3 else ""
+        paths = [p.strip() for p in body.split(" -> ")] if body else []
+        if not paths or not all(p in promised for p in paths):
+            outside.append(line)
+    return outside
+
+
 class GroundingReport:
     """グラウンディング検証 1 回分の結果。
 
@@ -103,15 +122,20 @@ class GroundingVerifier:
         self._run_probe = run_probe
 
     def _probe(self, lines: list[str], command: str,
-               timeout: int = PROBE_TIMEOUT_SEC) -> tuple[int, str]:
-        """検証コマンドを 1 本実行し、証跡ブロックへ「$ cmd / rc / 出力」を追記して結果を返す。"""
+               timeout: int = PROBE_TIMEOUT_SEC, raw: bool = False) -> tuple[int, str]:
+        """検証コマンドを 1 本実行し、証跡ブロックへ「$ cmd / rc / 出力」を追記して結果を返す。
+
+        raw=True は出力を strip せず返す。`git status --porcelain` は行頭の空白が状態記号の
+        一部であり、全体 strip が 1 行目の記号を欠落させてパス抽出を壊す（answered 検査 (3)
+        の実装時に検出）。証跡表示は従来どおり strip 済みで載せる。
+        """
         rc, output = self._run_probe(command, timeout)
         lines.append(f"$ {command} (rc={rc})")
         out = (output or "").strip()
         if len(out) > _PROBE_OUTPUT_MAX_CHARS:
             out = out[:_PROBE_OUTPUT_MAX_CHARS] + "\n…（以降略）"
         lines.append(out if out else "（出力なし）")
-        return rc, (output or "").strip()
+        return rc, (output or "") if raw else (output or "").strip()
 
     def verify(self, workspace: str, worker_text: str) -> GroundingReport:
         """worker の主張を workspace の実状態と突き合わせ、判定と証跡を返す。
@@ -263,6 +287,10 @@ class GroundingVerifier:
             bad = [v for k, v in params.items()
                    if (not (isinstance(v, int) and not isinstance(v, bool) and v > 0)
                        if k in ("max_lines", "min_bytes", "min_chars")
+                       # tree_baseline は git status --porcelain の行集合（空白・記号を
+                       # 含む）で、コマンド文字列に乗せず Python 内比較にのみ使う。
+                       # 文字列型のみ課す（§8.10f answered 検査 (3)）
+                       else (not isinstance(v, str)) if k == "tree_baseline"
                        else (not isinstance(v, str) or not _ACCEPT_PARAM_RE.match(v)
                              or ".." in v.split("/")))]
             if bad:
@@ -443,9 +471,10 @@ class GroundingVerifier:
 
             elif kind == "answered":
                 # 回答型依頼の達成検査（§8.10f）。(1) 回答本文の実在と最低文字数、
-                # (3) 作業ツリー不変（頼まれていない成果物を残していない）。
-                # (2) 送信成否は完了通知の後にしか確定しないため、呼び出し側の
-                # 届けの検証（achieved 判定）が担う — ここでは判定しない
+                # (3) 作業ツリーに約束の外の変化がない（約束した成果物の作成は正当な
+                # 差分として許す — 複合依頼で kind 単発の「不変」判定が正当な成果物を
+                # 誤検知した欠陥の是正・2026-09-09）。(2) 送信成否は完了通知の後にしか
+                # 確定しないため、呼び出し側の届けの検証（achieved 判定）が担う
                 min_chars = params.get("min_chars") or 1
                 chars = (answered_ctx or {}).get("result_chars")
                 if chars is None:
@@ -458,18 +487,40 @@ class GroundingVerifier:
                 else:
                     lines.append(f"$ (回答本文の実在) {chars} 字 >= {min_chars} 字 (PASS)")
                 baseline = params.get("tree_baseline")
-                if baseline and baseline != "-":
-                    rc, out = self._probe(
-                        lines, f"git -C {ws} status --porcelain | shasum -a 256")
-                    current = (out or "").split()[0] if out else ""
-                    if rc != 0 or not current:
+                # ツリー閉包の適用可否（§8.10f 4 行表）: 呼び出し側が契約全体（runbook
+                # 含む）から決定した値が最優先。未指定（旧経路・終端記録の再検査）は
+                # acceptance だけから同じ規則で導く（変える約束があれば課さない）
+                closure = (answered_ctx or {}).get("closure")
+                if closure is None:
+                    kinds_all = {a.get("kind") for a in acceptance}
+                    closure = not (kinds_all & {"file_changed", "head_touches",
+                                                "diff_limit", "pushed",
+                                                "branch_merged"})
+                if closure and baseline is not None and baseline != "-":
+                    # 約束パス集合 = 作る約束（file 系）の path。固定パス照合のみ・LLM 不関与
+                    promised = {(a.get("params") or {}).get("path")
+                                for a in acceptance
+                                if a.get("kind") in ("file", "file_min_bytes",
+                                                     "remote_file")}
+                    promised.discard(None)
+                    rc, out = self._probe(lines, f"git -C {ws} status --porcelain",
+                                          raw=True)
+                    if rc != 0:
                         problems.append("answered 未達（作業ツリー状態を実測できない）")
                         causes.append("acceptance_failed:answered")
-                    elif current != baseline:
-                        problems.append(
-                            "answered 未達（作業ツリーが着手時から変化 — 回答型依頼で"
-                            "頼まれていない成果物が作られた可能性）")
-                        causes.append("acceptance_failed:answered")
+                    else:
+                        outside = _tree_changes_outside_promise(
+                            baseline, out or "", promised)
+                        if outside:
+                            problems.append(
+                                "answered 未達（約束の外の変化: "
+                                + " / ".join(outside[:3])
+                                + (" 他" if len(outside) > 3 else "")
+                                + " — 頼まれていない成果物が作られた可能性）")
+                            causes.append("acceptance_failed:answered")
+                elif not closure:
+                    lines.append("（変える約束を含む依頼のためツリー閉包は課さない — "
+                                 "ファイル側は file 系検査・遵守照合が担保・§8.10f）")
                 lines.append("（送信成否は完了通知後に記録し achieved 判定に含める・届けの検証）")
 
             else:
