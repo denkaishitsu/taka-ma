@@ -1,12 +1,12 @@
 # リソース最適化通知 処理フロー（設計書 §8.14）
 
-設計書 [§8.14 qu-e → sa-ru（リソース最適化通知）](design-development-system.md) に対応する処理フロー図。
+設計書 [§8.14 qu-e → sa-ru（リソース最適化通知）](08-sentinel-paths.md#814-qu-e--sa-ruリソース最適化通知) に対応する処理フロー図。
 qu-e（MBP）が推奨 heavy 並行数を算出して sa-ru（Mac mini）へ SSH push し、sa-ru が heavy 並行数上限を動的更新する経路を示す。
 
 ノードには関数名（必要に応じて `関数名() — 処理概要` 形式）を記載。関数名は構築手順書 05（sa-ru）/ 07（qu-e）およびソースで grep して該当箇所へ移動できる。
 
-- qu-e 側実装: [`src/sentinel/main.py`](../../src/sentinel/main.py) / [`resource_optimizer.py`](../../src/sentinel/resource_optimizer.py)
-- sa-ru 側実装: [`src/orchestrator/__init__.py`](../../src/orchestrator/__init__.py) / [`concurrency.py`](../../src/orchestrator/concurrency.py)
+- qu-e 側実装: [`src/sentinel/main.py`](../../../src/sentinel/main.py) / [`resource_optimizer.py`](../../../src/sentinel/resource_optimizer.py)
+- sa-ru 側実装: [`src/orchestrator/__init__.py`](../../../src/orchestrator/__init__.py) / [`concurrency.py`](../../../src/orchestrator/concurrency.py)
 
 ```mermaid
 flowchart TD

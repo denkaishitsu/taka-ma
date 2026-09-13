@@ -43,6 +43,7 @@ from orchestrator.headless_runner import (
 from orchestrator.preflight import AuthPreflight, PreflightFailure
 from orchestrator.liveness import Heartbeat, RestartLimiter, start_watchdog_thread
 from orchestrator import contract as contract_rules
+from orchestrator.exit_gate import ExitGateReport, ExitGateVerifier
 from orchestrator import intent_store
 from orchestrator import runbook as runbook_rules
 from orchestrator.concurrency import DynamicConcurrencyLimiter
@@ -545,7 +546,7 @@ class Orchestrator:
             if rm_conf["blender_detection"]
             else None
         )
-        # 死活監視（§8.16.1・ADR 0002）: 心拍 2 探針（イベントループ閉塞・スレッドプール枯渇）と
+        # 死活監視（§8.16.1・是正記録 2026-09-04）: 心拍 2 探針（イベントループ閉塞・スレッドプール枯渇）と
         # daemon スレッドの自己終了復帰。運用値は sa-ru.yaml の liveness ブロックが唯一の源
         lv_conf = config["liveness"]
         self.liveness = Heartbeat(lv_conf)
@@ -1324,6 +1325,31 @@ class Orchestrator:
                             + "命令どおりのコマンドが実行されていない"
                         grounding.cause = grounding.cause or "directive_not_followed"
                         grounding.summary = f"（未達: {grounding.note}）"
+                # 出口ゲート（§8.10f 独立検証段）: 機械検査が全 PASS のタスクに限り、
+                # 実装と別系統の検証エージェントが根拠文書と成果物本体のみで独立判定する。
+                # FAIL は完了報告を出さず差し戻す（自己申告との食い違いは独立検証を正とする）。
+                # LLM 呼び出し＋SSH 採取の同期実行を含むため to_thread（§10.7）
+                gate = None
+                # テストは __new__ で __init__ を跳ばすため config 欠落でも落とさない
+                if grounding.ok and (getattr(self, "config", None) or {}).get("exit_gate"):
+                    gate = await asyncio.to_thread(
+                        self._run_exit_gate, task, grounding, final_result)
+                if gate is not None and gate.ok:
+                    # PASS: 独立検証レポートを機械検査の証跡に続けて添付する
+                    # （完了通知の「実測確認」チャンクと結果ファイル正本の両方に載る・§8.10f）
+                    grounding.text += "\n\n" + gate.text
+                elif gate is not None:
+                    if await self._reinject_for_exit_gate(
+                            task_file, task, subtasks, gate,
+                            channel, team_id, thread_ts):
+                        return
+                    # 差し戻せない FAIL（判定不能・directive 型・上限超過）は未達として人へ返す
+                    grounding.ok = False
+                    grounding.note = ((grounding.note + "・") if grounding.note
+                                      else "") + gate.note
+                    grounding.cause = grounding.cause or gate.cause
+                    grounding.text += "\n\n" + gate.text
+                    grounding.summary = f"（未達: {grounding.note}）"
                 # 証跡は正本（結果ファイル）にも残す（§8.9。Slack 表示と独立に全文へ到達できる）。
                 # 未達なら機械可読の失敗原因コードも正本へ刻む（§8.10f 反復停止の材料）
                 result_record = f"{final_result}\n\n{grounding.text}"
@@ -1464,6 +1490,99 @@ class Orchestrator:
                 text=f"【完了条件の検査】workspace: {workspace or '（未解決）'}\n{note}",
                 summary=f"（完了条件の検査の結果、未達: {note}）",
                 workspace=workspace, cause="grounding_unverified")
+
+    def _run_exit_gate(self, task: dict, grounding: GroundingReport,
+                       final_result: str) -> ExitGateReport | None:
+        """出口ゲート（§8.10f 独立検証段）を実行する（同期・to_thread で呼ぶ）。
+
+        None は対象外（workspace 未解決かつ answered も無い＝測る成果物が無い）。
+        想定外の失敗は fail-open にしない: 「独立検証を実行できなかった」を ok=False・
+        cause=exit_gate_unverified で返す（grounding と同じ規律。完了報告は出ない）。
+
+        final_result は回答型依頼（acceptance に answered）のときだけ回答本文＝成果物として
+        検証エージェントへ渡す。それ以外では渡さない（worker 自己申告の遮断・§8.10f）。
+        """
+        answered = any(a.get("kind") == "answered"
+                       for a in (task.get("acceptance") or []))
+        if not grounding.workspace and not answered:
+            return None
+        try:
+            template = (Path(__file__).parent / "prompts" / "exit_gate.md").read_text()
+            verifier = ExitGateVerifier(self.process_mgr.run_ssh_probe,
+                                        self._run_exit_gate_llm, template)
+            return verifier.verify(grounding.workspace, task, grounding.text,
+                                   answer_text=(final_result if answered else None))
+        except Exception as e:
+            logger.exception("出口ゲートで想定外の失敗: task_id=%s", task.get("task_id"))
+            note = f"独立検証を実行できませんでした（{type(e).__name__}: {e}）"
+            return ExitGateReport(ok=False, note=note, text=f"【独立検証】{note}",
+                                  cause="exit_gate_unverified")
+
+    def _run_exit_gate_llm(self, prompt: str) -> str:
+        """出口ゲートの検証 LLM を worker CLI の SSH 単発で 1 回だけ実行する。
+
+        契約化の昇格段（§8.4 (e)）と同じ書き込み不能呼び出し: stream-json・PreToolUse
+        フック・workspace を使わない（プロンプトは stdin）。モデル・タイムアウトは
+        sa-ru.yaml `exit_gate:` が唯一の源（コード側既定値なし）。実行不能は例外で返し、
+        呼び出し側（ExitGateVerifier）がリトライ・fail-closed 判定を行う。
+        """
+        if self.process_mgr is None:
+            raise RuntimeError("SSH 実行手段なし（process_mgr 未注入）")
+        conf = self.config["exit_gate"]
+        model_name = conf["model"]
+        model_conf = (self.config.get("models") or {}).get(model_name)
+        if not model_conf:
+            raise RuntimeError(f"未登録モデル: {model_name}")
+        if model_conf.get("keychain_auth"):
+            raise RuntimeError(f"{model_name} は SSH 単発で実行不可（keychain 認証依存）")
+        cli = model_conf.get("command", "")
+        remote = f"{cli} -p {model_conf.get('model_flag', '')}".strip()
+        try:
+            return self.process_mgr.run_ssh_command(
+                remote, timeout=conf["timeout_sec"], stdin_text=prompt)
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(f"独立検証のタイムアウト: {e}") from e
+
+    async def _reinject_for_exit_gate(self, task_file: str, task: dict,
+                                      subtasks: list[dict], gate: ExitGateReport,
+                                      channel, team_id, thread_ts) -> bool:
+        """出口ゲート FAIL の差し戻し（§8.10f）。再投入したら True、できなければ False。
+
+        差し戻すのは判定 FAIL（exit_gate_failed）のみ。判定不能（exit_gate_unverified）は
+        worker 再実行で直る失敗ではないため差し戻さない。directive 型は逐語命令が言い換え
+        不能で再実行に是正の余地が無いため差し戻さない。上限は exit_gate.max_reinject
+        （解釈できない値は approval の _reinject_count と同じく上限超過として扱う）。
+        """
+        if gate.cause != "exit_gate_failed" or task.get("directive"):
+            return False
+        conf = self.config.get("exit_gate") or {}
+        try:
+            limit = int(conf["max_reinject"])
+        except (KeyError, TypeError, ValueError):
+            logger.warning("exit_gate.max_reinject を解釈できません（差し戻しなしへ縮退）")
+            return False
+        try:
+            count = int(task.get("_exit_gate_count") or 0) + 1
+        except (TypeError, ValueError):
+            logger.warning("_exit_gate_count を解釈できません（上限超過として扱う）: %s",
+                           task_file)
+            return False
+        if count > limit:
+            return False
+        # init へ戻すと dispatcher が凍結プランで再実行する。completed_steps は破棄して
+        # 全 step をやり直す（成果物側に未解消が残っている以上、済んだ扱いにできない）。
+        # 判定表は worker 指示への前置き（_execute_subtask_in_chain）の材料として刻む
+        await self._update_status(task_file, "init", extra={
+            "_exit_gate_count": count,
+            "completed_steps": {},
+            "_plan": subtasks,
+            "exit_gate_findings": gate.findings_text() or gate.note,
+        })
+        await self._notify_chunked(
+            f"独立検証で未達のため、完了報告を出さず差し戻して再実行します"
+            f"（{count}/{limit} 回目）:", gate.text,
+            channel, team_id=team_id, thread_ts=thread_ts)
+        return True
 
     def _hook_settings_path(self, instance_id: str) -> str:
         """worker ホスト上のフック settings の一時パス（§8.10f 配布規則）。
@@ -1834,6 +1953,13 @@ class Orchestrator:
             # 分解されない 1 件プランのため dep_results は常に空で、原文が無傷で届く
             if task.get("directive"):
                 command = contract_rules.directive_command(task["directive"])
+            # 出口ゲートの差し戻し（§8.10f 独立検証段）: 前回実行が独立検証で未達と
+            # 判定されたタスクは、判定表の指摘を解消させる前置きを機械付与する。
+            # directive 型は差し戻されない（_reinject_for_exit_gate）ため上書きと重ならない
+            findings = task.get("exit_gate_findings")
+            if findings and not task.get("directive"):
+                command = ("前回実行は独立検証で未達と判定された。以下の指摘を解消せよ:\n"
+                           f"{findings}\n\n{command}")
             # 拘束条件（§8.10f 配布規則）: 全 step 共通の境界として短い定型を前置する。
             # 禁止型は decide デーモンの deny 規則としても機械強制される（_write_task_deny）
             constraints_block = contract_rules.build_constraints_block(

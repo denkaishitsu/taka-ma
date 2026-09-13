@@ -7,7 +7,7 @@ ApprovalPipeline.decide() を常駐状態で実行して {"allow", "reason"} を
 旧方式（decide_cli.py の 1 ショット SSH 起動）はツール呼び出しごとに Python コールド
 スタート＋依存 import（yaml / slack_sdk / ai_gateway）＋config ロード＋SlackNotifier
 構築を払い、承認レイテンシがツール数に比例して累積した。本デーモンは起動時に一度
-だけ構築して常駐する（設計: 本体 §8.5 / Appendix_worker-execution-adapters §2.1）。
+だけ構築して常駐する（設計: 本体 §8.5 / docs/design/details/08-worker-execution-adapters.md §2.1）。
 
 - 並行性: 接続ごとに asyncio タスクで捌く。Tier3 人間待ち（最大 300 秒）が他 worker の
   判定をブロックしない。

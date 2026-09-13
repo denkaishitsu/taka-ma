@@ -32,7 +32,7 @@ class ResourceMonitor:
         # SSH 先ホスト・タイムアウトも process_mgr が保持する値を共有する（host/timeout の供給元を
         # 1 つに保つ）。process_mgr はキーワード必須＝未注入は構築時に落とし、実行時 AttributeError を防ぐ。
         self.process_mgr = process_mgr
-        # 検知の失敗（SSH 不達等）が続いている状態。ログは状態遷移時のみ（ADR 0002 ログ規律。
+        # 検知の失敗（SSH 不達等）が続いている状態。ログは状態遷移時のみ（是正記録 2026-09-04 ログ規律。
         # 2026-09-04 は同一 traceback を 756 回連投して肝心の沈黙を埋もれさせた）
         self._failing: bool = False
 

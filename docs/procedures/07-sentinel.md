@@ -170,7 +170,7 @@ ssh mbp "tail -50 /opt/taka-ma/logs/qu-e.log | grep ヘルスチェック"
 
 | 観点 | 成功 | エラー |
 |------|------|--------|
-| 記録ログ | 起動直後の初回と**状態が遷移したとき**だけ `ヘルスチェック: <状態>（前回 <状態>）` が記録される（`main.py` の `log_health_transition()`。ADR 0002 ログ規律。平常時に毎周期の `healthy` 行は増えない。文言は日本語「ヘルスチェック」であり英語 `health_check` は出力されない） | 初回の記録が無い、毎周期 `healthy` が連投される |
+| 記録ログ | 起動直後の初回と**状態が遷移したとき**だけ `ヘルスチェック: <状態>（前回 <状態>）` が記録される（`main.py` の `log_health_transition()`。是正記録 2026-09-04 ログ規律。平常時に毎周期の `healthy` 行は増えない。文言は日本語「ヘルスチェック」であり英語 `health_check` は出力されない） | 初回の記録が無い、毎周期 `healthy` が連投される |
 | 各項目 | CPU / Memory / Disk / Network の 4 項目とも数値あり、`healthy` / `warning` / `critical` のいずれかが判定される | 項目欠落、判定なし |
 
 ## 検証項目
@@ -219,7 +219,7 @@ ssh mbp "tail -50 /opt/taka-ma/logs/qu-e.log | grep ヘルスチェック"
 | `commit_audit_cli.py` | [`commit_audit_cli.py`](../../src/sentinel/commit_audit_cli.py) | コミット前監査ゲートの 1 ショット CLI。staged diff を審査し approve のみ exit 0。監査 jsonl に `event="commit"` で追記（§8.12） |
 | `hooks/pre-commit` | [`hooks/pre-commit`](../../src/sentinel/hooks/pre-commit) | 自動導入される git pre-commit フック本体（sh）。監査基盤不在時は警告して素通し、基盤ありでの判定不能は fail-closed で中断 |
 | `ResourceOptimizer.recommended_heavy_instances()` / `notify_payload()` | [`resource_optimizer.py`](../../src/sentinel/resource_optimizer.py) | メモリ使用率から推奨 heavy 並行数を算出し、§8.14 通知 payload（recommended_heavy_instances / memory_usage / level）を生成 |
-| `resource_notify_loop()` | [`main.py`](../../src/sentinel/main.py) | `notify_interval_sec` 間隔で推奨並行数を算出し、前回値から変化時に sa-ru へ SSH push（§8.14、フロー図 [Appendix_resource-optimization-flow.md](../design/Appendix_resource-optimization-flow.md)） |
+| `resource_notify_loop()` | [`main.py`](../../src/sentinel/main.py) | `notify_interval_sec` 間隔で推奨並行数を算出し、前回値から変化時に sa-ru へ SSH push（§8.14、フロー図 [08-resource-optimization-flow.md](../design/details/08-resource-optimization-flow.md)） |
 | `health_check_loop()` / `daily_rotation_loop()` / `main()` | [`main.py`](../../src/sentinel/main.py) | 起動シーケンス（Observer 起動 + 起動時 retention rotation・workspace rotation + 日次 rotation（jsonl・workspace 両方）/ リソース通知 asyncio task） |
 
 ### プロンプト

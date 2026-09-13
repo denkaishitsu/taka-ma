@@ -1,10 +1,10 @@
 # worker 実行アダプタ抽象化 — subprocess / interactive(pty) / headless（Claude Code は headless アダプタの一実装）
 
-> **正本との対応**: 設計書本体 [§8.5 worker CLI（実行アダプタ抽象）](design-development-system.md#85-③-sa-ru--worker-cli重量タスク実行実行アダプタ抽象) に対応する詳細。本体が正本、本 Appendix は **実行アダプタ（CLI 固有）** の詳細（3層抽象の全体・cap1-10 実機根拠・レビュー対応表）を担う。
+> **正本との対応**: 設計書本体 [§8.5 worker CLI（実行アダプタ抽象）](08-worker-execution.md#85-③-sa-ru--worker-cli重量タスク実行実行アダプタ抽象) に対応する詳細。本体が正本、本書は **実行アダプタ（CLI 固有）** の詳細（3層抽象の全体・cap1-10 実機根拠・レビュー対応表）を担う。
 >
-> **承認判定の中核（CLI 非依存）は本 Appendix の対象外**。`decide()`/`PendingApproval`/`Decision`/Tier1-3/§8.10 待ち・handler 返却契約は設計書本体 [§3 承認パイプライン設計](design-development-system.md#3-承認パイプライン設計) を参照。本 Appendix は「アダプタが CLI 固有の入出力を中核の型へ変換する」層だけを扱う。
+> **承認判定の中核（CLI 非依存）は本書の対象外**。`decide()`/`PendingApproval`/`Decision`/Tier1-3/§8.10 待ち・handler 返却契約は設計書本体 [§3 承認パイプライン設計](03-approval-pipeline.md#3-承認パイプライン設計) を参照。本書は「アダプタが CLI 固有の入出力を中核の型へ変換する」層だけを扱う。
 
-対象: worker 実行方式（PTY+スクレイピング → 実行アダプタ抽象）の再設計。設計書本体 §2.1/§3/§8.5/§8.9/§8.10 と手順書の worker 実行記述を本方式へ改定する。**本体 §sections は改定済み（本 Appendix と双方向リンク）**。
+対象: worker 実行方式（PTY+スクレイピング → 実行アダプタ抽象）の再設計。設計書本体 §2.1/§3/§8.5/§8.9/§8.10 と手順書の worker 実行記述を本方式へ改定する。**本体 §sections は改定済み（本書と双方向リンク）**。
 
 **最上位の絶対制約（本設計の憲法）**: worker 実行・承認機構は**特定の worker CLI（Claude Code 等）にロックインしてはならない**。Claude Code の headless/stream-json/PreToolUse フックは Claude 固有機能であり、それを**アーキテクチャの中心に据えてはならない**。CLI 固有部分は必ず「アダプタ」に隔離し、中核（承認判定・実行 dispatch）は CLI 非依存で保つ。将来の Codex・別 CLI・別 LLM を、アダプタ追加だけで差し込めること。
 
@@ -58,7 +58,7 @@ worker 実行を**3層**に分け、CLI 固有部分をアダプタに閉じ込�
 
 ### 1.1 抽象の2境界（seam）
 
-- **seam A — 承認判定中核**: `ApprovalPipeline.decide(PendingApproval) → Decision`。**どの CLI から来ようと、構造化 {tool_name, tool_input} を受け allow/deny を返すだけ**。Tier1/2/3・安全性チェック・§8.10 はここに集約し、CLI の存在を一切知らない。ここが抽象の本体。**中核の詳細は本 Appendix ではなく設計書本体 [§3 承認パイプライン設計](design-development-system.md#3-承認パイプライン設計)**。本 Appendix は seam B とアダプタ（CLI 固有）を扱う。
+- **seam A — 承認判定中核**: `ApprovalPipeline.decide(PendingApproval) → Decision`。**どの CLI から来ようと、構造化 {tool_name, tool_input} を受け allow/deny を返すだけ**。Tier1/2/3・安全性チェック・§8.10 はここに集約し、CLI の存在を一切知らない。ここが抽象の本体。**中核の詳細は本書ではなく [§3 承認パイプライン設計](03-approval-pipeline.md#3-承認パイプライン設計)**。本書は seam B とアダプタ（CLI 固有）を扱う。
 - **seam B — 実行 dispatch**: `_select_method(methods)` が worker の `methods` 宣言で実行アダプタを選ぶ。新 CLI 追加＝`methods` 宣言＋アダプタ実装のみ。
 
 ### 1.2 アダプタ（CLI 固有・プラガブル）
@@ -167,13 +167,13 @@ exit 0（allow）と exit 2（deny）以外でフックコマンドが終わる�
 | headless（Claude） | PreToolUse フック stdin の JSON | `tool_name`/`tool_input`/`tool_use_id` をそのまま採る（変換不要・構造化済み） |
 | interactive(pty) | レガシー y/n 検出＋context 抽出（旧 `extract_command` の Run:/Write to: 逆走査はこのアダプタ内に残す） | 抽出文字列を `tool_name`（推定）＋`tool_input` に整形 |
 
-> 旧実装は stdout scrape の単一 `command` 文字列（`InterceptedPrompt.command`）を全 consumer が扱っていた。新方式では**中核が構造化 `PendingApproval` のみを受け**、scrape は interactive アダプタ内部の一手段に閉じる。中核から scrape 依存を除去する点は中核 Appendix §3 を参照。
+> 旧実装は stdout scrape の単一 `command` 文字列（`InterceptedPrompt.command`）を全 consumer が扱っていた。新方式では**中核が構造化 `PendingApproval` のみを受け**、scrape は interactive アダプタ内部の一手段に閉じる。中核から scrape 依存を除去する点は本書 §3 を参照。
 
-## 4. 承認中核との接続（詳細は中核 Appendix）
+## 4. 承認中核との接続（詳細は 03-approval-pipeline.md）
 
-承認判定（安全性チェック・スコープ・Tier1/2/3・§8.10 待ち・handler 返却契約・レコード schema）は **CLI 非依存の中核**であり、本 Appendix の対象外。詳細は設計書本体 §3。
+承認判定（安全性チェック・スコープ・Tier1/2/3・§8.10 待ち・handler 返却契約・レコード schema）は **CLI 非依存の中核**であり、本書の対象外。詳細は設計書本体 §3。
 
-本 Appendix（アダプタ）が中核と接続するのは次の2点のみ:
+本書（アダプタ）が中核と接続するのは次の2点のみ:
 - **入力変換**: 自 CLI の承認要求を `PendingApproval{tool_name, tool_input, tool_use_id}` に変換して `decide()` へ渡す（headless=フック stdin、interactive=レガシー y/n の context 抽出）。
 - **出力変換**: 中核が返す `Decision{allow, reason}` を自 CLI の伝達手段へ変換（headless=`permissionDecision:allow`/exit 2、interactive=`y`/`n` 送信）。
 
@@ -258,7 +258,7 @@ ya-ta の `model_flag`（`--model`）・`command` を保持。headless アダプ
 05-orchestrator（実行アダプタ dispatch・headless runner・検証#3）/ 06-task-models（Claude methods pty→headless・起動コマンド・検証#4/#5）/ 08-approval-pipeline（中核 decide＋アダプタ変換・interceptor は Ink のみ撤去・handler 返却契約・テスト `test_interceptor.py` はレガシー y/n 分を維持）/ 04-ai-gateway（検証#17 methods）/ 00-overview。
 
 ### 本設計ノートの正本への統合
-本 Appendix は設計書本体 §8.5 と双方向 markdown リンクで紐づく（既存 Appendix 慣習）。詳細フロー・実機検証結果・設計判断は本 Appendix、本体 §sections は方式サマリ＋抽象化3層（seam A/B）を記す。ファイル名・見出しは Claude 固有語（headless/stream-json）を主語にせず、抽象（実行アダプタ）を主語にする（ロックイン禁止の徹底）。
+本書は詳細設計 [08-worker-execution.md](08-worker-execution.md) §8.5 と双方向 markdown リンクで紐づく。詳細フロー・実機検証結果・設計判断は本書、本体 §sections は方式サマリ＋抽象化3層（seam A/B）を記す。ファイル名・見出しは Claude 固有語（headless/stream-json）を主語にせず、抽象（実行アダプタ）を主語にする（ロックイン禁止の徹底）。
 
 ## 15. テストフェーズで確定する実機検証項目
 

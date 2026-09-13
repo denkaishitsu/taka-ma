@@ -1,6 +1,6 @@
 # Slack Bot 運用情報
 
-構築完了後の継続運用情報（サービス管理 / アクセス制御 / タスク投入時の操作説明）。構築手順は [`docs/procedures/03-slack-bot.md`](../procedures/03-slack-bot.md) を参照。
+構築完了後の継続運用情報（サービス管理 / アクセス制御 / タスク投入時の操作説明）。構築手順は [`docs/procedures/03-slack-bot.md`](../../procedures/03-slack-bot.md) を参照。
 
 ## 目次
 
@@ -150,7 +150,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.taka-ma.sa-ru.plist
 /taka-ma-user list
 ```
 
-ユーザー情報は `/opt/taka-ma/config/users.yaml` に保存。テンプレートは [`src/slack_bot/config/users.yaml.example`](../../src/slack_bot/config/users.yaml.example) を参照。
+ユーザー情報は `/opt/taka-ma/config/users.yaml` に保存。テンプレートは [`src/slack_bot/config/users.yaml.example`](../../../src/slack_bot/config/users.yaml.example) を参照。
 
 ### モデル管理（Owner/Admin）
 
@@ -191,7 +191,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.taka-ma.sa-ru.plist
 
 ### ロールチェックの実装
 
-全コマンドハンドラの先頭で実行者の Slack user ID を `users.yaml` と照合する。本実装は [`src/slack_bot/services/role_check.py`](../../src/slack_bot/services/role_check.py) の `check_role(user_id, required_role)` を参照。階層比較の数値:
+全コマンドハンドラの先頭で実行者の Slack user ID を `users.yaml` と照合する。本実装は [`src/slack_bot/services/role_check.py`](../../../src/slack_bot/services/role_check.py) の `check_role(user_id, required_role)` を参照。階層比較の数値:
 
 | ロール | レベル |
 |--------|--------|

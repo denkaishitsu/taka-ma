@@ -1,6 +1,6 @@
 # sa-ru オーケストレーション処理フロー
 
-構築手順書04 Step 8 の [`src/orchestrator/__init__.py`](../../src/orchestrator/__init__.py) 骨格に対応するフロー図。
+構築手順書04 Step 8 の [`src/orchestrator/__init__.py`](../../../src/orchestrator/__init__.py) 骨格に対応するフロー図。
 ノードには関数名（必要に応じて関数内の処理概要を `関数名() — 処理概要` 形式で）、アローに値を記載。
 関数名は構築手順書 04 内で grep して該当箇所へ移動可能。
 
@@ -151,6 +151,7 @@ flowchart TD
 ## データフロー(結果回収・完了判定)
 
 ```mermaid
+%%{init: {'theme':'base', 'themeVariables': {'background':'#FAF9F6','lineColor':'#5F5E5A','edgeLabelBackground':'#FAF9F6'}}}%%
 flowchart TD
     OK["result_future.set_result(output)"] --> RES["_execute_subtask_in_chain() — results[step] = output<br>futures[step].set_result()<br>→ 依存先の await が解除"]
     FAIL["result_future.set_exception()"] --> SKIP["cascading skip<br>→ 依存先の await が例外で解除"]
@@ -158,9 +159,18 @@ flowchart TD
     RES --> DONE{"_execute_chain() — 全サブタスク成功？<br>(failed_steps が空？)"}
     SKIP --> DONE
 
-    DONE -->|"全成功"| COMP["_execute_chain() — status → completed<br>Slack に結果通知<br>done/{日付}/ に移動"]
+    DONE -->|"全成功"| GROUND["_ground_acceptance() / _ground_result()<br>＋ compare_directive()<br>機械検査（出口検査・遵守照合）"]
+    GROUND -->|"機械検査 PASS"| GATE["_run_exit_gate() — 出口ゲート（独立検証段）<br>別系統エージェントが根拠文書と成果物本体のみで判定"]
+    GROUND -->|"機械検査 FAIL"| COMP
+    GATE -->|"独立検証 PASS<br>（レポート添付）"| COMP["_execute_chain() — status → completed<br>Slack に結果通知（⚠ 未達含む）<br>done/{日付}/ に移動"]
+    GATE -->|"独立検証 FAIL<br>上限内・directive なし"| REINJ["_execute_chain() — status → init<br>exit_gate_findings をタスクへ刻む<br>凍結プラン全 step 再実行（差し戻し）"]
+    GATE -->|"独立検証 FAIL<br>上限超過 / directive 型 → ⚠ 未達"| COMP
+    REINJ -.->|"dispatcher が再取得"| DONE
     DONE -->|"1つでも失敗"| NOTI["_execute_chain() — status → failed<br>_notify_failure()<br>元の指示 + 各Step成否を Slack 通知<br>done/{日付}/ に移動"]
 
+    style GROUND fill:#FAEEDA,color:#000
+    style GATE fill:#EEEDFE,color:#000
+    style REINJ fill:#FAEEDA,color:#000
     style COMP fill:#EAF3DE,color:#000
     style NOTI fill:#FAECE7,color:#000
     style SKIP fill:#FCEBEB,color:#000

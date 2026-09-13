@@ -121,7 +121,7 @@ class YaTaLogger:
                 None=不成立）。
             attempts: 試行列 [{"model": 名前, "problems": 不合格理由リスト}, ...]。
             backend: 確定（または最終試行）のバックエンド（"worker_cli" / "local"）。
-            unreachable: CLI の呼び出し自体の失敗が続き不成立になったか（§8.4・ADR 0002。
+            unreachable: CLI の呼び出し自体の失敗が続き不成立になったか（§8.4・是正記録 2026-09-04。
                 2026-09-05 以前の記録は同義のキー degraded）。
         """
         entry = {

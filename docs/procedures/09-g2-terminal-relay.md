@@ -17,7 +17,7 @@
 
 ## 概要
 
-G2（Even Realities AR グラス）＋ R1 リングを第 2 の人間インターフェースとして追加する。方式・契約は [設計書 §8.17](../design/design-development-system.md#817-g2even-realities-ar-グラスチャネル--claude-リレー方式) が正本。
+G2（Even Realities AR グラス）＋ R1 リングを第 2 の人間インターフェースとして追加する。方式・契約は [設計書 §8.17](../design/details/08-slack-interface.md#817-g2even-realities-ar-グラスチャネル--claude-リレー方式) が正本。
 
 本手順書は **第 1 段（リレー方式）** を構築する。even-terminal 上の Claude セッション（リレー Claude）が、発話を Slack MCP で u-zu 宛の会話面へ原文投稿し、返信をグラス向けに要約表示する。計画確認・Tier 3 承認の決着は選択 UI（`AskUserQuestion`）で受け、u-zu のボタンと同一のファイル契約で代行する。
 
@@ -109,7 +109,7 @@ security find-generic-password -s taka-ma-g2-relay -a slack -w > /dev/null && ec
 
 ### Step 3: リレー用プロジェクトの配置（MBP）
 
-リレー Claude の振る舞い（会話面の選択・原文投稿・要約表示・選択 UI による決着・SSH 直読）は、リレー用プロジェクトの CLAUDE.md と補助スクリプトで定義する。定義の正本はリポジトリ [`src/g2_relay/`](../../src/g2_relay/CLAUDE.md)（仕様は [設計書 §8.17](../design/design-development-system.md#817-g2even-realities-ar-グラスチャネル--claude-リレー方式) 第 1 段）。
+リレー Claude の振る舞い（会話面の選択・原文投稿・要約表示・選択 UI による決着・SSH 直読）は、リレー用プロジェクトの CLAUDE.md と補助スクリプトで定義する。定義の正本はリポジトリ [`src/g2_relay/`](../../src/g2_relay/CLAUDE.md)（仕様は [設計書 §8.17](../design/details/08-slack-interface.md#817-g2even-realities-ar-グラスチャネル--claude-リレー方式) 第 1 段）。
 
 ```bash
 mkdir -p ~/DevDev/g2-relay

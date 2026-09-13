@@ -27,7 +27,7 @@
 
 worker CLI のツール実行を三段階リスク判定（Tier 1/2/3）に基づいて自動 / 半自動 / 手動承認する。承認要求の取得は実行アダプタごとに異なる（設計書 §3 / §8.5 / §8.8 / §8.9 参照）:
 
-- **headless アダプタ（Claude Code）**: MBP の PreToolUse フックが SSH で Mac mini の薄いクライアント（`decide_client.py`）を起動し、**launchd 常駐の decide デーモン**（`decide_daemon.py`・Unix ドメインソケット）が中核 `decide()` を実行する（設計 [Appendix §2.1](../design/Appendix_worker-execution-adapters.md#21-判定実行系--decide-デーモンmac-mini-常駐とフックの薄いクライアント化)）
+- **headless アダプタ（Claude Code）**: MBP の PreToolUse フックが SSH で Mac mini の薄いクライアント（`decide_client.py`）を起動し、**launchd 常駐の decide デーモン**（`decide_daemon.py`・Unix ドメインソケット）が中核 `decide()` を実行する（設計 [実行アダプタ設計 §2.1](../design/details/08-worker-execution-adapters.md#21-判定実行系--decide-デーモンmac-mini-常駐とフックの薄いクライアント化)）
 - **interactive(pty) アダプタ（agy 対話等）**: 対話型 CLI が出力する y/n プロンプトを汎用 PTY ラッパー（`WorkerPtyWrapper`、構築手順書 05 主要 API 参照）で捕捉し、sa-ru 内（in-process）でパイプラインを起動する
 
 > **NOTE**: interactive 経路の承認パイプラインは **sa-ru の一部** として動作し、独自の launchd 登録は不要。headless 経路の判定実行系のみ decide デーモン（`com.taka-ma.decide-daemon`）として launchd 常駐する（Step 2 で配備）。
@@ -52,7 +52,7 @@ sa-ru (Mac mini・interactive)
         └── audit_logger   （jsonl 監査ログ、§3.5）
 ```
 
-承認フロー全体は [設計書 §3.4 承認フロー図](../design/design-development-system.md#34-承認フロー図) を正とする（ya-ta スコープ判定 → 範囲内なら自動承認、範囲外なら Tier 1/2/3 分類）。
+承認フロー全体は [設計書 §3.4 承認フロー図](../design/details/03-approval-pipeline.md#34-承認フロー図) を正とする（ya-ta スコープ判定 → 範囲内なら自動承認、範囲外なら Tier 1/2/3 分類）。
 
 ## 実行場所
 
@@ -240,7 +240,7 @@ ssh mac-mini "launchctl bootstrap gui/\$(id -u) ~/Library/LaunchAgents/com.taka-
 | `Tier2Handler.handle()` | [`tier2_handler.py`](../../src/approval-pipeline/tier2_handler.py) | Medium Risk: qu-e 審査（§8.8）。qu-e へ **SSH** で `review_cli.py` を 1 ショット実行 → JSON。approve のみ承認、deny / escalate および失敗時は escalate を返す |
 | `Tier3Handler.handle()` | [`tier3_handler.py`](../../src/approval-pipeline/tier3_handler.py) | High Risk: Slack 経由人間承認（§8.9）。`hold_grace_sec` 超過で `hold`（承認は pending 存置・自動 deny しない。§8.10） |
 | `AuditLogger.log()` | [`audit_logger.py`](../../src/approval-pipeline/audit_logger.py) | jsonl 形式の監査ログ（§3.5） |
-| `DecideDaemon` / `PipelineHolder` | [`decide_daemon.py`](../../src/approval-pipeline/decide_daemon.py) | headless フック判定の常駐サーバ（UDS・asyncio 並行・config mtime 再ロード。設計 Appendix §2.1） |
+| `DecideDaemon` / `PipelineHolder` | [`decide_daemon.py`](../../src/approval-pipeline/decide_daemon.py) | headless フック判定の常駐サーバ（UDS・asyncio 並行・config mtime 再ロード。設計 details/08-worker-execution-adapters.md §2.1） |
 | `decide_client.main()` | [`decide_client.py`](../../src/approval-pipeline/decide_client.py) | フックの薄い入口（標準ライブラリのみ）。allow=exit 0 / deny・全異常=exit 2 の出力契約 |
 
 ### 設定

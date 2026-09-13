@@ -13,7 +13,7 @@ ready 毎 1 回と最低頻度で誤りのコストが最大のため、確実�
   検証関数を受け取って合否を聞くだけで、検証規則を持たない（権威はフィールド）
 - worker CLI の実行手段（SSH）は sa-ru が cli_runner として注入する
   （ya-ta モジュールに SSH・CLI 依存を持ち込まない — ライブラリ方式の維持）
-- 不達は fail-closed（ADR 0002）: CLI の呼び出し自体の失敗（SSH 不達・CLI エラー・
+- 不達は fail-closed（是正記録 2026-09-04）: CLI の呼び出し自体の失敗（SSH 不達・CLI エラー・
   認証失効）ではローカル ya-ta.model へ縮退せず、不成立（来歴 unreachable=true）を返す。
   2026-09-04 に縮退契約が誤ったリポジトリ名・完了条件なしの計画を生んだ是正。
   ローカル契約化は backend=local / escalate_runner 未注入（単体テスト・段階導入）のみ
@@ -54,7 +54,7 @@ class Contractor:
     """会話履歴（二窓ビュー）と確定要約から実行契約 JSON を抽出する（設計書 §8.4）。
 
     既定は worker CLI（contractor.model・既定 opus）で ATTEMPTS 回試行する。呼び出し
-    自体の失敗が続いても縮退せず不成立（unreachable）を返す（ADR 0002）。どのバックエンドの
+    自体の失敗が続いても縮退せず不成立（unreachable）を返す（是正記録 2026-09-04）。どのバックエンドの
     出力も受理判断は呼び出し元が注入する検証関数（sa-ru の validate_contract）が行う。
     不合格 2 回で (None, 来歴) を返し、呼び出し側が fail-closed で人へ差し戻す。
     """
@@ -102,7 +102,7 @@ class Contractor:
                 （ローカル契約化の ollama 呼び出しのみ。CLI の SSH 単発は対象外）。
 
         来歴 dict: {"origin": モデル名 | "local" | None, "backend": "worker_cli" | "local",
-                    "unreachable": bool（CLI の呼び出し自体の失敗が続き不成立・ADR 0002）,
+                    "unreachable": bool（CLI の呼び出し自体の失敗が続き不成立・是正記録 2026-09-04）,
                     "attempts": [{"model", "problems"}...],
                     "unmapped": [逐語引用, ...]（スキーマ閉包検出時のみ）}
         origin=None は不成立（呼び出し側が fail-closed で人へ差し戻す）。
@@ -134,7 +134,7 @@ class Contractor:
                 # 検証不合格を含む失敗 = モデルは応答している。最上位で不合格の契約を
                 # ローカルへ落とす意味はない（fail-closed・§8.4）
                 return None, self._provenance(None, "worker_cli", attempts)
-            # 呼び出し自体の失敗のみ → fail-closed（ローカルへ縮退しない・ADR 0002）。
+            # 呼び出し自体の失敗のみ → fail-closed（ローカルへ縮退しない・是正記録 2026-09-04）。
             # 呼び出し側は到達不能の固定文で止まる（§8.4「不達は fail-closed」）
             logger.warning("契約化 CLI が %d 回とも呼び出し失敗 → 不成立（到達不能・縮退しない）",
                            exec_failures)

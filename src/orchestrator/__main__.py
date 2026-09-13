@@ -40,7 +40,7 @@ config = {
 }
 
 # ハング診断: SIGUSR1 で全スレッドの Python スタックを stderr（sa-ru-error.log）へ吐く
-# （設計書 §8.5「ハング診断の常設」・ADR 0002）。イベントループ起動前に登録する。
+# （設計書 §8.5「ハング診断の常設」・是正記録 2026-09-04）。イベントループ起動前に登録する。
 install_hang_diagnostics()
 
 asyncio.run(Orchestrator(config).run())

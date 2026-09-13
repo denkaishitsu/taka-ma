@@ -147,7 +147,7 @@ ssh mac-mini "cat /opt/taka-ma/data/tasks/done/*test-light*.json"
 
 ### 4. heavy タスク並行実行
 
-2 つの heavy タスクを同時に投入する（詳細は [Appendix_04-orchestration-flow.md](../design/Appendix_04-orchestration-flow.md) を参照）。
+2 つの heavy タスクを同時に投入する（詳細は [10-orchestration-flow.md](../design/details/10-orchestration-flow.md) を参照）。
 
 | 観点 | 成功 | エラー |
 |------|------|--------|
@@ -264,7 +264,7 @@ ssh mac-mini "ls /opt/taka-ma/data/exec-confirmations/"
 - [`Orchestrator._dispatcher()`](../../src/orchestrator/__init__.py) — タスクファイル監視・分解・キュー投入
 - [`Orchestrator._conversation_loop() / _handle_conversation_message()`](../../src/orchestrator/__init__.py) — 会話キュー監視 → `ConversationManager.handle_message()` へ（§8.3 (A)）。ファイル取り回しは共有 `FileQueue`
 - [`Orchestrator._exec_confirmation_loop() / _finalize_confirm()`](../../src/orchestrator/__init__.py) — 着手確認の決着検知。confirmed→確定タスク生成、rejected→実行せず通知、pending は期限なしで待つ（§8.10b）。走査は `FileQueue.iter_records()`（壊れレコードは failed/ 隔離）
-- [`FileQueue`](../../src/orchestrator/file_queue.py) — 各待受の列挙・パース・壊れファイル隔離（failed/）・done/ 退避を集約する共有ファイルキュー。tasks/conversations/controls/exec-confirmations が利用。待受方式（これら 4 経路は poll 据え置き／watchdog は file_audit・リソース通知に限定）の選択方針と根拠は [design §8.15](../design/design-development-system.md)
+- [`FileQueue`](../../src/orchestrator/file_queue.py) — 各待受の列挙・パース・壊れファイル隔離（failed/）・done/ 退避を集約する共有ファイルキュー。tasks/conversations/controls/exec-confirmations が利用。待受方式（これら 4 経路は poll 据え置き／watchdog は file_audit・リソース通知に限定）の選択方針と根拠は [design §8.15](../design/design-development-system.md#815-待受方式の選択方針poll--watchdog--タイマー--ssh)
 - [`ConversationManager`](../../src/orchestrator/conversation.py) — 会話セッション保持・脳 LLM（`sa-ru.model`）呼び出し・要約提示（`_present_summary`）・確定タスク生成（`create_exec_task`）。プロンプトは [`prompts/converse.md`](../../src/orchestrator/prompts/converse.md)
 - [`Orchestrator._execute_chain()`](../../src/orchestrator/__init__.py) — サブタスク連鎖実行（依存・cascading skip 対応）
 - [`Orchestrator._worker_light() / _worker_heavy()`](../../src/orchestrator/__init__.py) — カテゴリ別ワーカー（heavy は `DynamicConcurrencyLimiter` で制御、上限は §8.14 で動的変動）
@@ -272,7 +272,7 @@ ssh mac-mini "ls /opt/taka-ma/data/exec-confirmations/"
 - [`Orchestrator._execute_cross_review() / _integrate_cross_review()`](../../src/orchestrator/__init__.py) — 複数モデル並行投入 → ya-ta 統合
 - [`Orchestrator._update_status() / _push_task_context()`](../../src/orchestrator/__init__.py) — タスク状態遷移時に qu-e へ SSH push（§8.13 / A1 §5）。payload に `workspace`（`_workspace_for(task_id)` = `{workspace_base}/{task_id}`）を含め、qu-e の path→task_id 帰属を可能にする。あわせて `thread_ts` を含め、qu-e の file_audit アラートが実行中タスクと同一 Slack スレッドへ Thread 返信できるようにする（§8.12）
 - [`FileAuditHandler`](../../src/orchestrator/__init__.py) — qu-e の file_audit アラート受信（§8.12 / A1 §1〜§3）
-- [`ResourceNotifyHandler`](../../src/orchestrator/__init__.py) — qu-e のリソース最適化通知を受信し `heavy_limiter.set_limit()` で並行数上限を動的更新（§8.14、フロー図 [Appendix_resource-optimization-flow.md](../design/Appendix_resource-optimization-flow.md)）
+- [`ResourceNotifyHandler`](../../src/orchestrator/__init__.py) — qu-e のリソース最適化通知を受信し `heavy_limiter.set_limit()` で並行数上限を動的更新（§8.14、フロー図 [08-resource-optimization-flow.md](../design/details/08-resource-optimization-flow.md)）
 - [`DynamicConcurrencyLimiter`](../../src/orchestrator/concurrency.py) — 実行時に上限を変更できる `asyncio.Semaphore` 代替。heavy 並行数制御に使用（§8.14）
 - [`RemoteProcessManager.run_ssh_command() / run_model_subprocess()`](../../src/orchestrator/process_manager.py) — 汎用 SSH コマンド実行 / worker モデルの SSH 単発実行（対話不要。prompt は stdin 渡し、ただし `keychain_auth: true` のモデル（agy）は GUI 起源 tmux 内で引数渡し実行し出力ファイルで回収する `_run_in_gui_tmux`。§8.6 Antigravity・§8.7 Gemma）
 - [`WorkerPtyWrapper`](../../src/orchestrator/pty_wrapper.py) — 対話型 worker CLI 用の **汎用 PTY ラッパー**（pexpect + tmux）。起動コマンドを `command` 引数で受け取り、Claude Code / Antigravity CLI / 将来の Codex 等を共通インタフェースで扱う。`cwd`（タスク専用 workspace）を渡すと tmux `-c` で当該ディレクトリ起動。後方互換のため `ClaudeCodeWrapper` エイリアスを残置

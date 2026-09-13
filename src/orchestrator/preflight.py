@@ -121,7 +121,7 @@ class AuthPreflight:
         # キャッシュ未命中の競合で同じプローブ（Anthropic は実推論コスト）と同じ Slack 通知が
         # 多重に走るのを防ぐ（2 本目はロック解放後にキャッシュ命中で即返る）
         self._lock = threading.Lock()
-        # 到達状態（§8.3 到達性の機械付与・ADR 0002）。ssh 検査の直近の実測結果と、
+        # 到達状態（§8.3 到達性の機械付与・是正記録 2026-09-04）。ssh 検査の直近の実測結果と、
         # 合格した最新の壁時計時刻（表示用。TTL の clock は monotonic のため別に持つ）
         self._wall = wall_clock
         self.ssh_reachable: bool | None = None
@@ -145,7 +145,7 @@ class AuthPreflight:
         git / Anthropic プローブは走らせない（Anthropic は実推論 1 回ぶんのコストを払う）。
         キャッシュは check() と同じキー "ssh" を共用する — worker 起動前検査で合格していれば
         ここでも再検査せず、不達の fail_ttl 内は同じ不合格を即時に返す（設計書 §8.4「到達性
-        ゲート」・ADR 0002）。
+        ゲート」・是正記録 2026-09-04）。
         """
         with self._lock:
             self._checked("ssh", self._check_ssh)

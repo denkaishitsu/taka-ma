@@ -299,7 +299,7 @@ Slack で `/taka-ma-task プロジェクトを解析して :gemini、問題点�
 | 強制ルーティング | マルチモーダル等のハードコード強制はしない（LLM 判断 + 運用ログから精度改善） |
 | 将来統合案 | sa-ru + ya-ta を DeepSeek-V4 に統合（V4 リリース後に検討） |
 
-詳細は [設計書](../design/design-development-system.md) §2.2 / §3.3 / §3.4 / §4 / §8.4 / §10.2 を参照。
+詳細は [基本設計書](../design/design-development-system.md) §2.2、[承認パイプライン](../design/details/03-approval-pipeline.md) §3.3 / §3.4、[qu-e](../design/details/04-sentinel.md) §4、[タスク分解・分類](../design/details/08-task-routing.md) §8.4、[オーケストレーション](../design/details/10-orchestration.md) §10.2 を参照。
 
 ### ルーティングロジック（概要）
 

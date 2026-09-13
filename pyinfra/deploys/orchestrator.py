@@ -70,7 +70,7 @@ server.shell(commands=[
 ])
 
 # Step 7: Slack 通知 — 依存パッケージ
-# py-spy はハング診断用（設計書 §8.5「ハング診断の常設」・ADR 0002）。実行時依存ではない
+# py-spy はハング診断用（設計書 §8.5「ハング診断の常設」・是正記録 2026-09-04）。実行時依存ではない
 pip.packages(
     packages=["slack-sdk", "python-dotenv", "pexpect", "pyyaml", "watchdog", "py-spy"],
     virtualenv="/opt/taka-ma-env",

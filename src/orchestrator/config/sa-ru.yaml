@@ -111,6 +111,16 @@ contract:
                                                 # 環境変数 TAKA_MA_TASK_DENY_DIR（既定値は同パス）で
                                                 # 同じ場所を読む（grep で両側一致を確認する）
 
+# §8.10f 出口ゲート（完了報告前の独立検証段）— Orchestrator._run_exit_gate が参照。
+# このブロックの有無で有効化される（未構成なら従来動作＝段階導入。contract: と同じ規律）
+exit_gate:
+  model: "opus"       # 検証エージェントのモデル（ya-ta.yaml models レジストリ名）。SSH 単発・
+                      # 書き込み不能呼び出しのため keychain_auth モデルは不可（§8.4 (e) と同制約）
+  timeout_sec: 600    # 検証 LLM 1 回の応答上限（秒）。証跡込みの長プロンプト＋判定表生成のため
+                      # llm_timeout_sec（300）より長く取る
+  max_reinject: 1     # 独立検証 FAIL による差し戻し再実行の上限回数。超過は ⚠ 未達で人へ返す
+                      # （approval.max_reinject と同趣旨 — 上限は「収束しなかった」ことの表明）
+
 # モデル関連設定（routing / fallback / concurrency / models）は ya-ta.yaml に集約。
 # Orchestrator 起動時に ya-ta.yaml と当ファイルをマージして単一 config を構築する。
 

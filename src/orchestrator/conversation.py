@@ -70,7 +70,7 @@ _SAFE_WORKSPACE_RE = re.compile(r"\A/[A-Za-z0-9._/\-]+\Z")
 # #taka-ma/142。実害は 2026-08-10 Slack DM インシデント F2 の生 JSON 漏出）。
 _CONTRACT_KEY_RE = re.compile(r"""["'](?:reply|ready|summary)["']\s*:""")
 
-# 到達性の機械付与（§8.3・ADR 0002）。実行機（MBP）に届かないあいだ、会話返信の先頭へ置く
+# 到達性の機械付与（§8.3・是正記録 2026-09-04）。実行機（MBP）に届かないあいだ、会話返信の先頭へ置く
 # 固定行と、ready 依頼を止める固定文。脳 LLM に到達性を推測・創作させない（2026-09-04 実測:
 # 不達中にローカル脳が「会話履歴を閲覧する権限がない」等を創作した）
 UNREACHABLE_NOTICE_FMT = "⛔ MBP 到達不能（最終疎通 {last_ok}）"
@@ -166,7 +166,7 @@ class ConversationManager:
                 返す同期呼び出し。会話処理は to_thread 上のため同期でよい）。None なら
                 制御判定を行わない（単体テスト・段階導入用）。
             preflight: 実行機（MBP）への到達性の実測手段（AuthPreflight。§8.3「到達性の
-                機械付与」・§8.4「到達性ゲート」・ADR 0002）。各ターン冒頭で check_ssh() を
+                機械付与」・§8.4「到達性ゲート」・是正記録 2026-09-04）。各ターン冒頭で check_ssh() を
                 通し、不達なら返信先頭へ固定行を前置し ready 依頼は契約化を呼ばず止める。
                 None なら到達性を見ない（単体テスト・段階導入用）。
         """
@@ -529,7 +529,7 @@ class ConversationManager:
 
         history_snapshot = self._record_user_turn(cid, msg["text"], workspace)
 
-        # 到達性の実測（§8.3 到達性の機械付与・ADR 0002）。不達なら以降の返信に固定行を
+        # 到達性の実測（§8.3 到達性の機械付与・是正記録 2026-09-04）。不達なら以降の返信に固定行を
         # 前置し、ready 依頼は契約化を呼ばずに止める（脳 LLM に到達性を推測させない）。
         # 検査は TTL キャッシュ共用のため通常は即時（実測 0.25 秒・合格後 10 分は再検査なし）
         unreachable_notice = self._reachability_notice()
@@ -600,7 +600,7 @@ class ConversationManager:
         self._append_turn(cid, "assistant", "（着手確認を提示します）")
         if unreachable_notice:
             # 実行機に届かない依頼は契約化・実行へ進めない（fail-closed・§8.4 到達性
-            # ゲート・ADR 0002）。縮退契約を作らず固定文で止め、復旧後の再送を待つ
+            # ゲート・是正記録 2026-09-04）。縮退契約を作らず固定文で止め、復旧後の再送を待つ
             self._set_awaiting(cid, True)
             self.slack.notify(
                 f"{unreachable_notice}\n{UNREACHABLE_STOP_TEXT}", msg.get("channel_id"),
@@ -670,7 +670,7 @@ class ConversationManager:
                 self._set_awaiting(cid, True)
                 unmapped = contract_prov.get("unmapped") or []
                 if contract_prov.get("unreachable"):
-                    # 到達性ゲート合格後（pass_ttl 内）に CLI 不達へ転じた場合（ADR 0002）。
+                    # 到達性ゲート合格後（pass_ttl 内）に CLI 不達へ転じた場合（是正記録 2026-09-04）。
                     # 抽出失敗の定型（言い直しの要求）で誤誘導せず、到達不能の固定文で止める
                     text = UNREACHABLE_STOP_TEXT
                 elif contract_prov.get("empty_acceptance"):
@@ -1385,7 +1385,7 @@ class ConversationManager:
         return contract, provenance
 
     def _reachability_notice(self) -> str | None:
-        """実行機（MBP）への到達性を実測し、不達なら返信先頭の固定行を返す（§8.3・ADR 0002）。
+        """実行機（MBP）への到達性を実測し、不達なら返信先頭の固定行を返す（§8.3・是正記録 2026-09-04）。
 
         AuthPreflight.check_ssh() の TTL キャッシュを共用するため、合格後 10 分は再検査せず
         即時に None、不達の fail_ttl 内は即時に固定行を返す。preflight 未注入は到達性を

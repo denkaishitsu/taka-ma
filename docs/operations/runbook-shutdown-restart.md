@@ -1,7 +1,7 @@
 # 停止・再起動 運用 Runbook（Mac mini / MacBook Pro）
 
 - 2 台（Mac mini = 司令塔 / MacBook Pro = 実行機）の **graceful な停止・再起動手順**と、**再起動後の自動復帰前提・稼働確認**をまとめた運用ページ。
-- システム構成・役割は [00. システムの俯瞰](../procedures/00-overview.md)、設計判断は [設計書](../design/design-development-system.md) を参照。
+- システム構成・役割は [00. システムの俯瞰](../procedures/00-overview.md)、設計判断は [設計書](../design/design-development-system.md)（部位別の詳細は [details/](../design/details/)）を参照。
 - u-zu（Slack Bot）視点のサービス挙動は [u-zu 運用情報](u-zu/slack-bot.md) を参照（本ページと相互参照）。
 
 ## 目次
@@ -31,7 +31,7 @@
 
 ## ハング時の手順（沈黙したまま再起動しない）
 
-sa-ru が「プロセスは生きているがログが止まっている」状態（2026-09-04 18:46 の実例）では、**再起動の前にスタックを採取する**。採取せずに再起動すると原因が失われる（[ADR 0002](../../docs/adr/0002-outage-2026-09-04-remediation.md)）。
+sa-ru が「プロセスは生きているがログが止まっている」状態（2026-09-04 18:46 の実例）では、**再起動の前にスタックを採取する**。採取せずに再起動すると原因が失われる（[是正記録 2026-09-04](../design/revisions/2026-09-04_mbp-unreachable-outage.md)）。
 
 ```bash
 # 1. 沈黙の確認（最終ログ時刻と PID 生存）

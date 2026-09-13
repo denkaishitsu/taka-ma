@@ -106,7 +106,7 @@ class TaskContextHandler(FileSystemEventHandler):
 
 
 def log_health_transition(prev_overall, result: dict):
-    """ヘルス状態を**遷移時のみ** 1 行記録し、新しい状態を返す（ADR 0002 ログ規律）。
+    """ヘルス状態を**遷移時のみ** 1 行記録し、新しい状態を返す（是正記録 2026-09-04 ログ規律）。
 
     以前は 30 秒ごとに「healthy」を書き 1 日 2,880 行の平常報告でログを埋めていた
     （2026-09-04 実測）。初回（prev=None）と状態が変わったときだけ書く。非 healthy への

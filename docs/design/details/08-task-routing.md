@@ -1,0 +1,256 @@
+# 詳細設計: タスク分解・分類・リスク判定・契約化（ya-ta）
+
+> **位置づけ**: [設計書本体](../design-development-system.md) の詳細。本書が扱う節: §8.4。
+> 障害を契機とする設計改訂の経緯は [revisions/](../revisions/) を参照。
+
+1 つの依頼をサブタスク DAG へ分解し、execution × depth × confidence でモデルへ写像し、リスクを判定し、実行契約を組み立てるまでを扱う。
+
+---
+
+<a id="sec-8-4"></a>
+## 8.4 ② sa-ru → ya-ta（タスク分解・分類・リスク判定・契約化）
+
+| 項目 | 仕様 |
+|------|------|
+| 方式 | Python ライブラリ import（同一プロセス内） |
+| 呼び出し元 | `src/sa-ru/orchestrator.py` |
+| 呼び出し先 | `src/ya-ta/decomposer.py`, `src/ya-ta/classifier.py`, `src/ya-ta/risk_classifier.py`, `src/ya-ta/contractor.py` |
+| LLM バックエンド | 分解・分類: qwen3.8:27b（dense・ollama localhost HTTP API・正は `ya-ta.yaml` の `model`）／リスク判定: Qwen3.6-35B-A3B（MoE・同 HTTP API。下記「リスク判定のモデル分離」）／契約化: worker CLI 上位モデル（既定 opus・下記「契約化の呼び出し」。[是正 2026-09-04](../revisions/2026-09-04_mbp-unreachable-outage.md)） |
+
+**ya-ta は launchd サービスとしては廃止。** sa-ru が直接 import して関数呼び出しする。これによりクラッシュ問題（exit -15）が構造的に解消される。モジュールとしての独立性は維持する（将来のモデル差し替え対応）。
+
+**ollama 呼び出し方式（共通口・HTTP API）:**
+
+sa-ru プロセス内の全ローカル LLM 呼び出し（会話脳・分解・分類・リスク判定）は、`ollama run` の subprocess 起動ではなく **ollama HTTP API（`localhost:11434/api/generate`）** に統一する。subprocess 方式は呼び出しごとに CLI を起動し、`keep_alive` を制御できず、プロンプト全量を毎回ゼロから評価するため、会話履歴が伸びるほど毎ターン遅くなる（実運用実測: 会話 1 ターン中央値 44 秒・履歴肥大時 64〜120 秒でタイムアウト）。HTTP API 化で次を得る:
+
+- `keep_alive` によるモデル常駐（ロード往復の排除）と、同一プレフィックスの KV キャッシュ再利用
+- 接続失敗（ollama 未起動・モデル未 pull）と生成タイムアウトの例外区別。上位はこの種別をユーザー通知にそのまま反映する（§8.3 エラーハンドリング。包括的な「内部エラー」表現は使わない）
+- タイムアウト値は実測の p95 に余裕を載せて config（`sa-ru.yaml` / `ya-ta.yaml`）で管理する。実所要と同水準の際どい値（旧: 分解 58 秒実測に対し timeout 60 秒）を置かない
+
+**思考（thinking）の制御:**
+
+思考型モデルでは思考トークンの生成が応答時間の支配項になる（実測: 会話 1 ターンの思考約 1400 トークン＝30 秒、分解の思考 3352 トークン＝281 秒。think 無効化でそれぞれ 2〜3 秒・12 秒）。呼び出し用途ごとに config の `llm_think` で制御する（`sa-ru.yaml`＝会話 / `ya-ta.yaml`＝分解・分類・リスク判定。未指定はモデル既定に従い、think 非対応モデルには送らない）。会話・分解いずれも構造化出力が主で、思考の品質寄与より応答時間の実害が大きいことを実機で確認して無効化を既定とした。判定品質の劣化が運用ログ（判定ログ §8.4.1）で観測された場合は、該当用途のみ有効へ戻して比較する。
+
+**リスク判定のモデル分離（応答速度）:**
+
+リスク判定は worker のツール呼び出しごとに同期で挟まる位置に在り、1 回の所要時間がツール数に比例して worker の実行時間へ積み上がる。実測（2026-07-29 本番ログ・ファイル 1 個作成の agent サブタスク）では、worker ステップ 68.6 秒のうち承認判定が 47.3 秒（69%）を占め、その内訳はツール 3 回分のリスク判定 32.6 秒 ＋ qu-e 審査 14.7 秒だった。つまり worker の起動・推論ではなく**承認ゲート内のローカル LLM が支配項**である。
+
+そこでリスク判定のモデルを分解用と分けて `ya-ta.yaml` の `risk_model` で指定する（分解は判定品質優先で dense、リスク判定は応答速度優先で MoE）。実測（2026-07-30・Mac mini・両モデル常駐・同一プロンプト 5 操作: 読み取り / 書き込み / `rm -rf` / `git push --force` / 参照系コマンド）:
+
+| モデル | 1 判定あたり | tier 判定 |
+|---|---|---|
+| Qwen3.6-27B（dense・従来） | 9.4〜12.8 秒 | 基準 |
+| Qwen3.6-35B-A3B（MoE・採用） | 2.0〜2.4 秒 | 5 操作すべて一致 |
+
+MoE 側は sa-ru の会話脳と同一モデルで、Mac mini に既に常駐しているため追加メモリを要さない。tier の一致は上記 5 操作での確認であり、判定品質の継続監視は判定ログ（§8.4.1）で行う。
+
+**タスク分解の呼び出し:**
+
+ユーザーの1つの指示をサブタスクに分解し、各サブタスクの分類と依存関係を判定する。
+単純な指示（1つのモデルで完結する）はサブタスク1件として返す。
+
+**分解粒度（過剰分割の抑制）:** 分割は「対象が別々で依存が無い（並行実行で短くなる）」か「前段の結果を見ないと後段が決まらない」ときに限る。同じ対象に対して同じ担当が続けて行うだけの工程（内容を決める → その内容をファイルへ書く 等）を分けると、実行者は同じまま worker 起動と操作ごとの承認判定が丸ごと重複し、その分だけ遅くなる。実測（2026-07-29）ではファイル 1 個の作成が 2 サブタスクに分割され、余分な 1 件が 68 秒を要した。この規則は分解プロンプト（`src/ai_gateway/prompts/decompose_task.md`）に置く。
+
+```python
+from ya_ta.decomposer import TaskDecomposer
+
+decomposer = TaskDecomposer(config)
+subtasks = decomposer.decompose("プロジェクトを解析して、設計を見直して、コードを修正して")
+# => [
+#   {"step": 1, "command": "プロジェクト全体を解析", "execution": "agent", "depth": "deep",    "confidence": 0.9, "depends_on": []},
+#   {"step": 2, "command": "解析結果に基づき設計見直し", "execution": "agent", "depth": "deep",    "confidence": 0.9, "depends_on": [1]},
+#   {"step": 3, "command": "設計に従いコード修正",     "execution": "agent", "depth": "shallow", "confidence": 0.85, "depends_on": [2]}
+# ]
+```
+
+**分解結果の JSON 構造（`category` を `execution` + `depth` の 2 軸へ）:**
+
+| フィールド | 型 | 説明 |
+|-----------|---|------|
+| `step` | int | サブタスク番号（1始まり） |
+| `command` | str | サブタスクの内容 |
+| `execution` | str | `inline`（純生成・単発）/ `agent`（探索・ツール使用・対話反復）。写像テーブルの入力軸（レーンは写像後モデルの method で決まる・§2.2） |
+| `depth` | str | `shallow` / `deep` / 省略（null）。モデル階梯を決める |
+| `confidence` | float | ya-ta の自己申告（0.0–1.0）。`routing.confidence_threshold` 未満は「迷い」として sonnet へ落とす |
+| `depends_on` | list[int] | 依存するステップ番号のリスト。空リスト = 依存なし（即座に実行可能） |
+
+**モデルへの写像は ya-ta ではなく orchestrator が行う**（§2.2 の写像テーブル）。ya-ta は execution/depth/confidence の生判定のみ返し、`model` フィールドはユーザーが `:モデル名` を明示指定したときにのみ格納する。
+
+**タスク分類の呼び出し:**
+
+分解時に分解脳（qwen3.8:27b）がカテゴリも同時に判定するが、個別のサブタスクに対して再分類が必要な場合にも使用する。
+
+```python
+from ya_ta.classifier import TaskClassifier
+
+classifier = TaskClassifier(config)
+result = classifier.classify("ログインフォームを実装して")
+# => {"execution": "agent", "depth": "deep", "reason": "...", "confidence": 0.92}
+```
+
+**リスク判定の決定的前置フィルタ（LLM を呼ぶ前に確定させる）:**
+
+リスク判定 LLM の**前**に、コード側の固定リストで決定的に確定させる 2 段を置く（決定的にできる仕事を LLM にさせない・§8.10g の原則の承認ゲートへの適用。[是正 2026-08-29](../revisions/2026-08-29.md)）:
+
+1. **読み取り専用ツールの固定小リスト**（Read / Grep / Glob / LS / ToolSearch / WebSearch 等 — tool_name の完全一致・コード側定数）→ **Tier 1 確定・LLM 不呼出**。副作用を持たないツール名だけを列挙し、Bash 等の内容依存ツールは含めない（コマンド文字列の自然文解析はしない — 判定できないものはリストに入れない fail-closed）
+2. **既定 deny リスト該当**（§8.10f 環境改変の既定 deny）→ 従来どおり deny
+
+LLM が判定するのは残りだけ。承認ゲートのレイテンシ（ツール毎に同期で挟まる・§8.4 実測 69%）も読み取り操作分だけ消える。
+
+**リスク分類の呼び出し:**
+
+```python
+from ya_ta.risk_classifier import RiskClassifier
+
+risk = RiskClassifier(config)
+result = risk.classify("Write to: src/app.ts")
+# => {"tier": 2, "reason": "ファイル書き込み", "action": "route_to_qu-e"}
+```
+
+**意図判定の呼び出し（sa-ru 会話層からの移管）:**
+
+発話の意図（雑談・リポ状態確認・進捗確認・実行依頼）の判定は、分解・分類・契約化と同族の「構造化出力」業務であり、ya-ta（`IntentClassifier`）が担う。旧来この判定は sa-ru の会話脳（速度優先で選定したアクティブ 3B）が返信生成と同時に行っていたが、実行依頼を状態確認と誤判定して成果物に到達しない事故が反復した（[是正 2026-08-26](../revisions/2026-08-26.md)・[是正 2026-09-07](../revisions/2026-09-07.md)）。判定と返信生成を分離し、判定を検証可能な単能業務として ya-ta へ置く。
+
+- **出力契約**: `{action: "chat"|"probe_repo"|"probe_task"|"execute", confidence: 0〜1, evidence: 発話からの逐語引用}`。evidence は判定根拠の**逐語引用を必須**とし、受理時に発話原文と文字列照合する（出所束縛 §8.10f と同一原理。引用が原文に存在しない判定は棄却）
+- **バックエンドと昇格**: 一次 = ローカル `ya-ta.model`（ollama HTTP）。二次 = worker CLI（`contractor.model` と同じ opus 経路・`escalate_runner` 注入）。中間段は置かない（判定業務での中間モデルの信頼性データが無く、段数分だけ遅延が増えるのみ。契約化の opus 直行の実績に合わせる）
+- **昇格条件（すべて機械判定・自己申告に依存しない）**: (1) スキーマ不合格（action が 4 値以外・キー欠落・confidence 非数値）→ 同段 1 回再試行、再不合格で次段 (2) evidence の逐語照合不合格 → 即次段 (3) `confidence < routing.confidence_threshold`（既存キー流用）→ 即次段 (4) 二段目の呼び出し前に `AuthPreflight.check_ssh`（§8.4 到達性ゲートと同一・キャッシュ共用）を通し、不達なら昇格せず fail-closed
+- **fail-closed の向き**: 全段不合格・昇格不能の最終防衛は必ず `action=chat`（会話継続 = 人への確認質問）へ倒す。誤って実行へ進む事故と誤って質問する事故は非対称であり、後者が常に安い。probe への誤爆も同じ理由で、確信の持てない判定は probe にも execute にも進めない
+- **記録**: 毎判定を判定ログ（§8.4.1）へ kind=intent で記録する。一次と二次の判定が食い違った場合は二次（opus）を採用し**両方を記録**する（一次モデルの誤り率を実測し、換装判断 §8.4.1 の材料にする — 契約化と同じ規律）
+**契約化の呼び出し（§8.10f 契約化パスの実行主体）:**
+
+依頼理解の構造化（会話 → 実行契約 `{directive, constraints, acceptance, runbook, workspace, branch, target_paths, needs_repo, rest_summary, unmapped}` の抽出）は、分解・分類と同族の「構造化出力」業務であり、ya-ta（`Contractor`）が担う。ただし LLM バックエンドは**ローカルモデルではなく worker CLI の上位モデル（既定 opus）** を用いる。
+
+来歴: 当初は sa-ru の会話脳（MoE）→ 次に ya-ta のローカル dense へ移したが、いずれも実測で不合格が続いた（[是正 2026-08-28](../revisions/2026-08-28.md)・[是正 2026-08-29](../revisions/2026-08-29.md)）。ローカル 27B 級 3 世代（DeepSeek-R1 32B / Qwen3.6-27B / qwen3.8:27b）のどれもこの責務で合格しなかったことを受け、契約化のみ上位モデルへ移す。契約化は (1) ready 毎 1 回と全 LLM 業務で最低頻度、(2) 誤りのコストが最大（下流の計画・実行・検査を全て誤らせる）であり、「高価で確実なモデルを最低頻度・最重要の 1 点に使う」配分である。分解・分類・リスク判定はローカル維持（頻度・実測不合格の実績が契約化と異なるため。分解・分類の失敗率は判定ログ §8.4.1 で継続実測し、換装判断の材料とする）。
+
+- **呼び出しチャネル**: 契約化はツール実行を伴わない単発生成のため、worker CLI の SSH 単発（`claude -p <プロンプト> --model <flag>`。`model_flag` は `ya-ta.yaml` の models 登録が源）で呼び、stdout から JSON を抽出する。stream-json・PreToolUse フック・workspace は使わない（書き込み能力を持たない呼び出し）。実行関数は sa-ru が `Contractor` へ注入する（ya-ta モジュールに SSH・CLI 依存を持ち込まない — ライブラリ方式の維持）。会話応答を塞ぐ位置のためハートビート進捗通知（§10.8）の配下で行う
+- **設定**: `ya-ta.yaml` の `contractor.backend`（`worker_cli` / `local`）と `contractor.model`（models レジストリのキー参照・既定 opus。モデル名をコードに直書きしない）。分解・分類（`model`）・リスク判定（`risk_model`）の設定は不変
+- **検証は不変**: どのバックエンドの出力も受理判断は sa-ru の `validate_contract`（逐語照合・出所束縛・kind 許可リスト・fail-closed）のみ。上位モデルの出力も信用しない（権威はフィールドの原則）
+- **不合格 2 回で fail-closed**: 既定バックエンドが最上位のため、契約化への昇格ラダー適用（旧 §8.4.x (e) 第 1 号）は廃止する。パース不能・検証不合格が 2 回連続したら着手確認を出さず不足を人に確認する
+- **到達性ゲート（[是正 2026-09-04](../revisions/2026-09-04_mbp-unreachable-outage.md)）**: 契約化を呼ぶ前に sa-ru が `AuthPreflight.check_ssh()`（ssh 検査のみ。§8.5 の worker 起動前検査と同じ TTL キャッシュ `pass_ttl_sec` / `fail_ttl_sec` を共用し、Anthropic プローブは走らせない）を通す。不合格なら契約化を呼ばず、固定文「実行機（MBP）到達不能のため契約化・実行不可。復旧後に再送してください」（先頭に §8.3「到達性の機械付与」の固定行）を返して止まる。負担は実測 0.23〜0.26 秒・合格後 10 分は再検査しない
+- **不達は fail-closed（[是正 2026-09-04](../revisions/2026-09-04_mbp-unreachable-outage.md)）**: worker CLI の**呼び出し自体の失敗**（SSH 不達・CLI エラー・認証失効。検証不合格は含まない）が `ATTEMPTS` 回続いても、ローカル `ya-ta.model` へは縮退しない。`Contractor` は不成立（origin=None・来歴 `unreachable=true`）を返し、呼び出し側は上記の固定文で止まる。`contractor.backend: local` と `escalate_runner` 未注入（単体テスト・段階導入）のローカル契約化は従来どおり（[是正 2026-09-04](../revisions/2026-09-04_mbp-unreachable-outage.md)）
+- **記録**: 契約化の backend・validate 結果・不達停止（`unreachable`）を判定ログ（§8.4.1）へ記録する
+
+```python
+from ya_ta.contractor import Contractor
+
+contractor = Contractor(config, escalate_runner=...)  # escalate_runner は sa-ru が注入（§8.4.x (e)）
+raw = contractor.contract(history_view, summary)
+# => {"directive": ..., "constraints": [...], "acceptance": [...], "runbook": [...],
+#     "workspace": ..., "branch": ..., "target_paths": [...], "needs_repo": ...,
+#     "rest_summary": ..., "unmapped": [...]}
+```
+
+- 入力は sa-ru が渡す**会話履歴の二窓ビューと確定要約**のみ（会話セッションの持ち主は sa-ru のまま。ya-ta は状態を持たない）
+- プロンプトは `src/ai_gateway/prompts/contract.md`（契約化専用。orchestrator 側から移動し、重複を残さない）。バックエンド・モデルは上記 `contractor.backend` / `contractor.model` が正。ローカル実行（`backend: local`）時のタイムアウト・think は `ya-ta.yaml` の既存キー（`llm_timeout_sec` / `llm_think`）を共用する
+- **受理判断は ya-ta に持たせない**: ya-ta が返すのは抽出結果（パース済み JSON）まで。検証は従来どおり sa-ru 側コード `validate_contract`（逐語照合の出典＝ユーザー発話・kind 許可リスト・fail-closed）が行う — 権威はフィールドの原則（§8.10f）は移管後も不変
+
+**フォールバック（ya-ta 自体の判定エラー時の安全側挙動）:**
+
+- タスク分解: パースエラー時 → 元の指示をサブタスク1件（`execution: agent` / `depth` 省略 / `confidence: 0.0`）として扱う。これは写像テーブル上 sonnet（中位・万能）へ落ち、かつ agent レーンで実行される安全側の既定
+- タスク分類: パースエラー時 → `{"execution": "agent", "depth": null, "confidence": 0.0}`（安全側に倒す＝sonnet）
+- リスク分類: パースエラー時 → `{"tier": 3}` （人間判断に倒す）
+- 契約化: パースエラー・検証（`validate_contract`）FAIL が 2 回連続 → fail-closed（着手確認を出さず不足を人に確認・§8.10f）。既定バックエンドが最上位（opus）のため昇格ラダーは適用しない。worker CLI の呼び出し自体の失敗は fail-closed（到達不能の固定文で停止し、ローカルへ縮退しない。[是正 2026-09-04](../revisions/2026-09-04_mbp-unreachable-outage.md)）。分解・分類のような「安全側の既定値」への縮退はしない（推測で埋めた契約は逐語原則に反する）
+- confidence < `routing.confidence_threshold`（既定 0.8）の判定 → 写像テーブル上で自動的に sonnet（迷いの落下先）へ。旧「light → heavy 強制ルーティング」はこの落下で置換された。閾値は設定ファイルで管理し、判定ログの実データで較正する（§2.2「閾値・rubric は実データで較正」）
+
+**LLM 呼び出し・出力の失敗検知（フォールバック発動条件の明確化）:**
+
+上記フォールバックは「パースエラー時」を発動条件とするが、その手前で失敗が握りつぶされ、空・不正な出力が正常値として下流へ流れる経路があってはならない。次を失敗として検知し、各用途の安全側フォールバックへ合流させる。
+
+- **ollama 実行失敗の検知**: ローカル ollama 呼び出し（上記「ollama 呼び出し方式」の HTTP API）は `stream=true` の NDJSON 逐次受信で行う。接続先は `sa-ru.yaml` の `sa-ru.ollama_host` を唯一の源として呼び出し元から渡す。接続失敗・HTTP エラー応答・ストリーム中のエラーチャンク／不正行を失敗とみなし、内容を添えて例外を送出する（ollama 未起動・モデル未 pull 等で空・部分的な出力が返っても、それを正常な生成結果として返さない）。呼び出し側はこの例外をパースエラーと同列に扱い、用途別フォールバック（分解＝元指示1件を `execution: agent`／分類＝`execution: agent`・`depth` 省略・`confidence: 0.0`＝sonnet／リスク＝tier3）へ落とす。timeout は deadline 方式で接続〜生成完了の全体に適用する（ストリーミングで逐次受信していても、生成全体が timeout を超えたら打ち切って timeout 例外を送出する）。timeout 値はコードに置かず yaml を唯一の源とする（分解・分類・リスク判定＝`ya-ta.yaml` の `ya-ta.llm_timeout_sec`、会話応答＝`sa-ru.yaml` の `sa-ru.converse_timeout_sec`）。ストリーミングの受信チャンク数は生成トークン数の進捗として共有ホルダーに記録し、ハートビート進捗通知（§10.8）が読む。
+- **分解結果の構造検証**: 分解出力は「サブタスクの配列」であり、各要素が少なくとも `command` と `execution` を持つことを検証する。`step` を欠く要素は配列順の連番（1始まり）で補完する（下流の依存解決が `step` を前提とするため、欠落を放置すると無音でロストする）。`depth` 欠落は「省略」（null）として正規化する。配列でない・必須フィールドを欠く要素を含む等、構造が満たされない場合はフォールバック（元指示1件を `execution: agent`＝sonnet）へ落とす。
+- **confidence 欠損値の正規化**: `confidence` が欠落または `null` の場合は既定値（現行同様 1.0）として扱い、閾値比較で例外を起こさない。値の欠損自体でフォールバック全体を落とさない。
+- **JSON 抽出の対応括弧**: LLM 出力からの JSON 本体抽出は、開き括弧と同種の閉じ括弧（`{`↔`}` または `[`↔`]`）を対にして切り出す。開き `{` と別種の閉じ `]` を跨ぐ等、対応の取れない不整合な範囲を返さない。
+
+<a id="sec-8-4-1"></a>
+### 8.4.1 判定ログの記録と Phase 2（プロンプト自動改善）
+
+ya-ta の分類精度を運用ログから継続改善するための土台。**記録（本節 live 経路）→ 蓄積 → 消費（Phase 2）** の 2 段で構成する。
+
+**(1) 記録経路（live・本タスクで実装済み）**
+
+live の正規分類経路は `TaskDecomposer.decompose()` である。各サブタスクの判定が確定した時点で `YaTaLogger.log_decision()` を呼び、判定ログを追記する。`TaskClassifier.classify()`（個別サブタスクの再分類用・呼ばれた場合のみ）も同様に記録する。
+
+| 項目 | 仕様 |
+|------|------|
+| 記録箇所 | `src/ai_gateway/decomposer.py` `decompose()`（サブタスク単位）／ `classifier.py` `classify()`（再分類時） |
+| 記録値 | モデルの**生判定**（`execution` / `depth` / `model` / `reason` / `confidence`）。orchestrator による写像・昇格の**前**の生軸を残す（Phase 2 と閾値較正が「モデルがどう軸を誤ったか」を学習対象にするため。§2.2「閾値・rubric は実データで較正」の入力データでもある） |
+| 出力先 | `/opt/taka-ma/logs/ya-ta-decisions-{YYYY-MM-DD}.jsonl`（日付別・1 行 1 判定の JSONL）。設定源は `ya-ta.yaml` の `decision_log_dir` |
+| 耐障害 | ログ書き込み失敗は分解・分類の本体処理を壊さない（try/except で握る）。判定ログは運用改善の補助であり実行の必須経路ではない |
+
+> 注意（来歴）: 旧実装は `classify()` のみに記録を入れたが、`classify()` は live で呼ばれず（live は `decompose()`）、production では判定ログが 1 件も残っていなかった。後続改修で `decompose()` に記録を移し、live で実際に蓄積されるようにした。
+
+**契約化・構造検証の記録（追加）**: 契約化（`Contractor.contract()`）も同ログへ記録する — backend（worker_cli / local）・モデル・`validate_contract` の合否と不合格理由・不達停止（`unreachable`）。あわせて分解・分類の**構造検証の失敗**（パースエラー・必須フィールド欠落によるフォールバック発動）も記録し、失敗率を期間集計できるようにする。この集計が「分解・分類も worker CLI 上位モデルへ移すか（契約化に続く換装）」の判断材料となる（推測ではなく実測で決める）。
+
+**ローカル脳の換装判断基準（実測駆動）:**
+
+判定ログから次の指標を集計スクリプト（LLM 不使用・JSONL パースのみ）で算出し、いずれかの発動基準に達したら該当業務の worker CLI 換装（と qwen3.8:27b の常駐解除の要否）をユーザーへ提案する:
+
+| 指標 | 導出元 | 発動基準（初期値・実データで較正） |
+|------|--------|--------------------------------|
+| 分解フォールバック率 | `分解フォールバック発動` エントリ / 分解総数 | 7 日間で 5% 超 |
+| 契約化の不達停止率 | kind=contract の unreachable / 総数（2026-09-05 以前の記録は `degraded` キーで同義） | 7 日間で 20% 超（CLI 側の可用性問題として切り分け） |
+| 会話脳の重大誤出力 | 実障害の手動記録（例: 2026-08-30 23:50 の converse.md L67 例文オウム返し — プロンプト例文が返信に逐語出現） | 1 件でも再発したら会話脳の換装検討を起票 |
+
+会話脳の例文エコーは機械検出可能（返信がプロンプト例文集合と逐語一致したら棄却・実測ログへ記録）であり、検出器の実装は本基準の運用開始とセットで行う。
+
+**(2) 消費 = Phase 2: プロンプト自動改善（後追いバッチ・現時点では未実装）**
+
+蓄積した判定ログを入力に、分類プロンプトを改善する後追い処理。**記録経路が無ければ入力データが存在せず Phase 2 自体が成立しない**ため、(1) が前提となる。
+
+1. **収集**: `ya-ta-decisions-*.jsonl` を期間指定で読み込む。
+2. **実結果の突合**: 各判定に対し、実行成否・人手による再分類/やり直しの有無を `actual_result` として突合する（記録時点では `actual_result` は空。この突合機構は Phase 2 で新設する）。
+3. **誤判定の特定**: 判定 `execution` / `depth` / `confidence` と実結果（実行成否・昇格発生）が食い違うエントリを誤判定として抽出する。
+4. **パターン抽出**: 誤判定をクラスタリングし、「本来 agent/deep だが inline や shallow と誤判定されやすい言い回し」「confidence を過大申告しやすいパターン」等の傾向を得る（§2.2 の閾値較正の入力）。
+5. **few-shot 反映**: 抽出パターンを分類プロンプト（`decompose_task.md` / `classify_task.md`）に few-shot 例として追記する（**モデル重みは変えず、プロンプトのみ改善**）。
+6. **適用**: 更新プロンプトで以後の分解・分類を実行する。
+
+<a id="sec-8-4-x"></a>
+### 8.4.x 相互扶助機能（全モデル横断、ya-ta の中核価値）
+
+ya-ta の本質的な価値は「**すべての worker LLM が任意の組み合わせで互いを補える**」点にある。特定モデル（例: Gemini）が固定的に「セカンドオピニオン担当 / フォールバック担当」になるわけではない。`ya-ta.yaml` の `models` に登録された全モデルが、状況に応じて以下の機能の参加候補になる。
+
+**(a) 障害・難所フォールバック（昇格ラダーによる段階代替）**
+
+写像テーブルで決めた primary モデルが失敗、または worker が難所を自己申告した場合、`routing.escalation.ladder`（既定 `[haiku, sonnet, opus]`）に沿って段階的に上位へ切替える（旧 `category_defaults` 配列の順次代替を置換）。ラダーは管理者が編成可能。
+
+| 例（ladder `[haiku, sonnet, opus]`） | 挙動 |
+|---|---|
+| haiku が API エラー / `ESCALATE:` 申告 | sonnet で再実行（昇格通知） |
+| sonnet も失敗 | opus で再実行 |
+| opus も失敗 | 次段なし → failed |
+| gemini 等の horizontal fallback | `models.<name>.fallback` に別モデルを列挙した場合はそちらを優先（マルチモーダル障害時の gemini→gemini-pro 等） |
+
+**(b) 能力不足フォールバック（迷い → sonnet、実行時は昇格ラダー）**
+
+ya-ta の confidence が `routing.confidence_threshold` 未満、または depth 省略の場合、写像テーブルが自動的に sonnet（中位・万能）を選ぶ（旧「light→heavy 昇格」を入口の写像で置換）。実行後にさらに難所へ当たれば昇格ラダーで opus まで引き上げる。特定モデルの専売ではなく、ラダー上のモデルが順に引き受ける。
+
+**(c) cross-review（複数モデル並行投入によるクロスチェック）**
+
+ユーザーが `:opus :gemini` / `:opus :sonnet` / `:gemma :haiku` 等で **任意の複数モデルを明示指定** → 各モデルへ並行投入し、ya-ta（分解脳モデル）が結果を統合して 1 メッセージで返す。
+
+- モデル組み合わせは制限なし（Claude 系同士 / 軽量同士 / マルチモーダル混在 / 3 モデル以上 すべて可）
+- 各モデルは「明示指定扱い」のため個別の fallback は行わない（指定モデル尊重）
+- 部分成功許容: 1 つでも成功すれば成功分を統合
+
+**(d) 実行途中の能力切替（将来拡張）**
+
+主モデル実行中に「タスクの中身がそのモデルの能力範囲を超える」ことが判明した場合（例: Claude Code が動画の高度な解析の必要を検出 → マルチモーダル解析能力を持つ Gemini に引き渡し）、ya-ta が再判定して別モデルへ受け渡す機能。
+
+- **現状: 未実装**。初動の ya-ta 判定で決まったモデルが最後まで実行する
+- 将来、タスク中間で `capabilities` 不足を検出した際に再ルーティングする経路を追加する予定
+
+**(e) 脳系業務の昇格ラダー（脳系構造化出力への相互扶助適用）**
+
+(a)(b) は worker の**実行**を対象とするが、相互扶助は ya-ta 自身の**脳系業務**（構造化出力）にも適用できる。実装第 1 号は契約化だった（[是正 2026-08-28](../revisions/2026-08-28.md)）。**ただし契約化はその後、既定バックエンド自体が worker CLI の最上位モデル（opus）となったため、本ラダーの適用対象から外れた**（opus の不合格を下位モデルで救う意味がないため。§8.4「契約化の呼び出し」が現行の正）。本節の機構定義は、将来ローカル脳系業務（分解・分類等）へ昇格を適用する場合の型として維持する。以下の記述は契約化へ適用していた当時の仕様（機構の定義として有効）:
+
+- **発火条件**: 契約化の出力がパース不能、または sa-ru の `validate_contract` で不合格 — が**ローカルモデル（`ya-ta.model`）で 2 回連続**したとき
+- **昇格先**: `routing.escalation.ladder`（既定 `[haiku, sonnet, opus]`）を (a) と共用し、各段 1 回ずつ同一プロンプト（`contract.md`）で再契約化する。専用ラダーの設定キーは新設しない（管理者は既存キーで編成する）
+- **検証は同一**: どの段で生成された契約も受理判断は sa-ru の `validate_contract` のみ（権威はフィールド・逐語照合の出典はユーザー発話のまま）。段の実行エラー（SSH 不達・CLI エラー・タイムアウト）は検証 FAIL と同列にその段の失敗とし、次段へ進む
+- **呼び出しチャネル**: worker CLI の SSH 単発呼び出し（定義は §8.4「契約化の呼び出し」の呼び出しチャネルと同一。重複記述を持たない）
+- **全段失敗**: fail-closed（§8.10f）— 着手確認を出さず不足を人に確認する。従来と同じ最終防衛であり、ラダーは「人へ届く前の段階」を増やすだけで受理基準を緩めない
+- **可視化**: 昇格で確定した契約には、着手確認へ「契約化: ローカル検証不合格 2 回 → <モデル名>（昇格）」の来歴行を機械付与する（どの脳が立てた契約かを人が承認時に見える）。試行列（モデル・不合格理由）は判定ログ（§8.4.1）へ記録し、ラダー較正の実データとする
+
+**機能の対象モデル**
+
+`ya-ta.yaml` の `models.<name>.capabilities` / `methods` で各モデルが対応可能な能力・経路を宣言。ya-ta はユーザー指定・ya-ta 判定・配列設定からこれらを引き合わせて選択する。**「Gemini = セカンドオピニオン担当」のような固定割り当ては存在しない。**
+

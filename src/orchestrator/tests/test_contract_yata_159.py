@@ -143,13 +143,13 @@ def test_cli_invalid_twice_fails_closed_without_local(monkeypatch):
 
 
 def test_cli_exec_failure_fails_closed_without_local(monkeypatch):
-    """CLI の呼び出し自体の失敗（SSH 不達等）が続いても縮退しない（ADR 0002・§8.4）。
+    """CLI の呼び出し自体の失敗（SSH 不達等）が続いても縮退しない（是正記録 2026-09-04・§8.4）。
 
     2026-09-04 に縮退契約が誤リポ名・完了条件なしの計画を生んだ是正。ローカルを呼ばず
     不成立（origin=None・unreachable=True）を返し、呼び出し側が到達不能の固定文で止まる。
     """
     def _no_local(*a, **k):
-        raise AssertionError("CLI 不達でローカルへ縮退してはならない（ADR 0002）")
+        raise AssertionError("CLI 不達でローカルへ縮退してはならない（是正記録 2026-09-04）")
     monkeypatch.setattr(contractor_mod, "run_ollama", _no_local)
 
     def _dead_cli(name, prompt):
@@ -299,7 +299,7 @@ class _FakeContractor:
 
 
 def test_build_contract_never_marks_degraded():
-    """縮退モードは廃止（ADR 0002）: 来歴に何が在っても _contract_degraded を立てない。"""
+    """縮退モードは廃止（是正記録 2026-09-04）: 来歴に何が在っても _contract_degraded を立てない。"""
     mgr = _manager(tempfile.mkdtemp())
     mgr.contractor = _FakeContractor(
         _raw(acceptance=[{"kind": "pushed", "params": {}}]),
@@ -497,6 +497,6 @@ def test_format_contract_shows_rest_summary_and_degraded():
         {**base, "rest_summary": "README を追記する"})
     # キー欠落（旧レコード）は「旧契約」と明示（確定要約フォールバックは廃止・2026-09-03）
     assert "残り作業（分解対象）: 未特定（旧契約）" in fmt(base)
-    # 縮退モード行は廃止（ADR 0002）: 旧キーが残っていても表示しない
+    # 縮退モード行は廃止（是正記録 2026-09-04）: 旧キーが残っていても表示しない
     text = fmt({**base, "rest_summary": None, "_contract_degraded": True})
     assert "縮退モード" not in text
