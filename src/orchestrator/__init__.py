@@ -49,7 +49,8 @@ from orchestrator import runbook as runbook_rules
 from orchestrator.concurrency import DynamicConcurrencyLimiter
 from orchestrator.conversation import ConversationManager
 from orchestrator.grounding import GroundingReport, GroundingVerifier
-from orchestrator.plan import PlanService, effective_deps
+from orchestrator.plan import (PlanService, drop_verification_subtasks,
+                               effective_deps, is_verification_text)
 from orchestrator.resource_monitor import ResourceMonitor
 from orchestrator.file_queue import FileQueue, atomic_write_json
 
@@ -255,6 +256,76 @@ def _escalate_reason(output: str) -> str | None:
         if stripped.startswith(ESCALATE_MARKER):
             return stripped[len(ESCALATE_MARKER):].strip() or "(理由未記載)"
     return None
+
+
+# 根拠文書が**自ら宣言した**指摘・要件（§8.10f 昇格の第 3 の引き金）。宣言は 2 形あり、
+# 意味が違うので読み分ける:
+#   - 個別番号 `指摘1` `要件2` `【3】` … 依頼が 1 件ずつ番号を振っている（異なり数を数える）
+#   - 総数     `指摘 16 件` …………… 依頼が総数だけを述べている（その数がそのまま件数）
+# 「指摘 16 件」を番号 16 番と読むと 1 件に潰れる（2026-09-14 実運用の依頼で実測）。
+# 箇条書き行は数えない — 実運用 94 件では前提（repo:/docs: 等）・決定事項・成果物が混在し、
+# 件数とみなすと期待値が最大 23 件まで膨らみ、半数の依頼で誤って「判定表が足りない」となる。
+_FINDING_TOTAL_RE = re.compile(r"(?:指摘|要件|項目)\s*(\d+)\s*件")
+# `(?!\d)` は数字の途中で切って総数形を番号形へすり替える後戻りを塞ぐ
+# （これが無いと「指摘 16 件」が『指摘 1』＋残り "6 件" として番号扱いになる）
+_FINDING_MARKER_RE = re.compile(
+    r"(?:指摘|要件|項目)\s*(\d+)(?!\d)(?!\s*件)|【\s*(\d+)\s*】")
+
+
+def _expected_verdict_count(task: dict) -> tuple[int, bool]:
+    """判定表に最低限並ぶべき行数と、その期待値が厳格か（未達まで倒してよいか）を返す。
+
+    設計書 §8.10f「検証出力の形式的完全性」。期待値は
+    「確定要約の宣言件数（個別番号の異なり数と総数宣言の大きい方。無ければ 1）
+    ＋ constraints 件数 ＋ acceptance 件数」。constraints / acceptance は人が着手確認で
+    承認した構造データであり、検証はそれぞれに触れる規約のため件数に数える。
+    中身の正誤は見ない（件数・欠落のみ）。
+
+    第 2 要素（strict）は不足を未達（fail-closed）まで倒してよいか。倒してよいのは
+    **依頼が 1 件ずつ番号を振っているとき**だけとする:
+
+    - 個別番号あり（`指摘1` `指摘2` …）→ strict。列挙された当の 1 件ずつを見ていない検証は
+      信用の根拠を欠く
+    - 総数だけ（`指摘 16 件`）→ strict にしない。検証側が関連する指摘をまとめて 1 行に
+      畳むのは正当で、総数との差で未達を出すと済んだ仕事を未達と呼ぶ誤りになる。
+      期待値としては使う（不足なら上位モデルで取り直す）
+    - 宣言なし（散文）→ strict にしない（同上・実運用の大多数）
+    """
+    text = task.get("command") or ""
+    marked = {m.group(1) or m.group(2) for m in _FINDING_MARKER_RE.finditer(text)}
+    totals = [int(m.group(1)) for m in _FINDING_TOTAL_RE.finditer(text)]
+    declared = max([1, len(marked)] + totals)
+    expected = (declared + len(task.get("constraints") or [])
+                + len(task.get("acceptance") or []))
+    return expected, bool(marked)
+
+
+def _settle_self_referential(report: "ExitGateReport") -> "ExitGateReport":
+    """独立検証レポートそのものを求める要件を、実装担当の未達から外す（§8.10f）。
+
+    依頼者が成果物欄・完了条件に「独立検証レポート」と書くと、検証エージェントはそれを
+    要件として数え、レポート実体が成果物に無いため未解消と判定する。差し戻すと worker が
+    自前の検証レポートを書き始める — 実装担当による自己検証そのもので、本段が廃したはずの
+    ものが依頼文の書き方だけで復活する（2026-09-14 実測）。この段が現に生んでいるレポートで
+    満たされる要件のため、resolved として扱い、残りの判定だけで合否を組み直す。
+
+    新規不整合（new_issues）と、自己言及でない未解消は一切緩めない。
+    """
+    if report.ok or not report.items:
+        return report
+    bad = [it for it in report.items
+           if it.get("verdict") != "resolved" and not is_verification_text(it.get("req") or "")]
+    if bad or report.new_issues:
+        return report            # 実体のある未達が残る＝緩めない
+    settled = [{**it, "verdict": "resolved",
+                "evidence": (it.get("evidence") or "") + "（本独立検証レポートが充足）"}
+               if it.get("verdict") != "resolved" else it
+               for it in report.items]
+    text = (report.text
+            + "\n（注記: 独立検証レポート自体を求める要件は本レポートで充足済みとして扱った"
+              "— 実装担当に自己検証を書かせないため）")
+    return ExitGateReport(ok=True, note="", text=text, cause=None,
+                          items=settled, new_issues=report.new_issues)
 
 
 def _axis_label(subtask: dict) -> str:
@@ -693,6 +764,9 @@ class Orchestrator:
                         team_id=task.get("team_id"),
                         thread_ts=task.get("thread_ts"),
                     )
+                    # 検証は出口ゲートの経路だけに落とす（§10.2。会話経由は
+                    # PlanService.build が同じフィルタを掛けた凍結プランで来る）
+                    subtasks = drop_verification_subtasks(subtasks)
 
                 # /exam_gw ドライラン: 判定結果のみ返却し、実行しない（設計書 §2.2）
                 if task.get("dry_run"):
@@ -1508,28 +1582,105 @@ class Orchestrator:
             return None
         try:
             template = (Path(__file__).parent / "prompts" / "exit_gate.md").read_text()
-            verifier = ExitGateVerifier(self.process_mgr.run_ssh_probe,
-                                        self._run_exit_gate_llm, template)
-            return verifier.verify(grounding.workspace, task, grounding.text,
-                                   answer_text=(final_result if answered else None))
+            answer_text = final_result if answered else None
+
+            def _verify(model_name=None) -> ExitGateReport:
+                verifier = ExitGateVerifier(
+                    self.process_mgr.run_ssh_probe,
+                    lambda prompt: self._run_exit_gate_llm(prompt, model_name),
+                    template)
+                return verifier.verify(grounding.workspace, task, grounding.text,
+                                       answer_text=answer_text)
+
+            report = _verify()
+            return self._complete_exit_gate(task, report, _verify)
         except Exception as e:
             logger.exception("出口ゲートで想定外の失敗: task_id=%s", task.get("task_id"))
             note = f"独立検証を実行できませんでした（{type(e).__name__}: {e}）"
             return ExitGateReport(ok=False, note=note, text=f"【独立検証】{note}",
                                   cause="exit_gate_unverified")
 
-    def _run_exit_gate_llm(self, prompt: str) -> str:
+    def _complete_exit_gate(self, task: dict, report: ExitGateReport,
+                            verify) -> ExitGateReport:
+        """判定表の形式的完全性を機械検査し、不足なら上位モデルで再実行する（§8.10f）。
+
+        昇格の第 3 の引き金（既存は ESCALATE 自己申告・例外/タイムアウトの 2 つ）。
+        正常終了した不完全な検証（根拠文書の指摘 N 件に対し判定表が N 件未満）は、
+        素通りさせず昇格ラダーの次段で 1 回だけ取り直す。中身の正誤は判定せず件数のみ
+        見る（exit_gate.py の空判定表拒否と同じ規律の延長）。
+
+        取り直してもなお不足したときの倒し方は、依頼が件数を**宣言しているか**で分ける:
+
+        - 宣言あり（指摘 N / 要件 N / 【N】が在る）→ `exit_gate_unverified` で fail-closed。
+          依頼が N 件と言っているのに N 件見ていない検証は信用の根拠を欠く。
+        - 宣言なし（散文依頼）→ **未達にしない**。期待値は構造データ（拘束条件・完了条件）
+          からの推定にすぎず、これで未達を返すと済んだ仕事を未達と呼ぶ誤りが常態化する
+          （実測: 依頼 94 件のいずれにも明示の件数宣言が無い）。不足は注記として
+          レポートに残し、合否は判定表の verdict に委ねる。
+
+        判定表が取れていない報告（パース不能）は既に fail-closed 済みのためそのまま返す。
+        """
+        report = _settle_self_referential(report)
+        expected, strict = _expected_verdict_count(task)
+        if not report.items or len(report.items) >= expected:
+            return report
+        short = f"期待 {expected} 件に対し判定表 {len(report.items)} 件"
+        nxt = self._exit_gate_next_model()
+        if nxt is not None:
+            logger.info("独立検証が不完全（%s）→ %s で再実行: task_id=%s",
+                        short, nxt, task.get("task_id"))
+            retried = verify(nxt)
+            retried.text = (f"（判定表が不完全（{short}）のため {nxt} で再実行）\n"
+                            + retried.text)
+            if not retried.items or len(retried.items) >= expected:
+                return retried
+            report = retried
+            short = f"期待 {expected} 件に対し判定表 {len(retried.items)} 件"
+        if not strict:
+            # 依頼が件数を宣言していない＝期待値は推定。未達にはせず注記だけ残す
+            logger.info("独立検証の判定表が推定期待値に届かない（注記のみ・未達にしない）:"
+                        " task_id=%s %s", task.get("task_id"), short)
+            report.text += (f"\n（注記: {short}。依頼が件数を宣言していないため"
+                            "期待値は推定であり、未達判定には用いない）")
+            return report
+        note = (f"独立検証が不完全（{short}・依頼が件数を宣言）"
+                + ("" if nxt is not None else "・昇格先のモデルが無い"))
+        logger.warning("出口ゲート未達（形式的完全性）: task_id=%s %s",
+                       task.get("task_id"), note)
+        return ExitGateReport(ok=False, note=note, cause="exit_gate_unverified",
+                              text=report.text + f"\n判定: {note}",
+                              items=report.items, new_issues=report.new_issues)
+
+    def _exit_gate_next_model(self) -> str | None:
+        """出口ゲートの昇格先（設定モデルの 1 つ上）を返す。無ければ None。
+
+        昇格ラダー（routing.escalation.ladder）を唯一の源とする。設定モデルが
+        ラダー最上位・ラダー外・ラダー未設定なら昇格先は無い（勝手にモデルを選ばない）。
+        """
+        conf = (getattr(self, "config", None) or {}).get("exit_gate") or {}
+        ladder = ((self.config.get("routing") or {})
+                  .get("escalation", {}).get("ladder") or [])
+        model_name = conf.get("model")
+        if model_name not in ladder:
+            return None
+        idx = ladder.index(model_name)
+        return ladder[idx + 1] if idx + 1 < len(ladder) else None
+
+    def _run_exit_gate_llm(self, prompt: str, model_name: str | None = None) -> str:
         """出口ゲートの検証 LLM を worker CLI の SSH 単発で 1 回だけ実行する。
 
         契約化の昇格段（§8.4 (e)）と同じ書き込み不能呼び出し: stream-json・PreToolUse
         フック・workspace を使わない（プロンプトは stdin）。モデル・タイムアウトは
         sa-ru.yaml `exit_gate:` が唯一の源（コード側既定値なし）。実行不能は例外で返し、
         呼び出し側（ExitGateVerifier）がリトライ・fail-closed 判定を行う。
+
+        model_name は昇格の第 3 の引き金（判定表の形式的完全性・§8.10f）による再実行時の
+        上位モデル。None は設定モデル（通常実行）。
         """
         if self.process_mgr is None:
             raise RuntimeError("SSH 実行手段なし（process_mgr 未注入）")
         conf = self.config["exit_gate"]
-        model_name = conf["model"]
+        model_name = model_name or conf["model"]
         model_conf = (self.config.get("models") or {}).get(model_name)
         if not model_conf:
             raise RuntimeError(f"未登録モデル: {model_name}")

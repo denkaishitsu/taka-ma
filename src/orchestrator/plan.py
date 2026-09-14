@@ -47,6 +47,59 @@ def derive_weight(execution: str, depth) -> str:
     return WEIGHT_UNSPECIFIED
 
 
+# 出口ゲート（§8.10f 独立検証段）が担う作業の語彙。依頼者が成果物欄・完了条件に
+# 検証を書くと分解脳がこれを通常サブタスクに起こし、出口ゲートと二重に走るうえ
+# routing の matrix にかかって軽量モデルへ落ちる（2026-09-14 実測）。検証は
+# exit_gate の経路だけに落とすため、分解直後に機械的に取り除く。
+# 語は出口ゲート固有の成果物名に限る（「テストを実行」等の正当な作業は落とさない）。
+_VERIFICATION_SUBTASK_RE = re.compile(
+    r"独立検証|検証レポート|検証報告|検証結果レポート|レビューレポート|"
+    r"レビュー結果報告|判定表|全件突合")
+
+
+def is_verification_text(text: str) -> bool:
+    """出口ゲートが担う検証そのものを指す文か（決定的・LLM 不使用）。
+
+    語彙の正本はここ 1 箇所。分解結果のフィルタ（本モジュール）と、出口ゲートの判定表から
+    自己言及要件を外す処理（Orchestrator）が同じ語彙を使う — 片方だけが「検証」と認める
+    と、依頼の書き方で経路が変わる（§8.10f / §10.2）。
+    """
+    return bool(_VERIFICATION_SUBTASK_RE.search(text or ""))
+
+
+def is_verification_subtask(subtask: dict) -> bool:
+    """出口ゲートが担う検証そのものを指すサブタスクか（決定的・LLM 不使用）。"""
+    return is_verification_text(subtask.get("command") or "")
+
+
+def drop_verification_subtasks(subtasks: list[dict]) -> list[dict]:
+    """検証サブタスクを分解結果から取り除き、依存を張り直して返す（設計書 §10.2）。
+
+    依頼者が検証を書いても書かなくても、検証は出口ゲート（opus 固定・タスク末尾で
+    自動発火）の経路だけに落とす。落とした step に依存していた後続は、落とした step の
+    依存をそのまま引き継ぐ（推移的に解決）ため、実行順は保たれる。
+
+    全件が検証サブタスクになる分解（依頼そのものが検証の依頼）は、落とすと実行する物が
+    無くなるため、入力をそのまま返す（空のプランを作らない）。
+    """
+    dropped = {s["step"]: list(s.get("depends_on") or [])
+               for s in subtasks if is_verification_subtask(s)}
+    if not dropped or len(dropped) == len(subtasks):
+        return subtasks
+
+    def _resolve(deps: list, seen: set) -> list:
+        out = []
+        for d in deps:
+            if d not in dropped:
+                out.append(d)
+            elif d not in seen:
+                out.extend(_resolve(dropped[d], seen | {d}))
+        return list(dict.fromkeys(out))   # 重複除去（順序保持）
+
+    return [{**s, "depends_on": _resolve(s.get("depends_on") or [], set())}
+            for s in subtasks if s["step"] not in dropped]
+
+
 def effective_deps(subtask: dict, step_set: set) -> list:
     """実行時に実際に待ち合わせる依存だけを返す（存在しない step への依存＝dangling は除外）。
 
@@ -255,8 +308,14 @@ class PlanService:
         self.valid_models = set(valid_models)
 
     def build(self, summary: str, progress=None) -> list[dict]:
-        """確定要約を ya-ta で分解し、プレビュー対象のサブタスク列を返す。"""
-        return self.decomposer.decompose(summary, progress=progress)
+        """確定要約を ya-ta で分解し、プレビュー対象のサブタスク列を返す。
+
+        分解入力の組み立ては decomposer 側の責務、分解結果の機械フィルタ（検証サブタスクの
+        除去・§10.2）はここ。両者を分けてあるため、分解入力を変える改修は本メソッドの
+        1 行目だけを触ればよい。
+        """
+        subtasks = self.decomposer.decompose(summary, progress=progress)
+        return drop_verification_subtasks(subtasks)
 
     def view(self, subtasks: list[dict]) -> list[dict]:
         """実行と同じ写像でモデルを解決したビューを返す。"""
