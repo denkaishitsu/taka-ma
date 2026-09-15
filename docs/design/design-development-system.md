@@ -110,6 +110,7 @@
 | §8.10e | [intent 連続捕捉（依頼意図のドリフト検出 → 人の承認 → append）](details/08-conversation-gateway.md#sec-8-10e) |
 | §8.10f | [会話⇄実行の受け渡し契約（命令原文・拘束条件・完了条件）](details/08-conversation-gateway.md#sec-8-10f) |
 | §8.10g | [決定的実行と実測回答（LLM 裁量の構造撤去）](details/08-conversation-gateway.md#sec-8-10g) |
+| §8.10h | [タスク受付の意図起票とブランチ束縛（レビュー系に載せる前段）](details/08-conversation-gateway.md#sec-8-10h) |
 | §8.11 | [qu-e → sa-ru（監査アラート）](details/08-sentinel-paths.md#sec-8-11) |
 | §8.12 | [qu-e file_audit → sa-ru（ファイル変更アラート）](details/08-sentinel-paths.md#sec-8-12) |
 | §8.13 | [sa-ru → qu-e（タスクコンテキスト共有）](details/08-sentinel-paths.md#sec-8-13) |
@@ -161,7 +162,7 @@
 | §4 | [04-sentinel.md](details/04-sentinel.md) | 守護プロセス qu-e（役割と使用モデル） |
 | §6 | [06-infrastructure.md](details/06-infrastructure.md) | インフラ・IaC |
 | §7 | [07-task-models.md](details/07-task-models.md) | モデルの配分・選定・自動監視 |
-| §8.3・§8.10b・§8.10e〜g | [08-conversation-gateway.md](details/08-conversation-gateway.md) | 会話ゲートウェイ（人の依頼 → 実行契約） |
+| §8.3・§8.10b・§8.10e〜h | [08-conversation-gateway.md](details/08-conversation-gateway.md) | 会話ゲートウェイ（人の依頼 → 実行契約） |
 | §8.4 | [08-task-routing.md](details/08-task-routing.md) | タスク分解・分類・リスク判定・契約化（ya-ta） |
 | §8.5〜§8.7 | [08-worker-execution.md](details/08-worker-execution.md) | worker 実行経路（実行アダプタ） |
 | — | [08-worker-execution-adapters.md](details/08-worker-execution-adapters.md) | 実行アダプタの内部設計と実機検証（§8.5 の付属文書） |
@@ -447,7 +448,7 @@ flowchart LR
 | ⑦ sa-ru → Slack（通知・承認リクエスト） | §8.9 | [slack-interface](details/08-slack-interface.md) |
 | ⑧ u-zu → sa-ru（承認結果通知） | §8.10 | [slack-interface](details/08-slack-interface.md) |
 | ⑨〜⑫ qu-e ⇄ sa-ru（監査・ファイル変更・文脈共有・資源最適化） | §8.11〜§8.14 | [sentinel](details/04-sentinel.md) |
-| 会話 → 実行の移譲（計画確認・意図捕捉・受け渡し契約・決定的実行） | §8.10b・§8.10e・§8.10f・§8.10g | [conversation-gateway](details/08-conversation-gateway.md) |
+| 会話 → 実行の移譲（計画確認・意図捕捉・受け渡し契約・決定的実行・受付の起票とブランチ束縛） | §8.10b・§8.10e・§8.10f・§8.10g・§8.10h | [conversation-gateway](details/08-conversation-gateway.md) |
 | 制御コマンド（手動 ollama 停止・中止/取消の即時実行） | §8.10c・§8.10d | [slack-interface](details/08-slack-interface.md) |
 | 待受方式の選択方針 | §8.15 | [infrastructure](details/06-infrastructure.md) |
 | Socket Mode 受信と sa-ru の死活監視 | §8.16・§8.16.1 | [slack-interface](details/08-slack-interface.md) |

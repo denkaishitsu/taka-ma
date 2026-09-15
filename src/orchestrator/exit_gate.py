@@ -260,7 +260,10 @@ class ExitGateVerifier:
                 break
             logger.warning("独立検証 LLM の出力を判定表として解釈できない（%d 回目）", attempt)
         if parsed is None:
-            note = "独立検証を実行できなかった（検証エージェントの応答を判定表として解釈できない）"
+            # 「未検査」— 測れていないのであって、測って落ちた（未達）のではない
+            # （失敗報告の帰属区別・§8.10f）
+            note = ("独立検証を実行できませんでした（未検査 — "
+                    "検証エージェントの応答を判定表として解釈できない）")
             return ExitGateReport(
                 ok=False, note=note, cause="exit_gate_unverified",
                 text=self._report_text([], [], probes) + f"\n判定: {note}")

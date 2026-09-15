@@ -111,6 +111,32 @@ contract:
                                                 # 環境変数 TAKA_MA_TASK_DENY_DIR（既定値は同パス）で
                                                 # 同じ場所を読む（grep で両側一致を確認する）
 
+# §8.10h タスク受付の意図起票とブランチ束縛 — ConversationManager._ensure_task_intake が参照。
+# このブロックの有無で有効化される（未構成なら従来動作＝段階導入。contract: と同じ規律）。
+# 運用ルール（承認面にも明記される）: 「作る・変える」型の依頼は、着手前に台帳へ起票し
+# （ledger.py start）task-<id> ブランチ上で作業する。依頼文にその記載が無くても受付が自動で
+# 行い、用意できない変更系依頼は着手させない（main 直接作業＝レビュー系の対象外を作らない）
+task_intake:
+  ledger_py: "/Users/youruser/.claude/tools/conformance/ledger/ledger.py"  # 実行ホスト（MBP）上の
+                                                        # 台帳 CLI。起票と意図記録の唯一の入口
+                                                        # （ledger.json / intents を自前で書かない）
+  python_bin: "/opt/homebrew/bin/python3"  # ledger.py 実行バイナリ。標準ライブラリのみだが
+                                  # `X | None` 注記を持つため 3.10 以上が要る（実行ホストの
+                                  # /usr/bin/python3 は 3.9 で TypeError。実測で確認・是正）
+  timeout_sec: 30                 # 起票・実測 1 コマンドの SSH 応答上限（秒）。runbook の
+                                  # EXEC_TIMEOUT_SEC と同じ粒度の軽い git 操作＋台帳 CLI 1 回
+
+# §8.10f 入口ゲート（依頼⇄契約の独立突合）— ConversationManager._run_entry_gate が参照。
+# このブロックの有無で有効化される（未構成なら従来動作＝段階導入。exit_gate: と同じ規律）。
+# 契約化と別系統の突合エージェントが「依頼の各要求 ⇄ 契約フィールド」の対応表を作り、
+# 合否はコード導出（参照が契約の実体へ解決できるかのみ）。対応表は着手確認に提示され、
+# 契約に載らなかった要求（❌ 行）の扱いは人が裁く（このまま着手 / 訂正）
+entry_gate:
+  model: "opus"       # 突合エージェントのモデル（ya-ta.yaml models レジストリ名）。SSH 単発・
+                      # 書き込み不能呼び出しのため keychain_auth モデルは不可（exit_gate と同制約）
+  timeout_sec: 300    # 突合 LLM 1 回の応答上限（秒）。入力は会話ビュー＋契約のみで出口ゲート
+                      # より短い（証跡採取が無い）ため llm_timeout_sec と同水準
+
 # §8.10f 出口ゲート（完了報告前の独立検証段）— Orchestrator._run_exit_gate が参照。
 # このブロックの有無で有効化される（未構成なら従来動作＝段階導入。contract: と同じ規律）
 exit_gate:

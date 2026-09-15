@@ -89,16 +89,21 @@ class GroundingReport:
     summary: 会話還流の先頭に置く 1 行判定（worker 自己申告の上書き用）。
     workspace: 検証対象の workspace（呼び出し側が設定。会話への紐付けに使う）。
     cause:   ok=False のときの機械可読な失敗原因コード（§8.10f。None は原因なし＝ok）。
+    closure_outside: answered ツリー閉包が検出した「約束の外の変化」のパス列
+             （§8.10f 失敗報告の帰属区別 — 入口ゲートの ❌ 行と並記する条件に使う。
+             閉包 FAIL 以外は空）。
     """
 
     def __init__(self, ok: bool, note: str, text: str, summary: str,
-                 workspace: str | None = None, cause: str | None = None):
+                 workspace: str | None = None, cause: str | None = None,
+                 closure_outside: list | None = None):
         self.ok = ok
         self.note = note
         self.text = text
         self.summary = summary
         self.workspace = workspace
         self.cause = cause
+        self.closure_outside = closure_outside or []
 
 
 def detect_claims(worker_text: str) -> dict:
@@ -257,6 +262,7 @@ class GroundingVerifier:
                  + (f"・対象 ref: {default_branch}" if default_branch else "") + "）"]
         problems: list[str] = []
         causes: list[str] = []
+        closure_outside: list[str] = []   # answered ツリー閉包の「約束の外」パス列（帰属区別・§8.10f）
         # default_branch は上流検証済みだが防御的に再検証する（コマンド文字列に乗るため）
         if default_branch and (not _ACCEPT_PARAM_RE.match(default_branch)
                                or ".." in default_branch.split("/")):
@@ -512,6 +518,7 @@ class GroundingVerifier:
                         outside = _tree_changes_outside_promise(
                             baseline, out or "", promised)
                         if outside:
+                            closure_outside = list(outside)
                             problems.append(
                                 "answered 未達（約束の外の変化: "
                                 + " / ".join(outside[:3])
@@ -536,4 +543,5 @@ class GroundingVerifier:
             summary = f"（完了条件の検査の結果、未達: {note}）"
             lines.append(f"判定: 未達 — {note}")
         return GroundingReport(ok=ok, note=note, text="\n".join(lines), summary=summary,
-                               cause=(causes[0] if causes else None))
+                               cause=(causes[0] if causes else None),
+                               closure_outside=closure_outside)

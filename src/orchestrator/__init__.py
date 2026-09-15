@@ -43,6 +43,7 @@ from orchestrator.headless_runner import (
 from orchestrator.preflight import AuthPreflight, PreflightFailure
 from orchestrator.liveness import Heartbeat, RestartLimiter, start_watchdog_thread
 from orchestrator import contract as contract_rules
+from orchestrator.entry_gate import misbooking_notice
 from orchestrator.exit_gate import ExitGateReport, ExitGateVerifier
 from orchestrator import intent_store
 from orchestrator import runbook as runbook_rules
@@ -1417,13 +1418,28 @@ class Orchestrator:
                             task_file, task, subtasks, gate,
                             channel, team_id, thread_ts):
                         return
-                    # 差し戻せない FAIL（判定不能・directive 型・上限超過）は未達として人へ返す
+                    # 差し戻せない FAIL（判定不能・directive 型・上限超過）は人へ返す
                     grounding.ok = False
                     grounding.note = ((grounding.note + "・") if grounding.note
                                       else "") + gate.note
                     grounding.cause = grounding.cause or gate.cause
                     grounding.text += "\n\n" + gate.text
-                    grounding.summary = f"（未達: {grounding.note}）"
+                    # 失敗報告の帰属区別（§8.10f）: 検証を実行できなかった
+                    # （exit_gate_unverified）は「未検査」— 測れていない ≠ 測って落ちた。
+                    # 「未達」と呼ぶのは判定 FAIL（exit_gate_failed）だけ
+                    label = ("未検査" if gate.cause == "exit_gate_unverified"
+                             else "未達")
+                    grounding.summary = f"（{label}: {grounding.note}）"
+                # 失敗報告の帰属区別（§8.10f）: answered ツリー閉包 FAIL かつ着手時の
+                # 対応表に契約へ載らなかった要求（❌ 行・人が「このまま着手」で承認）が
+                # あるタスクは、受注不備の可能性を報告の冒頭で明言する。条件は決定的
+                # （閉包の実測パス列 × 対応表の status のみ。散文の照合はしない）
+                misbook = None
+                if not grounding.ok and grounding.closure_outside:
+                    misbook = misbooking_notice(task.get("entry_gate") or {},
+                                                grounding.closure_outside)
+                if misbook:
+                    grounding.text = misbook + "\n\n" + grounding.text
                 # 証跡は正本（結果ファイル）にも残す（§8.9。Slack 表示と独立に全文へ到達できる）。
                 # 未達なら機械可読の失敗原因コードも正本へ刻む（§8.10f 反復停止の材料）
                 result_record = f"{final_result}\n\n{grounding.text}"
@@ -1438,6 +1454,9 @@ class Orchestrator:
                 else:
                     header = (f"⚠ タスク未完了: {grounding.note}"
                               f"（結果ファイル: {result_path}）。worker の報告:")
+                    if misbook:
+                        # 受注不備の可能性は Slack 報告でも冒頭に置く（§8.10f 帰属区別）
+                        header = misbook + "\n" + header
                 delivered = await self._notify_chunked(
                     header, final_result,
                     channel, team_id=team_id, thread_ts=thread_ts)
@@ -1596,7 +1615,7 @@ class Orchestrator:
             return self._complete_exit_gate(task, report, _verify)
         except Exception as e:
             logger.exception("出口ゲートで想定外の失敗: task_id=%s", task.get("task_id"))
-            note = f"独立検証を実行できませんでした（{type(e).__name__}: {e}）"
+            note = f"独立検証を実行できませんでした（未検査 — {type(e).__name__}: {e}）"
             return ExitGateReport(ok=False, note=note, text=f"【独立検証】{note}",
                                   cause="exit_gate_unverified")
 
@@ -1643,7 +1662,7 @@ class Orchestrator:
             report.text += (f"\n（注記: {short}。依頼が件数を宣言していないため"
                             "期待値は推定であり、未達判定には用いない）")
             return report
-        note = (f"独立検証が不完全（{short}・依頼が件数を宣言）"
+        note = (f"独立検証が不完全（未検査 — {short}・依頼が件数を宣言）"
                 + ("" if nxt is not None else "・昇格先のモデルが無い"))
         logger.warning("出口ゲート未達（形式的完全性）: task_id=%s %s",
                        task.get("task_id"), note)

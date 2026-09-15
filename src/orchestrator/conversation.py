@@ -41,6 +41,8 @@ from ai_gateway.llm import (
     run_ollama,
 )
 from orchestrator import contract as contract_rules
+from orchestrator import entry_gate as entry_gate_rules
+from orchestrator import intake as intake_rules
 from orchestrator import intent_store
 from orchestrator import runbook as runbook_rules
 from orchestrator.file_queue import atomic_write_json
@@ -236,6 +238,32 @@ class ConversationManager:
         contract_conf = config.get("contract") or {}
         self._contract_enabled = bool(contract_conf)
         self.intents_dir = contract_conf.get("intents_dir")
+        # §8.10h 受付の意図起票とブランチ束縛。`task_intake:` ブロックの有無で有効化する
+        # （段階導入。contract: と同じ規律）。必須キーが欠けた部分構成は無効化して起動ログへ
+        # 出す — コード側に既定値（台帳のパス等）を置くと供給元が二重になる
+        intake_conf = config.get("task_intake") or {}
+        self._intake_conf = None
+        if intake_conf:
+            missing = [k for k in ("ledger_py", "python_bin", "timeout_sec")
+                       if not intake_conf.get(k)]
+            if missing:
+                logger.warning("task_intake 未構成（キー欠落: %s）— 受付の自動起票は行わない",
+                               ", ".join(missing))
+            else:
+                self._intake_conf = intake_conf
+        # §8.10f 入口ゲート（依頼⇄契約の独立突合）。`entry_gate:` ブロックの有無で
+        # 有効化する（段階導入。exit_gate: と同じ規律）。必須キーが欠けた部分構成は
+        # 無効化して起動ログへ出す — コード側に既定値（モデル名等）を置かない
+        entry_conf = config.get("entry_gate") or {}
+        self._entry_gate_conf = None
+        if entry_conf:
+            missing = [k for k in ("model", "timeout_sec")
+                       if not entry_conf.get(k)]
+            if missing:
+                logger.warning("entry_gate 未構成（キー欠落: %s）— 依頼⇄契約の突合は行わない",
+                               ", ".join(missing))
+            else:
+                self._entry_gate_conf = entry_conf
         # 契約化の実行主体は ya-ta（§8.4「契約化の呼び出し」。会話脳での契約化は
         # 構造化出力が実測で不安定だったため移管 — 2026-08-28 E2E）。上位モデルでの
         # 再契約化（§8.4.x (e) 昇格ラダー）の実行手段はこちら（sa-ru）が注入する
@@ -724,6 +752,18 @@ class ConversationManager:
                     msg.get("channel_id"),
                     team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
                 return None
+            # 受付の意図起票とブランチ束縛（§8.10h）。branch を持たない「作る・変える」型は
+            # ここで台帳へ起票し、契約を task-<id> へ束縛する（依頼文への記載漏れがそのまま
+            # main 直接作業＝レビュー系の対象外になる経路を塞ぐ）。用意できない変更系依頼は
+            # 着手させない（fail-closed）。回答型・読み取り系はここを素通りする
+            refusal = self._ensure_task_intake(contract_data, workspace, summary)
+            if refusal is not None:
+                # 起票・ブランチが用意できない = 着手させない。入力の補いを待つ（§8.3 (C)）
+                self._set_awaiting(cid, True)
+                self.slack.notify(
+                    refusal, msg.get("channel_id"),
+                    team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
+                return None
             # 指定ブランチへの switch 機械付与（§8.10g。契約 branch と HEAD の
             # 不一致を実測し、runbook 先頭へ既存カタログの switch を置く — 決定的・
             # LLM 不使用。worker の実行も同じ checkout 上で行われるため、指定
@@ -748,6 +788,13 @@ class ConversationManager:
                     return
                 if pre_satisfied:
                     contract_data["_pre_satisfied"] = pre_satisfied
+            # ── 入口ゲート（§8.10f）: 契約化と別系統の突合で依頼⇄契約の対応表を
+            # 作り、着手確認に載せる。契約への全機械付与（intake の runbook 前置・
+            # switch 付与）の後に走らせる — 対応表の参照先を最終の契約に揃える。
+            # 未対応が残っても止めない（人が着手確認で裁く）。突合を実行できなかった
+            # ときは「未検査」注記が対応表ブロックに載る（fail-open を無印にしない） ──
+            self._run_entry_gate(
+                contract_data, contract_prov.get("history_view") or "", summary)
 
         return contract_data, workspace
 
@@ -1382,7 +1429,9 @@ class ConversationManager:
         # 完了条件の欠落なのでリトライせず、呼び出し側が完了条件を人に聞き返す
         if not contract.get("acceptance"):
             return None, {**provenance, "empty_acceptance": True}
-        return contract, provenance
+        # 入口ゲート（§8.10f）が依頼の原文として同じ二窓ビューを使う（契約化と入力を
+        # 揃える — 突合の基準を契約化が見たものと一致させる）
+        return contract, {**provenance, "history_view": history_text}
 
     def _reachability_notice(self) -> str | None:
         """実行機（MBP）への到達性を実測し、不達なら返信先頭の固定行を返す（§8.3・是正記録 2026-09-04）。
@@ -1434,6 +1483,109 @@ class ConversationManager:
             # TimeoutExpired は Contractor の捕捉対象（RuntimeError）へ正規化する。
             # 素通しすると段の失敗でなく会話処理全体を落とす（ハング CLI が 1 段で全体を殺す）
             raise RuntimeError(f"昇格段のタイムアウト: {e}") from e
+
+    def _run_entry_gate(self, contract: dict, history_view: str, summary: str):
+        """入口ゲート（§8.10f 依頼⇄契約の独立突合）を実行し、結果を契約へ刻む。
+
+        `entry_gate:` 未構成なら何もしない（段階導入）。突合の失敗・想定外の例外でも
+        着手確認は止めない — unchecked（未検査）の対応表として刻み、着手確認に
+        「突合を実行できませんでした（未検査）」の注記が機械付与される。
+        結果は `_entry_gate` キーで着手確認レコード → 確定タスクへ運ばれ、出口の
+        報告（失敗報告の帰属区別）が参照する。
+        """
+        # 部分構築（テスト・段階導入の旧構成）でも落ちない（_contract_enabled と同じ規律）
+        if getattr(self, "_entry_gate_conf", None) is None:
+            return
+        try:
+            template = (Path(__file__).parent / "prompts" / "entry_gate.md").read_text()
+            checker = entry_gate_rules.EntryGateChecker(
+                self._run_entry_gate_llm, template)
+            report = checker.check(history_view, summary, contract)
+        except Exception:
+            logger.exception("入口ゲートで想定外の失敗（未検査として着手確認へ）")
+            report = entry_gate_rules.EntryGateReport(
+                unchecked=True, note="突合の実行中に想定外の失敗")
+        if report.unchecked:
+            logger.warning("入口ゲート未検査: %s", report.note)
+        elif report.uncovered():
+            logger.info("入口ゲート: 契約に載っていない要求 %d 件（着手確認で提示）",
+                        len(report.uncovered()))
+        contract["_entry_gate"] = report.to_record()
+
+    def _run_entry_gate_llm(self, prompt: str) -> str:
+        """入口ゲートの突合 LLM を worker CLI の SSH 単発で 1 回だけ実行する。
+
+        契約化の昇格段・出口ゲートと同じ書き込み不能呼び出し: stream-json・PreToolUse
+        フック・workspace を使わない（プロンプトは stdin）。モデル・タイムアウトは
+        sa-ru.yaml `entry_gate:` が唯一の源（コード側既定値なし）。実行不能は例外で返し、
+        呼び出し側（EntryGateChecker）がリトライ・未検査判定を行う。
+        """
+        if self.process_mgr is None:
+            raise RuntimeError("SSH 実行手段なし（process_mgr 未注入）")
+        conf = self._entry_gate_conf
+        model_name = conf["model"]
+        model_conf = (self.config.get("models") or {}).get(model_name)
+        if not model_conf:
+            raise RuntimeError(f"未登録モデル: {model_name}")
+        if model_conf.get("keychain_auth"):
+            raise RuntimeError(f"{model_name} は SSH 単発で実行不可（keychain 認証依存）")
+        cli = model_conf.get("command", "")
+        remote = f"{cli} -p {model_conf.get('model_flag', '')}".strip()
+        try:
+            return self.process_mgr.run_ssh_command(
+                remote, timeout=conf["timeout_sec"], stdin_text=prompt)
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(f"入口ゲートのタイムアウト: {e}") from e
+
+    def _ensure_task_intake(self, contract: dict, workspace: str | None,
+                            summary: str) -> str | None:
+        """受付時に意図を台帳へ起票し、契約を task-<id> ブランチへ束縛する（§8.10h）。
+
+        「作る・変える」型（作業ツリーを変更する完了条件を持つ契約）だけを対象にし、回答型・
+        読み取り系・ref 操作のみの依頼は素通りさせる（受付で止めない）。判定と起票の実体は
+        orchestrator.intake（実測のみ・LLM 不関与）。ここは実行手段（SSH）の注入と、結果の
+        契約への反映・拒否文の組立だけを担う。
+
+        返り値は拒否文（None なら続行）。拒否は「変更系なのにブランチを用意できない」場合
+        だけに限る — 測れない・起票できない状態で着手すると main 直接作業がそのまま通り、
+        成果がレビュー系（review-verify）に載らないため。
+        """
+        if self._intake_conf is None or not getattr(self, "_contract_enabled", False):
+            return None
+        run = None
+        if workspace and self.process_mgr is not None:
+            run = self.process_mgr.run_ssh_probe
+        try:
+            result = intake_rules.bind_task_branch(
+                run, workspace, contract,
+                ledger_py=self._intake_conf["ledger_py"],
+                python_bin=self._intake_conf["python_bin"],
+                timeout=int(self._intake_conf["timeout_sec"]),
+                title=summary)
+        except Exception as e:
+            # 実行手段の例外（SSH 不達等）も「用意できない」に含める（変更系は fail-closed）
+            logger.exception("受付の起票・ブランチ束縛に失敗")
+            result = intake_rules.IntakeResult("refuse:exception", detail=str(e))
+        if result.refused:
+            logger.warning("受付の起票・ブランチ束縛を拒否: %s", result.status)
+            return ("この依頼は作業ツリーを変更しますが、タスク台帳への起票と作業ブランチの"
+                    "用意ができませんでした（main 直接作業は行いません）。\n"
+                    f"原因: {result.status}\n{result.detail}\n"
+                    "作業リポジトリ（`repo:/絶対パス`）を確認するか、手動で起票"
+                    "（`ledger.py start`）して `ブランチ: task-<id>` を明示して"
+                    "言い直してください。")
+        if not result.bound:
+            logger.info("受付の起票・ブランチ束縛は対象外: %s", result.status)
+            return None
+        contract["branch"] = result.branch
+        if result.step is not None:
+            # ブランチ作成・切替は受付では実行せず、準備系 step として runbook 先頭へ置く
+            # （§8.10h。世界を変えるのは人が着手確認で承認した列の実行時 = 最初の書き込みの直前）
+            contract["runbook"] = [result.step] + (contract.get("runbook") or [])
+        # 着手確認の提示（契約テンプレート）で束縛の出所を人へ明示するための印
+        contract["_intake"] = result.status
+        logger.info("受付でブランチを束縛: %s（%s）", result.branch, result.status)
+        return None
 
     def _ensure_branch_switch(self, contract: dict, workspace: str | None):
         """契約 branch と workspace の HEAD が不一致なら runbook 先頭へ switch を機械付与する。
@@ -1492,6 +1644,14 @@ class ConversationManager:
             return
         ws = shlex.quote(workspace)
         branch = (contract or {}).get("branch")
+        if any(rb.get("kind") == "branch_create"
+               and (rb.get("params") or {}).get("name") == branch
+               for rb in ((contract or {}).get("runbook") or [])):
+            # 受付で束縛した未作成のブランチ（§8.10h の branch_create が前置されている）は
+            # 当該 ref がまだ存在せず `rev-parse <branch>:<path>` で測れない。基点は現 HEAD
+            # なので作業ツリー側の hash-object を baseline にする（測れないことを理由に
+            # file へ縮退すると、修正依頼が無作業でも PASS する既知の穴が復活する）
+            branch = None
         head = None
         try:
             rc, out = self.process_mgr.run_ssh_probe(
@@ -1952,6 +2112,9 @@ class ConversationManager:
             "constraints": (contract or {}).get("constraints") or [],
             "acceptance": (contract or {}).get("acceptance") or [],
             "needs_repo": bool((contract or {}).get("needs_repo")),
+            # 入口ゲートの対応表（§8.10f 着手時判断の記録）。着手（このまま着手）の
+            # 承認とともに確定タスクへ運ばれ、出口の報告（帰属区別）が参照する
+            "entry_gate": (contract or {}).get("_entry_gate"),
             "created_at": now,
             "decided_at": None,
             "decided_by": None,
@@ -1982,6 +2145,11 @@ class ConversationManager:
         if contract is not None:
             # 契約は空でも「なし」を明示する（§8.10f。見えていない契約は承認されない）
             contract_text = self._format_contract(contract)
+            # 入口ゲートの対応表（§8.10f 着手確認での提示）。❌ 行・未検査の注記も
+            # 含めコード側で組み立てる（突合エージェントの散文は載せない）
+            if contract.get("_entry_gate"):
+                contract_text += "\n" + entry_gate_rules.render_table(
+                    contract["_entry_gate"], contract)
             # git 操作を含みそうな依頼が runbook なしのときの注意行（§8.10g 警告補助。
             # 変換・ブロックはしない — 判断は着手確認を見る人が行う）
             warning = contract_rules.runbook_warning(contract, summary)
@@ -2035,7 +2203,14 @@ class ConversationManager:
         計画本文にそのまま提示された）。
         """
         lines = [f"命令（逐語実行）: {contract.get('directive') or 'なし'}"]
-        lines.append(f"ブランチ: {contract.get('branch') or 'なし（HEAD のまま作業）'}")
+        # ブランチ欄は受付の束縛（§8.10h）の出所も併記する。「作る・変える」型は台帳へ
+        # 起票され task-<id> 上で作業する運用ルールを、承認面そのものに明記する
+        intake_note = {
+            "created:ledger": "（受付で台帳へ起票 — task-<id> 上で作業・§8.10h）",
+            "bound:head_task_branch": "（HEAD のタスクブランチを継承・§8.10h）",
+        }.get(contract.get("_intake"), "")
+        lines.append(f"ブランチ: {contract.get('branch') or 'なし（HEAD のまま作業）'}"
+                     + intake_note)
         target_paths = contract.get("target_paths") or []
         lines.append("対象文書: " + ("、".join(target_paths) if target_paths else "なし"))
         constraints = contract.get("constraints") or []
@@ -2124,6 +2299,10 @@ class ConversationManager:
         for key in ("directive", "constraints", "acceptance", "branch", "target_paths"):
             if record.get(key):
                 task[key] = record[key]
+        # 入口ゲートの対応表（§8.10f 着手時判断の記録）。人が「このまま着手」で通した
+        # ❌ 行の存在を出口の報告（失敗報告の帰属区別）が参照する
+        if record.get("entry_gate"):
+            task["entry_gate"] = record["entry_gate"]
         os.makedirs(self.task_dir, exist_ok=True)
         ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S%f")
         path = os.path.join(self.task_dir, f"{ts}_{task_id}.json")
