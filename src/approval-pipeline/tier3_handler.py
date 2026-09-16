@@ -30,6 +30,7 @@ import os
 import time
 import uuid
 
+import evidence
 from approval_types import Decision, operation_str
 
 logger = logging.getLogger("sa-ru.tier3")
@@ -63,7 +64,8 @@ class Tier3Handler:
     """High Risk: 人間承認（Slack 経由・ファイルベース cross-process）。"""
 
     def __init__(self, slack_notifier, approval_dir: str = APPROVAL_DIR, *,
-                 hold_grace_sec: float, poll_interval_sec: float):
+                 hold_grace_sec: float, poll_interval_sec: float,
+                 run_probe=None):
         """Tier 3 ハンドラを構築する。
 
         Args:
@@ -74,11 +76,15 @@ class Tier3Handler:
                 保留（hold）に落とす（§8.10。sa-ru.yaml approval.hold_grace_sec が唯一の源）。
             poll_interval_sec: 承認待ち中の status ポーリング間隔秒（§8.10。
                 sa-ru.yaml approval.poll_interval_sec が唯一の源）。
+            run_probe: worker ホストへの読み取り専用 probe（§3.3 (5) 実体採取・TOCTOU 照合。
+                callable(command, timeout) -> (rc, stdout)。None なら採取・照合を行わない
+                — 旧構成・単体テストの縮退）。
         """
         self.slack_notifier = slack_notifier
         self.approval_dir = approval_dir
         self.hold_grace_sec = hold_grace_sec
         self.poll_interval_sec = poll_interval_sec
+        self.run_probe = run_probe
 
     def _generate_request_id(self) -> str:
         """承認リクエストの一意 ID（Slack ボタン value／承認ファイル名で特定）。"""
@@ -117,6 +123,22 @@ class Tier3Handler:
 
         approval_path = os.path.join(self.approval_dir, f"{request_id}.json")
 
+        # 承認対象の実体採取（設計 §3.3 (5) (a)）: 操作が指す実在ファイルの
+        # ハッシュ＋行番号付き抜粋をコードの固定コマンドで採り、レコードと Slack へ添付する。
+        # 採取の失敗は未添付の明示に倒し、承認フロー自体は止めない
+        evidence_files: list = []
+        evidence_notes: list = []
+        if self.run_probe is not None:
+            try:
+                paths = await asyncio.to_thread(
+                    evidence.resolve_existing, self.run_probe,
+                    getattr(pending, "cwd", ""), evidence.candidate_tokens(pending))
+                evidence_files, evidence_notes = await asyncio.to_thread(
+                    evidence.collect, self.run_probe, paths)
+            except Exception:
+                logger.exception("承認対象の実体採取に失敗（未添付で続行）: %s", request_id)
+                evidence_notes = ["実体の採取に失敗 — 未添付（照合対象なし）"]
+
         # 承認ファイルを status=pending で作成（§8.10 フロー 1）。
         # command は人間可読の操作文字列、tool_name/tool_input は構造化データ（後方互換で併記）。
         # team_id / channel_id は応答先ワークスペース特定用の記録。
@@ -137,6 +159,8 @@ class Tier3Handler:
             "team_id": team_id or "",
             "channel_id": channel or "",
             "thread_ts": thread_ts,
+            # 実体添付と TOCTOU 照合の基準（§3.3 (5)）。probe_approval の実測回答も参照する
+            "evidence": {"files": evidence_files, "notes": evidence_notes},
         })
 
         # Slack に Block Kit 承認リクエストを送信（送信元 WS へ。SlackNotifier は同期メソッド）。
@@ -151,6 +175,7 @@ class Tier3Handler:
                 channel=channel,
                 team_id=team_id,
                 thread_ts=thread_ts,
+                evidence_text=evidence.slack_text(evidence_files, evidence_notes),
             )
         except Exception:
             logger.exception("Tier3 承認リクエストの Slack 送信に失敗。安全側で deny します: %s", request_id)
@@ -174,6 +199,37 @@ class Tier3Handler:
             decision = await asyncio.to_thread(self._claim_hold, approval_path)
 
         if decision == STATUS_APPROVED:
+            # TOCTOU 照合（設計 §3.3 (5) (c)）: 承認時に固定したハッシュを allow 発行の
+            # 直前に再計測し、1 件でも不一致なら allow を発行しない（fail-closed）。
+            # 照合自体が実行できない場合も allow を出さない（測れないまま通さない）
+            if self.run_probe is not None and evidence_files:
+                try:
+                    mismatches = await asyncio.to_thread(
+                        evidence.verify, self.run_probe, evidence_files)
+                except Exception:
+                    logger.exception("TOCTOU 照合を実行できません（allow を発行しない）: %s",
+                                     request_id)
+                    mismatches = [{"path": "（照合不能）",
+                                   "approved_sha256": "-", "current_sha256": "-"}]
+                if mismatches:
+                    await asyncio.to_thread(
+                        self._notify_toctou_mismatch, request_id, evidence_files,
+                        mismatches, channel, team_id, thread_ts)
+                    # レコードへ印を残す（probe_approval の実測回答・監査が読む）。
+                    # 失敗してもブロックの判定は変えない
+                    try:
+                        with open(approval_path) as f:
+                            rec = json.load(f)
+                        rec["toctou_mismatch"] = True
+                        rec["toctou_report"] = os.path.join(
+                            self.approval_dir, f"{request_id}.toctou.diff")
+                        self._write_record(approval_path, rec)
+                    except Exception:
+                        logger.exception("TOCTOU 印の記録に失敗: %s", approval_path)
+                    self._finalize(approval_path)
+                    return Decision(
+                        allow=False, handler="tier3_human",
+                        reason="toctou_mismatch: 承認された内容と実行時点の内容が異なる")
             self._finalize(approval_path)
             return Decision(allow=True, handler="tier3_human")
         if decision == STATUS_REJECTED:
@@ -201,6 +257,46 @@ class Tier3Handler:
         self._finalize(approval_path)
         return Decision(allow=False, handler="tier3_human",
                         reason=f"承認レコードを追跡できません (status={decision})")
+
+    def _notify_toctou_mismatch(self, request_id: str, evidence_files: list,
+                                mismatches: list, channel, team_id, thread_ts):
+        """TOCTOU 不一致の通知（設計 §3.3 (5) (c)）。
+
+        判断材料（要約差分）と次の行き先（再実行で再承認 / 中止して調査）を含める。
+        差分の全文は正本ファイルへ保存してパスを併記する（通知には要約と上限つき本文のみ）。
+        通知の失敗は握らずログへ（allow を出さない判定自体は確定済み）。
+        """
+        try:
+            summary, full = evidence.mismatch_report(
+                self.run_probe, evidence_files, mismatches)
+        except Exception:
+            logger.exception("TOCTOU 差分の生成に失敗（要約なしで通知）: %s", request_id)
+            summary, full = "（差分を生成できません）", ""
+        report_path = os.path.join(self.approval_dir, f"{request_id}.toctou.diff")
+        try:
+            with open(report_path, "w") as f:
+                f.write(f"TOCTOU 不一致 (request_id={request_id})\n\n"
+                        + "\n".join(f"- {m['path']}: 承認時 {m['approved_sha256']}"
+                                    f" / 現在 {m['current_sha256']}"
+                                    for m in mismatches)
+                        + "\n\n" + full)
+        except OSError:
+            logger.exception("TOCTOU 差分の正本保存に失敗: %s", report_path)
+            report_path = "（保存失敗）"
+        body = (
+            "⚠ 承認された内容と実行時点の内容が異なるため実行しませんでした"
+            "（承認後に対象が変更されています）。\n"
+            "変更の要約（承認時の記録 ⇄ 現在の実測）:\n"
+            f"{summary}\n"
+            f"差分の全文: {report_path}\n"
+            "次の行き先: 変更が正当なら再実行を指示してください（現在の内容で改めて承認を"
+            "求めます）。意図しない変更なら中止し、変更の調査へ進んでください。"
+            f" (ID: {request_id})")
+        try:
+            self.slack_notifier.notify(body, channel=channel, team_id=team_id,
+                                       thread_ts=thread_ts)
+        except Exception:
+            logger.exception("TOCTOU 不一致通知の送信に失敗（ブロックは確定）: %s", request_id)
 
     async def _poll_decision(self, approval_path: str, budget: float) -> str | None:
         """承認ファイルの status を poll_interval_sec 間隔で読み、approved / rejected を検知して返す。

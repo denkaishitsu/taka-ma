@@ -346,7 +346,7 @@ def test_validate_rest_summary_null_and_string_and_invalid():
 def _plan_capture(mgr):
     calls = []
 
-    def fake_build_plan(text, progress=None):
+    def fake_build_plan(text, progress=None, contract=None, workspace=None):
         calls.append(text)
         return [{"step": 1, "command": "編集", "execution": "agent", "depth": None,
                  "confidence": 1.0, "depends_on": []}]

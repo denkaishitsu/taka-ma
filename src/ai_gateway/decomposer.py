@@ -39,10 +39,14 @@ class TaskDecomposer:
         self.logger = YaTaLogger()
 
     def decompose(self, command: str,
-                  progress: GenerationProgress | None = None) -> list[dict]:
+                  progress: GenerationProgress | None = None,
+                  context_docs: str | None = None) -> list[dict]:
         """ユーザー指示をサブタスクに分解する。
         フォールバック: JSONパースエラー時は元の指示を1件の execution=agent（写像上 sonnet）として返す。
         progress はハートビート進捗通知（§10.8）へ生成トークン数を届ける共有ホルダー。
+        context_docs は対象文書の実測抜粋（§8.4「分解入力」・#171）。sa-ru 側が採取済みの
+        文字列で受ける（ya-ta は状態を持たない — SSH・ファイル I/O をここに持ち込まない）。
+        None は従来どおり指示文のみで分解する。
         """
         # 分解プロンプトを組み立てる: 分解規則のテンプレートにカテゴリ定義を差し込む
         with open(PROMPTS_DIR / "categories.md") as f:
@@ -54,9 +58,15 @@ class TaskDecomposer:
             # プロンプト＋ユーザー指示をローカル ollama（ya-ta モデル）に渡しサブタスク JSON を得る。
             # ollama 実行失敗は run_ollama が RuntimeError を送出し、下の except で
             # 安全側フォールバックへ落ちる（設計書 §8.4「ollama 実行失敗の検知」）。
+            # 対象文書の抜粋は指示文の後ろへ別ブロックで添える（§8.4「分解入力」）。
+            # 実体に基づく分割の判断材料であり、指示文と混ぜない
+            user_block = f"ユーザー指示: {command}"
+            if context_docs:
+                user_block += ("\n\n対象文書の現状（実測抜粋・行番号付き）:\n"
+                               + context_docs)
             stdout = run_ollama(
                 self.model,
-                f"{system_prompt}\n\nユーザー指示: {command}",
+                f"{system_prompt}\n\n{user_block}",
                 timeout=self.llm_timeout,
                 host=self.ollama_host,
                 think=self.llm_think,

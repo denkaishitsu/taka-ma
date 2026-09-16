@@ -42,6 +42,7 @@ from ai_gateway.llm import (
 )
 from orchestrator import contract as contract_rules
 from orchestrator import entry_gate as entry_gate_rules
+from orchestrator import exit_gate as exit_gate_rules
 from orchestrator import intake as intake_rules
 from orchestrator import intent_store
 from orchestrator import runbook as runbook_rules
@@ -99,6 +100,10 @@ _BRANCH_MENTION_RE = re.compile(
     r"\s*[:：=＝]\s*"
     r"([A-Za-z0-9._/\-]+)",
     re.IGNORECASE)
+
+# 承認レコード由来パスの受理形式（SSH コマンド文字列に乗るため防御的に検証。
+# exit_gate._SAFE_PATH_RE / approval-pipeline evidence._SAFE_PATH_RE と同一規則）
+_APPROVAL_PATH_RE = re.compile(r"\A[A-Za-z0-9._/\-]+\Z")
 
 
 # 「実行系」とみなすタスク status（§8.3 進行状況発言のグラウンディング。orchestrator の
@@ -264,6 +269,9 @@ class ConversationManager:
                                ", ".join(missing))
             else:
                 self._entry_gate_conf = entry_conf
+        # §3.3 (5) (b) probe_approval: Tier3 承認レコードの置き場（Tier3Handler・u-zu と
+        # 同じ dir を sa-ru.yaml approval.dir から共有）。未構成なら実測回答は行わない
+        self._approval_dir = (config.get("approval") or {}).get("dir")
         # 契約化の実行主体は ya-ta（§8.4「契約化の呼び出し」。会話脳での契約化は
         # 構造化出力が実測で不安定だったため移管 — 2026-08-28 E2E）。上位モデルでの
         # 再契約化（§8.4.x (e) 昇格ラダー）の実行手段はこちら（sa-ru）が注入する
@@ -556,6 +564,21 @@ class ConversationManager:
                 team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
 
         history_snapshot = self._record_user_turn(cid, msg["text"], workspace)
+
+        # 承認リクエストの実測回答（設計 §3.3 (5) (b)・probe_approval）: この会話スレッドに
+        # 保留中の Tier3 承認があるとき、発話は承認についての質問とみなし、会話脳でなく
+        # 承認レコード＋現在の実測から機械組み立てで答える（LLM の記憶・言い換えで承認対象を
+        # 語らない — §8.10g 状態主張の規律の承認面への拡張）。判定は thread_ts ⇄ 承認レコードの
+        # 決定的照合のみ。1 問ごとに読み直すため問答は複数回成り立つ
+        if not msg.get("force_ready"):
+            approval_block = self._approval_probe_block(msg)
+            if approval_block is not None:
+                self._append_turn(cid, "assistant", approval_block)
+                self._set_awaiting(cid, True)
+                self.slack.notify(
+                    approval_block, msg.get("channel_id"),
+                    team_id=msg.get("team_id"), thread_ts=msg.get("thread_ts"))
+                return
 
         # 到達性の実測（§8.3 到達性の機械付与・是正記録 2026-09-04）。不達なら以降の返信に固定行を
         # 前置し、ready 依頼は契約化を呼ばずに止める（脳 LLM に到達性を推測させない）。
@@ -1484,6 +1507,158 @@ class ConversationManager:
             # 素通しすると段の失敗でなく会話処理全体を落とす（ハング CLI が 1 段で全体を殺す）
             raise RuntimeError(f"昇格段のタイムアウト: {e}") from e
 
+    # 承認実測ブロックの表示上限（§3.3 (5) (b)。Slack 可読性と分割送信の回避）
+    _APPROVAL_EXCERPT_CAP = 1200
+
+    def _approval_probe_block(self, msg: dict) -> str | None:
+        """このスレッドの Tier3 承認レコードから実測回答ブロックを組む（該当なしは None）。
+
+        優先順: (1) 保留中（approval.dir 直下・status=pending）→ 実体と現在の照合を返す。
+        (2) 直近 60 分に決着した done/ レコード（TOCTOU ブロック含む）→ 決着状態を返す。
+        いずれもコード組立のみ（LLM 不関与）。読み取り失敗は該当なし扱い（会話を止めない）。
+        """
+        adir = getattr(self, "_approval_dir", None)
+        thread = msg.get("thread_ts")
+        if not adir or not thread or not os.path.isdir(adir):
+            return None
+
+        def _load(dirpath):
+            out = []
+            try:
+                names = os.listdir(dirpath)
+            except OSError:
+                return out
+            for name in names:
+                if not name.endswith(".json"):
+                    continue
+                try:
+                    with open(os.path.join(dirpath, name)) as f:
+                        r = json.load(f)
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if r.get("thread_ts") == thread:
+                    out.append(r)
+            return out
+
+        pending = [r for r in _load(adir) if r.get("status") == "pending"]
+        if pending:
+            pending.sort(key=lambda r: r.get("created_at") or "")
+            return "\n\n".join(self._approval_block(r, decided=False)
+                               for r in pending[-2:])
+        done = _load(os.path.join(adir, "done"))
+        if done:
+            done.sort(key=lambda r: r.get("decided_at") or r.get("created_at") or "")
+            latest = done[-1]
+            ts = latest.get("decided_at") or ""
+            try:
+                decided = datetime.datetime.fromisoformat(ts)
+                age = (datetime.datetime.now(decided.tzinfo) - decided).total_seconds()
+            except (ValueError, TypeError):
+                age = None
+            # 決着直後（60 分内）の追い質問だけ実測で答える。それ以降の同スレッド発話まで
+            # 承認の話と決めつけない（通常の会話へ落とす）
+            if age is not None and age <= 3600:
+                return self._approval_block(latest, decided=True)
+        return None
+
+    def _approval_block(self, record: dict, decided: bool) -> str:
+        """承認レコード 1 件の実測ブロック（コード組立のみ・§3.3 (5) (b)）。"""
+        rid = record.get("request_id") or "?"
+        if not decided:
+            status_label = "保留中 — 判断は承認リクエストのボタンで"
+        elif record.get("toctou_mismatch"):
+            status_label = (f"{record.get('status')}（ただし実行せず — 承認後に対象が変更・"
+                            f"差分: {record.get('toctou_report') or '-'}）")
+        else:
+            status_label = (f"{record.get('status')}"
+                            f"（{record.get('decided_by') or '-'} / "
+                            f"{record.get('decided_at') or '-'}）")
+        lines = [f"【承認リクエストの実測】(ID: {rid} / {status_label})",
+                 f"操作: {record.get('command') or '-'}",
+                 f"帰属: task_id={record.get('task_id') or '不明'}"
+                 f" / tool={record.get('tool_name') or '-'}",
+                 f"リスク判定: {record.get('risk_reason') or '-'}"]
+        # 契約の該当欄（§3.3 (5) (b)）: task_id からタスクファイルを引き、人が着手確認で
+        # 承認した契約（依頼・拘束条件・完了条件）を併記する — 「この操作は頼んだ作業の
+        # 流れとして自然か」を判断できるようにする。引けなければその旨を明示
+        contract_lines = self._approval_task_contract(record.get("task_id") or "")
+        if contract_lines:
+            lines.extend(contract_lines)
+        else:
+            lines.append("  契約: タスクファイルを引けません（契約欄なし）")
+        ev = record.get("evidence") or {}
+        total = 0
+        for f in ev.get("files") or []:
+            path = f.get("path") or "?"
+            sha = (f.get("sha256") or "")[:12]
+            check = self._approval_hash_check(path, f.get("sha256"))
+            lines.append(f"--- {path} (sha256 {sha}… / {check}) ---")
+            excerpt = (f.get("excerpt") or "").rstrip("\n")
+            room = self._APPROVAL_EXCERPT_CAP - total
+            if excerpt and room > 0:
+                if len(excerpt) > room:
+                    excerpt = excerpt[:room] + "\n…（以降略）"
+                lines.append(excerpt)
+                total += len(excerpt)
+            elif excerpt:
+                lines.append("…（表示上限・全文は承認レコードを参照）")
+        for n in ev.get("notes") or []:
+            lines.append(f"⚠ {n}")
+        lines.append("（この回答は承認レコードと現在の実測のみから機械的に組み立てています）")
+        return "\n".join(lines)
+
+    def _approval_task_contract(self, task_id: str) -> list:
+        """task_id のタスクファイルから契約の該当欄（依頼・拘束・完了条件）の表示行を引く。
+
+        実行中（task_dir 直下）→ 決着済み（task_dir/done/ 配下）の順で探す。引けない・
+        読めないときは空リスト（呼び出し側が「契約欄なし」を明示する — 無印にしない）。
+        表示はタスクファイルの実値のみから組む（LLM 不関与・§3.3 (5) (b)）。
+        """
+        tdir = getattr(self, "task_dir", None)
+        if not tdir or not task_id:
+            return []
+        candidates = glob.glob(os.path.join(tdir, f"*_{task_id}.json"))
+        candidates += glob.glob(os.path.join(tdir, "done", "*", f"*_{task_id}.json"))
+        if not candidates:
+            return []
+        try:
+            with open(sorted(candidates)[-1]) as f:
+                task = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return []
+        lines: list = []
+        cmd = " ".join((task.get("command") or "").split())
+        if cmd:
+            lines.append("  依頼: " + (cmd[:160] + "…" if len(cmd) > 160 else cmd))
+        for c in task.get("constraints") or []:
+            prefix = "（禁止）" if c.get("forbid") else ""
+            lines.append(f"  拘束条件: {prefix}{c.get('text', '')}")
+        acceptance = task.get("acceptance") or []
+        if acceptance:
+            parts = []
+            for a in acceptance:
+                path = (a.get("params") or {}).get("path")
+                parts.append(f"{a.get('kind')}" + (f" {path}" if path else ""))
+            lines.append("  完了条件: " + "、".join(parts))
+        return lines
+
+    def _approval_hash_check(self, path: str, approved_sha) -> str:
+        """承認時ハッシュと現在の実測の照合結果ラベル（測れないときはその旨）。"""
+        if not approved_sha or self.process_mgr is None:
+            return "現在の照合: 実測手段なし"
+        if not _APPROVAL_PATH_RE.match(path or "") or ".." in (path or "").split("/"):
+            return "現在の照合: 対象外（不正パス）"
+        try:
+            rc, out = self.process_mgr.run_ssh_probe(
+                f"shasum -a 256 {shlex.quote(path)}", 15)
+        except Exception:
+            return "現在の照合: 実測失敗"
+        parts = (out or "").split()
+        if rc != 0 or not parts:
+            return "現在の照合: 再計測不能（不在の可能性）"
+        return ("現在の照合: 一致（承認時から変更なし）" if parts[0] == approved_sha
+                else "⚠ 現在の照合: 不一致（承認時から変更あり）")
+
     def _run_entry_gate(self, contract: dict, history_view: str, summary: str):
         """入口ゲート（§8.10f 依頼⇄契約の独立突合）を実行し、結果を契約へ刻む。
 
@@ -2002,7 +2177,8 @@ class ConversationManager:
         # 確定要約を分解入力に使う縮退経路は廃止 — 会話脳の言い換えを実行系へ入れない。
         # 2026-09-03 改訂）。キーが無い契約はここへ到達しない（validate_contract が弾く）
         rest = ([] if rest_summary is None
-                else self._build_plan(rest_summary + note, progress=progress) or [])
+                else self._build_plan(rest_summary + note, progress=progress,
+                                      contract=contract, workspace=workspace) or [])
         for s in rest:
             s = dict(s)
             s["step"] = s["step"] + k
@@ -2027,15 +2203,43 @@ class ConversationManager:
             })
         return plan, skipped
 
-    def _build_plan(self, summary: str, progress=None) -> list[dict] | None:
+    # 分解入力へ添える文書抜粋の上限（§8.4「分解入力」・#171。分解モデルはローカル
+    # 32K ctx で、プロンプト評価時間が応答時間の支配項になるため出口ゲートの証跡上限
+    # （12,000/80,000）より絞る）
+    _DOC_EXCERPT_FILE_CAP = 8000
+    _DOC_EXCERPT_TOTAL_CAP = 24000
+
+    def _build_plan(self, summary: str, progress=None,
+                    contract: dict | None = None,
+                    workspace: str | None = None) -> list[dict] | None:
         """確定要約を分解して計画プレビュー用のサブタスク列を返す（失敗時は None）。
 
         分解失敗（想定外の例外）でゲート自体を落とさない。None のときはプレビュー無しで
         従来どおり要約のみを提示し、分解は dispatcher 側で行われる（縮退動作）。
+
+        contract・workspace が与えられたとき、契約 target_paths の対象文書の実体
+        （行番号付き抜粋）を固定コマンドで採取し、分解入力へ別ブロックで添える
+        （§8.4「分解入力」・#171 — 要約の散文だけでは対象の現状を知らずに分割が
+        組まれる）。採取不能は当該ファイルをスキップし、1 件も採れなければ従来どおり
+        要約のみで分解する（採取の失敗で分解を止めない）。
         """
         if self.plan_service is None:
             return None
+        docs = None
+        if contract and workspace and self.process_mgr is not None:
+            try:
+                docs = exit_gate_rules.collect_doc_excerpts(
+                    self.process_mgr.run_ssh_probe, workspace,
+                    contract.get("target_paths") or [],
+                    self._DOC_EXCERPT_FILE_CAP, self._DOC_EXCERPT_TOTAL_CAP)
+            except Exception:
+                logger.exception("文書抜粋の採取に失敗（要約のみで分解）")
         try:
+            # docs 無しは従来と同じ呼び出し形を保つ（docs 引数を持たない既存の
+            # 偽 PlanService・旧実装との互換 — plan.py 側と同じ方針）
+            if docs:
+                return self.plan_service.build(summary, progress=progress,
+                                               docs=docs)
             return self.plan_service.build(summary, progress=progress)
         except Exception:
             logger.exception("計画プレビューの分解に失敗（要約のみで提示）")
@@ -2089,7 +2293,8 @@ class ConversationManager:
             # runbook 無しの契約も分解入力は rest_summary（§8.10g 一本化・2026-09-03）。
             # null（残り作業なし）はプレビュー無し提示へ縮退（分解対象が無い）
             rest_summary = contract.get("rest_summary")
-            plan = (self._build_plan(rest_summary, progress=progress)
+            plan = (self._build_plan(rest_summary, progress=progress,
+                                     contract=contract, workspace=workspace)
                     if rest_summary else None)
         else:
             # 契約未構成（`contract:` 無効の従来動作）のみ確定要約を分解する

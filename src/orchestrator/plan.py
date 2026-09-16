@@ -307,14 +307,23 @@ class PlanService:
         self.resolve = resolve
         self.valid_models = set(valid_models)
 
-    def build(self, summary: str, progress=None) -> list[dict]:
+    def build(self, summary: str, progress=None,
+              docs: str | None = None) -> list[dict]:
         """確定要約を ya-ta で分解し、プレビュー対象のサブタスク列を返す。
 
         分解入力の組み立ては decomposer 側の責務、分解結果の機械フィルタ（検証サブタスクの
         除去・§10.2）はここ。両者を分けてあるため、分解入力を変える改修は本メソッドの
         1 行目だけを触ればよい。
+
+        docs は対象文書の実測抜粋（§8.4「分解入力」・#171。sa-ru 側が採取済みの文字列）。
+        None は従来どおり要約のみで分解する。
         """
-        subtasks = self.decomposer.decompose(summary, progress=progress)
+        # docs 無しは従来と同じ呼び出し形を保つ（context_docs 引数を持たない
+        # 既存の偽 decomposer・旧実装との互換）
+        subtasks = (self.decomposer.decompose(summary, progress=progress,
+                                              context_docs=docs)
+                    if docs else
+                    self.decomposer.decompose(summary, progress=progress))
         return drop_verification_subtasks(subtasks)
 
     def view(self, subtasks: list[dict]) -> list[dict]:

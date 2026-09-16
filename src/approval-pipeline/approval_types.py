@@ -23,6 +23,9 @@ class PendingApproval:
     source: str = "headless"  # 承認要求の由来。"headless"=フック stdin の権威的 tool_input、
                               # "interactive"=非構造・非信頼な stdout スクレイプ由来（設計 §3.3 (3)）。
                               # 中核 decide() が interactive にフェイルセーフ（Tier1 禁止・判定不能→Tier3）を適用する。
+    cwd: str = ""             # worker の作業ディレクトリ（headless フック stdin の cwd）。
+                              # Tier3 の実体採取（設計 §3.3 (5)）が相対パスの解決に使う。
+                              # interactive 由来・旧クライアントは空（実体添付は best-effort）。
 
 
 @dataclass

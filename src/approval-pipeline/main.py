@@ -17,6 +17,7 @@ import time
 
 import yaml
 
+import evidence
 from approval_types import Decision, operation_str
 from interceptor import to_pending
 from classifier import RiskClassifier
@@ -136,7 +137,10 @@ class ApprovalPipeline:
             3: Tier3Handler(slack_notifier,
                             # 承認の期限ではなく worker を待たせる上限（超過＝保留・§3.3 (4)）
                             hold_grace_sec=approval_conf["hold_grace_sec"],
-                            poll_interval_sec=approval_conf["poll_interval_sec"]),
+                            poll_interval_sec=approval_conf["poll_interval_sec"],
+                            # 実体採取・TOCTOU 照合（§3.3 (5)）。workspace は worker ホスト
+                            # （qu-e と同じ MBP）にあるため、Tier2 と同じ SSH 1 ショットで測る
+                            run_probe=evidence.ssh_probe_factory(ssh_host)),
         }
 
         # pipeline.yaml（SSOT）をロードし、監査ログ出力先と安全性チェックリストを取得する（設計 §3.3 (0)/§3.4）。

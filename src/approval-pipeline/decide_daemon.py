@@ -166,6 +166,8 @@ class DecideDaemon:
             tool_name=payload.get("tool_name", ""),
             tool_input=payload.get("tool_input") or {},
             tool_use_id=payload.get("tool_use_id", ""),
+            # cwd は Tier3 の実体採取（設計 §3.3 (5)）が相対パス解決に使う
+            cwd=payload.get("cwd") or "",
         )
         # task_id はクライアント argv 優先。未指定なら cwd（=/opt/taka-ma/work/{task_id}）末尾から補う。
         task_id = req.get("task_id") or os.path.basename((payload.get("cwd") or "").rstrip("/"))

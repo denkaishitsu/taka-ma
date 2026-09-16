@@ -98,6 +98,55 @@ def collect_check_paths(task: dict) -> list[str]:
     return paths[:_MAX_PATHS]
 
 
+def numbered_cat_command(workspace: str, path: str) -> str | None:
+    """安全検証済みの行番号付き読み取りコマンドを返す（不正パスは None）。
+
+    パスは SSH コマンド文字列に乗るため防御的に検証する。出口ゲートの証跡採取と
+    分解入力の文書抜粋（§8.4「分解入力」・#171）が同じ検証・同じコマンド形を共用する。
+    """
+    if not _SAFE_PATH_RE.match(path) or ".." in path.split("/"):
+        return None
+    return f"cat -n {shlex.quote(workspace)}/{shlex.quote(path)}"
+
+
+def collect_doc_excerpts(run_probe, workspace: str, paths: list,
+                         per_file_cap: int, total_cap: int) -> str | None:
+    """対象文書の行番号付き抜粋を固定コマンドで採取して 1 ブロックの文字列にする。
+
+    分解入力（§8.4「分解入力」・#171）用。採取は sa-ru 側のコードのみで行い、
+    LLM 出力をコマンドに接続しない。読めないファイル（不正パス・不在・probe 失敗）は
+    スキップし、1 件も採取できなければ None（呼び出し側は従来どおり要約のみで分解 —
+    採取の失敗で分解を止めない）。上限超過は切り詰めて明示する。
+    """
+    blocks: list[str] = []
+    total = 0
+    for path in paths or []:
+        if not isinstance(path, str):
+            continue
+        command = numbered_cat_command(workspace, path)
+        if command is None:
+            continue
+        try:
+            rc, out = run_probe(command, PROBE_TIMEOUT_SEC)
+        except Exception:
+            logger.warning("文書抜粋の採取に失敗（スキップ）: %s", path)
+            continue
+        if rc != 0 or not (out or "").strip():
+            continue
+        body = out
+        if len(body) > per_file_cap:
+            body = body[:per_file_cap] + "\n…（以降略）"
+        block = f"--- {path} ---\n{body}"
+        if total + len(block) > total_cap:
+            room = total_cap - total
+            if room <= 0:
+                break
+            block = block[:room] + "\n…（以降略）"
+        blocks.append(block)
+        total += len(block)
+    return "\n\n".join(blocks) if blocks else None
+
+
 def _request_doc(task: dict) -> str:
     """依頼の根拠文書ブロックを契約フィールドのみから組み立てる（worker 出力を含めない）。"""
     lines = [f"確定要約（着手確認で人が承認した依頼内容）:\n{task.get('command', '')}"]
@@ -163,12 +212,13 @@ class ExitGateVerifier:
                 self._probe(probes, f"git -C {ws} show HEAD --stat", 4000)
                 self._probe(probes, f"git -C {ws} show HEAD", _PATCH_MAX_CHARS)
             for path in collect_check_paths(task):
-                # パスは SSH コマンド文字列に乗るため防御的に検証（不正は採取しない。
-                # 判定材料が減る＝unresolved 側に倒れるだけで、偽完了は生まない）
-                if not _SAFE_PATH_RE.match(path) or ".." in path.split("/"):
-                    continue
+                # パス検証・コマンド組立は分解入力の抜粋採取と共用（不正は採取しない。
+                # 判定材料が減る＝unresolved 側に倒れるだけで、偽完了は生まない）。
                 # cat -n で行番号付き内容を採る（要件突合の判定根拠を「行番号」にするため）
-                self._probe(probes, f"cat -n {ws}/{shlex.quote(path)}", _FILE_MAX_CHARS)
+                command = numbered_cat_command(workspace, path)
+                if command is None:
+                    continue
+                self._probe(probes, command, _FILE_MAX_CHARS)
         for command, rc, out in probes:
             blocks.append(f"$ {command} (rc={rc})\n{out if out.strip() else '（出力なし）'}")
         # 回答型依頼（acceptance に answered）は回答本文が成果物そのもの（§8.10f 出口ゲート）

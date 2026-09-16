@@ -178,13 +178,16 @@ class SlackNotifier:
                               context: str = "",
                               channel: str | None = None,
                               team_id: str | None = None,
-                              thread_ts: str | None = None):
+                              thread_ts: str | None = None,
+                              evidence_text: str = ""):
         """Tier 3 承認リクエストを Block Kit 付きで送信する。
 
         context（worker stdout の前後文脈）があれば承認者が「何を実行しようとしているか」を
         判断できるよう本文に併記する。command が "unknown" になる場面でも文脈で補えるようにする。
         thread_ts があれば着手確認・進捗通知と同じ会話スレッドへ返信する（未配線だと通常投稿に
         なる欠陥を実機検証で確認・是正）。
+        evidence_text（設計 §3.3 (5) (a)）は承認対象の実体（機械採取済み・上限つき）。
+        パスしか見えない操作（`bash setup.sh` 等）でも中身で判断できるよう本文へ併記する。
         """
         target = self._channel_for(team_id, channel)
         blocks = [
@@ -201,6 +204,12 @@ class SlackNotifier:
             snippet = context[-800:]
             blocks.append({"type": "section", "text": {
                 "type": "mrkdwn", "text": f"*Context:*\n```{snippet}```",
+            }})
+        if evidence_text:
+            # 実体は先頭が重要（shebang・冒頭処理）のため先頭側を残す（§3.3 (5)。
+            # evidence.slack_text 側で上限済みだが、Slack section 上限へ防御的に再丸め）
+            blocks.append({"type": "section", "text": {
+                "type": "mrkdwn", "text": f"*承認対象の実体:*\n```{evidence_text[:2800]}```",
             }})
         blocks += [
             {"type": "actions", "elements": [
