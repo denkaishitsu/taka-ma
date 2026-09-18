@@ -45,11 +45,6 @@ ATTEMPTS = 2
 LOCAL_ATTEMPTS = ATTEMPTS
 
 
-def _is_unmapped(problems: list[str]) -> bool:
-    """検証不合格がスキーマ閉包の unmapped 検出か（§8.10f。リトライ対象ではない）。"""
-    return any(p.startswith("unmapped:") for p in problems)
-
-
 class Contractor:
     """会話履歴（二窓ビュー）と確定要約から実行契約 JSON を抽出する（設計書 §8.4）。
 
@@ -103,9 +98,10 @@ class Contractor:
 
         来歴 dict: {"origin": モデル名 | "local" | None, "backend": "worker_cli" | "local",
                     "unreachable": bool（CLI の呼び出し自体の失敗が続き不成立・是正記録 2026-09-04）,
-                    "attempts": [{"model", "problems"}...],
-                    "unmapped": [逐語引用, ...]（スキーマ閉包検出時のみ）}
+                    "attempts": [{"model", "problems"}...]}
         origin=None は不成立（呼び出し側が fail-closed で人へ差し戻す）。
+        unmapped（写像できない指定）は不成立理由ではない — 検証済み契約の
+        `unmapped` フィールドに載って着手確認へ運ばれる（§8.10f 閉包規則・突き返し廃止）。
         """
         prompt = (self._template
                   .replace("{history}", history_text)
@@ -123,11 +119,6 @@ class Contractor:
                 if validated is not None:
                     return validated, self._provenance(
                         self.cli_model, "worker_cli", attempts)
-                if status == "unmapped":
-                    # スキーマ閉包の正常な検出（§8.10f）。リトライせず直ちに人へ
-                    return None, self._provenance(
-                        None, "worker_cli", attempts,
-                        unmapped=self._unmapped_items(attempts))
                 if status == "exec_error":
                     exec_failures += 1
             if exec_failures < ATTEMPTS:
@@ -150,10 +141,6 @@ class Contractor:
                 validate)
             if validated is not None:
                 return validated, self._provenance("local", "local", attempts)
-            if status == "unmapped":
-                return None, self._provenance(
-                    None, "local", attempts,
-                    unmapped=self._unmapped_items(attempts))
 
         # 不成立 — fail-closed の最終防衛は呼び出し側（着手確認を出さず人へ・§8.10f）。
         # ここへ来るのはローカル試行の後なので、最終試行のバックエンドは常に local
@@ -163,7 +150,7 @@ class Contractor:
         """1 回の契約化試行。(検証済み契約 | None, 状態) を返す（attempts へ記録）。
 
         状態: "ok" / "exec_error"（呼び出し自体の失敗 = 不達判定の材料）/
-              "invalid"（検証不合格）/ "unmapped"（スキーマ閉包検出・リトライしない）。
+              "invalid"（検証不合格）。
         """
         try:
             stdout = run()
@@ -187,24 +174,13 @@ class Contractor:
             return validated, "ok"
         logger.warning("契約化の出力が逸脱（%s）: %s", model_name, problems)
         attempts.append({"model": model_name, "problems": problems})
-        return None, ("unmapped" if _is_unmapped(problems) else "invalid")
-
-    @staticmethod
-    def _unmapped_items(attempts: list[dict]) -> list[str]:
-        """attempts から unmapped の逐語引用列を取り出す（人への確認文の材料）。"""
-        for a in reversed(attempts):
-            for p in a.get("problems") or []:
-                if p.startswith("unmapped:"):
-                    return [s.strip() for s in p[len("unmapped:"):].split(" / ") if s.strip()]
-        return []
+        return None, "invalid"
 
     def _provenance(self, origin, backend: str, attempts: list[dict],
-                    unreachable: bool = False, unmapped: list[str] | None = None) -> dict:
+                    unreachable: bool = False) -> dict:
         """来歴を組み立て、試行列を判定ログ（§8.4.1）へ記録する（換装判断の実データ）。"""
         provenance = {"origin": origin, "backend": backend, "unreachable": unreachable,
                       "attempts": attempts}
-        if unmapped:
-            provenance["unmapped"] = unmapped
         # ログ書き込み失敗は契約化本体を壊さない（decompose の判定ログと同じ耐障害方針）
         try:
             self.logger.log_contract(origin, attempts, backend=backend,

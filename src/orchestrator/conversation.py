@@ -597,6 +597,17 @@ class ConversationManager:
             action = self.intent.classify(history_text, msg["text"])["action"]
         else:
             action = "chat"
+        # 構造マーカーの決定的ガード（§8.4・#175）: 依頼の書式マーカーを 2 個以上持つ
+        # 発話は、意図判定 LLM が chat と言っても execute として扱う（chat→execute の
+        # 片方向のみ。人の書式を LLM の揺らぎより優先する — 2026-09-16 実測:
+        # マーカー 5 個の構造化依頼が chat conf 0.98 で捨てられた）。execute へ倒しても
+        # 実行は始まらず、契約化 → 入口ゲート → 着手確認（人の裁定面）に出るだけ
+        if action == "chat":
+            marker_count = contract_rules.request_structure_count(msg["text"])
+            if marker_count >= 2:
+                logger.info("意図判定ガード発動: 構造マーカー %d 個 → execute へ倒す"
+                            "（LLM 判定 chat を上書き）", marker_count)
+                action = "execute"
 
         # 確認系質問（リポジトリ実状態・進行状況）には宣言でなく実測を返す（§8.3 probe）。
         # 返信本文はコマンド実出力・実レコードから機械的に組み立てる（§8.9 と同じ規律）
@@ -719,7 +730,6 @@ class ConversationManager:
                 # 契約が確定できない依頼は実行へ進めない（fail-closed・§8.10f）。
                 # 言い直しの返答を待つ（§8.3 (C) 能動昇格）
                 self._set_awaiting(cid, True)
-                unmapped = contract_prov.get("unmapped") or []
                 if contract_prov.get("unreachable"):
                     # 到達性ゲート合格後（pass_ttl 内）に CLI 不達へ転じた場合（是正記録 2026-09-04）。
                     # 抽出失敗の定型（言い直しの要求）で誤誘導せず、到達不能の固定文で止める
@@ -734,13 +744,6 @@ class ConversationManager:
                             "完了条件を含めて、依頼全体を言い直してください。\n"
                             "例: 「…を確認して、結果の一覧を回答で返して。一覧が"
                             "届いたら完了」")
-                elif unmapped:
-                    # スキーマ閉包の検出（§8.10f）: 契約フィールドへ写像できない
-                    # 「実行に影響する指定」。散文で黙って運ばず、扱いを人に確認する
-                    text = ("次の指定を契約のどの項目としても解釈できませんでした"
-                            "（安全のため実行へ進めません）:\n"
-                            + "\n".join(f"- {u}" for u in unmapped)
-                            + "\nこの指定の意図を言い直すか、取り下げてください。")
                 else:
                     text = ("実行契約を確定できませんでした（命令・拘束・完了条件の"
                             "抽出に失敗）。作業リポジトリ（`repo:/絶対パス`）と、"
@@ -2225,6 +2228,15 @@ class ConversationManager:
         """
         if self.plan_service is None:
             return None
+        # 保存先の解釈案（§8.10f 閉包規則）を分解入力へ定型行で機械追記する — 保存先を
+        # 知らない worker が成果物を別の場所に作り、file 検査が誤未達になる経路を塞ぐ。
+        # 組立は決定的（契約フィールドのみ・LLM 不関与）。新しい通信路は作らない
+        proposals = [u for u in (contract or {}).get("unmapped") or []
+                     if isinstance(u, dict) and u.get("proposal_path")]
+        if proposals:
+            summary = summary + "\n\n" + "\n".join(
+                f"成果物「{u.get('quote', '')}」の保存先: {u['proposal_path']}"
+                "（着手確認で承認）" for u in proposals)
         docs = None
         if contract and workspace and self.process_mgr is not None:
             try:
@@ -2317,6 +2329,9 @@ class ConversationManager:
             "constraints": (contract or {}).get("constraints") or [],
             "acceptance": (contract or {}).get("acceptance") or [],
             "needs_repo": bool((contract or {}).get("needs_repo")),
+            # 写像できなかった指定と解釈案/質問（§8.10f 閉包規則）。着手の承認で
+            # 解釈案が契約として凍結された事実を記録に残す（人の裁定の監査点）
+            "unmapped": (contract or {}).get("unmapped") or [],
             # 入口ゲートの対応表（§8.10f 着手時判断の記録）。着手（このまま着手）の
             # 承認とともに確定タスクへ運ばれ、出口の報告（帰属区別）が参照する
             "entry_gate": (contract or {}).get("_entry_gate"),
@@ -2418,6 +2433,21 @@ class ConversationManager:
                      + intake_note)
         target_paths = contract.get("target_paths") or []
         lines.append("対象文書: " + ("、".join(target_paths) if target_paths else "なし"))
+        # 写像できなかった指定（§8.10f 閉包規則・突き返し廃止）: 解釈案/質問の行として
+        # 提示し、人が裁く。着手の承認で解釈案は契約として凍結される（target_paths へ
+        # 追記済み）。訂正は訂正経路（§10.2.1）の返信 — 再投稿（言い直し）を求めない
+        unmapped = [u for u in contract.get("unmapped") or [] if isinstance(u, dict)]
+        if unmapped:
+            lines.append("写像できなかった指定（着手で下記の扱いを承認・訂正は返信で）:")
+            for u in unmapped:
+                quote = u.get("quote", "")
+                if u.get("proposal_path"):
+                    lines.append(f"- 「{quote}」 → {u['proposal_path']}"
+                                 "（保存先未指定のためシステム提案）")
+                else:
+                    lines.append(f"- 「{quote}」 → 質問: "
+                                 + (u.get("question")
+                                    or contract_rules.UNMAPPED_DEFAULT_QUESTION))
         constraints = contract.get("constraints") or []
         if constraints:
             lines.append("拘束条件:")

@@ -16,9 +16,11 @@ import json
 from orchestrator.entry_gate import (
     STATUS_EXIT_GATE,
     STATUS_FIELD,
+    STATUS_REFERENCE,
     STATUS_UNCOVERED,
     EntryGateChecker,
     EntryGateReport,
+    is_reference_location,
     misbooking_notice,
     render_table,
     resolve_reference,
@@ -106,6 +108,44 @@ def test_verification_request_routed_to_exit_gate_deterministically():
     report = checker.check("view", "要約", dict(_CONTRACT))
     assert all(it["status"] == STATUS_EXIT_GATE for it in report.items)
     assert not report.uncovered()
+
+
+def test_reference_location_routed_deterministically():
+    """前提資料の場所の記法は「参考情報」へ決定的に振り分ける（§8.10f・#175）。
+
+    2026-09-18 実測の是正: 実依頼の前提資料行「docs: ~/…/docs」が ❌「契約に無い」で
+    提示され、成果物の欠落と同じ危険表示になった。mapped_to の内容に依らない。
+    """
+    raw = _items_json([
+        {"req": "docs: ~/DevDev/projects/obsidian-auto-stock-trader/docs",
+         "src": "u1", "mapped_to": []},
+        {"req": "• 資料: /repo/docs", "src": "u1", "mapped_to": ["workspace"]},
+    ])
+    checker = EntryGateChecker(_llm_factory([raw]), _TEMPLATE)
+    report = checker.check("view", "要約", dict(_CONTRACT))
+    assert all(it["status"] == STATUS_REFERENCE for it in report.items)
+    assert not report.uncovered()  # 参考情報は「契約に無い」警告に数えない
+
+
+def test_reference_location_matcher_is_strict():
+    """行全体がマーカー＋パスの形のときだけ参考情報（部分一致は ❌ 側へ倒す）。"""
+    assert is_reference_location("docs: ~/DevDev/projects/x/docs")
+    assert is_reference_location("• docs: /abs/path/docs")
+    assert is_reference_location("資料： /repo/docs")
+    # 実行への要求が混ざる行・パスでないもの・成果物の言及は対象外
+    assert not is_reference_location("docs/consistency/97-….md を是正して")
+    assert not is_reference_location("docs: の場所は後で伝える")
+    assert not is_reference_location("対応状況表を docs に保存して")
+    assert not is_reference_location("")
+
+
+def test_render_table_shows_reference_row():
+    record = {"items": [
+        {"req": "docs: /repo/docs", "refs": [], "status": STATUS_REFERENCE}],
+        "unchecked": False}
+    text = render_table(record, dict(_CONTRACT))
+    assert "ℹ docs: /repo/docs → 参考情報（前提資料の場所 — 実行契約の対象外）" in text
+    assert "契約に載っていない要求" not in text  # 警告ヘッダに数えない
 
 
 # ── リトライと未検査（fail-open を無印にしない） ──

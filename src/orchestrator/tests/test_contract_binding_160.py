@@ -105,14 +105,18 @@ def test_target_paths_verbatim_dedup_and_limit():
     assert any("上限" in p for p in problems)
 
 
-def test_unmapped_makes_contract_invalid_with_marker():
-    """unmapped 非空は契約不成立で、問題文は "unmapped:" 前置き（機械判別可能）。"""
+def test_unmapped_does_not_invalidate_contract():
+    """unmapped 非空は契約不成立にしない（§8.10f 閉包規則・突き返し廃止・#175 R5）。
+
+    旧形式（素の逐語引用の文字列）は既定質問へ縮退して契約に載り、着手確認の行として
+    人に提示される — 突き返し（旧: "unmapped:" 前置きの不成立）は存在しない。
+    """
     v, problems = contract_rules.validate_contract(
         _raw(unmapped=["レビューは Rev 形式で進めろ"]), SOURCE)
-    assert v is None
-    assert len(problems) == 1
-    assert problems[0].startswith("unmapped:")
-    assert "Rev 形式" in problems[0]
+    assert problems == []
+    assert v is not None
+    assert v["unmapped"] == [{"quote": "レビューは Rev 形式で進めろ",
+                              "question": contract_rules.UNMAPPED_DEFAULT_QUESTION}]
 
 
 def test_src_pointing_to_missing_utterance_rejected():
@@ -164,10 +168,10 @@ def test_default_file_acceptance_prefers_target_paths():
     assert paths == ["docs/02-implementation-design.md"]
 
 
-# ── Contractor: unmapped はリトライしない ──
+# ── Contractor: unmapped を含む契約は成立して返る ──
 
-def test_contractor_unmapped_stops_without_retry(monkeypatch):
-    """unmapped 検出はスキーマ閉包の正常動作 — リトライせず直ちに人へ（§8.10f）。"""
+def test_contractor_unmapped_contract_succeeds(monkeypatch):
+    """unmapped を含む契約は 1 回で成立して返る — 突き返さない（§8.10f・#175 R5）。"""
     calls = []
     output = json.dumps(_raw(unmapped=["独自の進め方の指定"]), ensure_ascii=False)
 
@@ -185,9 +189,10 @@ def test_contractor_unmapped_stops_without_retry(monkeypatch):
         escalate_runner=_runner)
     validated, prov = c.contract(
         "履歴", "要約", lambda parsed: contract_rules.validate_contract(parsed, SOURCE))
-    assert validated is None
-    assert calls == ["opus"]  # 1 回で停止（リトライなし）
-    assert prov["unmapped"] == ["独自の進め方の指定"]
+    assert validated is not None
+    assert calls == ["opus"]  # 1 回で成立（リトライなし）
+    assert validated["unmapped"][0]["quote"] == "独自の進め方の指定"
+    assert "unmapped" not in prov  # 来歴の unmapped 経路は廃止（突き返しの根を残さない）
 
 
 # ── GroundingVerifier: 測定の ref 化 ──

@@ -63,10 +63,25 @@ _FIELD_LABELS = {
     "rest_summary": "残り作業",
 }
 
-# 対応表の各行の status（コード導出の 3 値・§8.10f 着手確認での提示）
+# 対応表の各行の status（コード導出の 4 値・§8.10f 着手確認での提示）
 STATUS_FIELD = "field"          # ✅ 契約フィールドに載っている（参照が解決できた）
 STATUS_EXIT_GATE = "exit_gate"  # ✅ 出口ゲートが担当（検証系の要求・決定的振り分け）
+STATUS_REFERENCE = "reference"  # ℹ 参考情報（前提資料の場所 — 実行契約の対象外）
 STATUS_UNCOVERED = "uncovered"  # ❌ 契約に無い
+
+# 前提資料の場所の記法（依頼書式の `docs:` 行等 — マーカー＋パスの形のみ）。
+# 実行への要求ではなく参照場所の共有であり、契約に運ぶフィールドは無い（場所欄は
+# workspace＝リポジトリのみ）。2026-09-18 実測: 実依頼の前提資料行「docs: ~/…/docs」が
+# ❌「契約に無い」で提示され、成果物の欠落と同じ危険表示になった — の是正。
+# 判定は行全体がこの形のときだけ（部分一致は ❌ 側へ倒す = 誤って無害扱いしない）
+_REFERENCE_LOCATION_RE = re.compile(
+    r"\A(?:[•・\-*]\s*)?(?:docs|資料|前提資料|ドキュメント)\s*[:：]\s*(?:~/|/)\S+\Z",
+    re.IGNORECASE)
+
+
+def is_reference_location(req: str) -> bool:
+    """依頼行が前提資料の場所の記法か（決定的・LLM 不関与・§8.10f）。"""
+    return bool(_REFERENCE_LOCATION_RE.match(" ".join((req or "").split())))
 
 
 class EntryGateReport:
@@ -197,6 +212,12 @@ class EntryGateChecker:
                 rows.append({"req": req, "src": it.get("src") or "",
                              "refs": [], "status": STATUS_EXIT_GATE})
                 continue
+            # 前提資料の場所の記法は決定的に「参考情報」へ振り分ける（実行への
+            # 要求ではない。LLM の mapped_to に依らない — 検証系と同じ規律）
+            if is_reference_location(req):
+                rows.append({"req": req, "src": it.get("src") or "",
+                             "refs": [], "status": STATUS_REFERENCE})
+                continue
             refs = [r.strip() for r in it["mapped_to"]
                     if resolve_reference(contract, r)]
             rows.append({"req": req, "src": it.get("src") or "",
@@ -260,6 +281,8 @@ def render_table(record: dict, contract: dict) -> str:
             lines.append(f"- ✅ {req} → {dest}")
         elif status == STATUS_EXIT_GATE:
             lines.append(f"- ✅ {req} → 出口ゲートが担当（完了報告前の独立検証）")
+        elif status == STATUS_REFERENCE:
+            lines.append(f"- ℹ {req} → 参考情報（前提資料の場所 — 実行契約の対象外）")
         else:
             lines.append(f"- ❌ {req} → 契約に無い")
     # 部分列挙への保険（突合エージェントも LLM であり全件列挙は保証できない）:

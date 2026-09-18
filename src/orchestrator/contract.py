@@ -57,6 +57,10 @@ TRANSITION_KINDS = {"pushed", "head_touches", "diff_limit", "branch_merged",
 # 既定 file 検査の上限 _MAX_DEFAULT_FILE_CHECKS と同値）
 MAX_TARGET_PATHS = 5
 
+# unmapped 要素の縮退先の既定質問（§8.10f 閉包規則。proposal も question も無い・
+# 検証不合格の要素はこの質問行として着手確認に載る — 突き返しには落とさない）
+UNMAPPED_DEFAULT_QUESTION = "この指定をどう扱いますか？（訂正の返信で指示できます）"
+
 # 整数パラメータ（検査コマンド文字列には乗せず比較にのみ使う）。上限は暴走値の拒否
 _INT_PARAMS = {"max_lines", "min_bytes", "min_chars"}
 _MAX_INT_PARAM = 100000
@@ -172,15 +176,6 @@ def validate_contract(raw, source_text: str, utterances: dict | None = None,
     if not isinstance(raw, dict):
         return None, ["契約出力が JSON オブジェクトでない"]
 
-    # unmapped: スキーマ閉包（§8.10f）。契約フィールドへ写像できない「実行に影響する
-    # 指定」の逐語引用列。非空なら契約不成立 — 脳の誤りではなく閉包の正常な検出であり、
-    # 呼び出し側はリトライせず直ちに当該指定の扱いを人に確認する（"unmapped:" 前置きで
-    # 機械判別できる形にする）
-    unmapped = [u.strip() for u in (raw.get("unmapped") or [])
-                if isinstance(u, str) and u.strip()]
-    if unmapped:
-        return None, ["unmapped:" + " / ".join(unmapped)]
-
     cites_current = False  # 現在ターンを引用するフィールドが 1 つでもあるか
 
     def _cited(candidate: str, src: str | None) -> None:
@@ -275,6 +270,56 @@ def validate_contract(raw, source_text: str, utterances: dict | None = None,
         if path not in target_paths:
             target_paths.append(path)
 
+    # unmapped: スキーマ閉包（§8.10f 閉包規則）。写像できない「実行に影響する指定」は
+    # **契約不成立の理由にしない**（突き返し廃止の不変条件・2026-09-17。旧規則
+    # 「非空なら不成立」は実運用の実依頼を 3 回連続不受理にした直接原因）。各要素
+    # {quote, src?, proposal_path | question} を検証し、検証済み proposal_path は
+    # target_paths へ機械追記（既定 file 検査に乗る）、それ以外は質問行へ決定的に
+    # 縮退する — どの縮退先も突き返しではなく、全要素が着手確認の行として人に届く。
+    # 提案の機械追記が有効なのは分解（agent 実行）を通る契約のみ — directive 型
+    # （逐語命令・分解しない）は保存先を worker へ届ける経路が無く、file 検査だけが
+    # 付くと誤未達になるため、提案を質問へ縮退する
+    spoken_targets = bool(target_paths)  # 発話由来の target_paths の有無（stale 検査用）
+    can_merge_proposal = directive is None
+    unmapped: list[dict] = []
+    for u in raw.get("unmapped") or []:
+        if isinstance(u, str):
+            # 旧形式（素の逐語引用）は既定質問へ縮退
+            if u.strip():
+                unmapped.append({"quote": u.strip(),
+                                 "question": UNMAPPED_DEFAULT_QUESTION})
+            continue
+        if not isinstance(u, dict):
+            continue
+        quote = u.get("quote")
+        if not isinstance(quote, str) or not quote.strip():
+            continue  # 指示対象を持たない要素（落とし物の検出の正は入口ゲート）
+        quote = quote.strip()
+        src = u.get("src") if isinstance(u.get("src"), str) else None
+        verbatim = _verbatim_in(quote, src, utterances, source_text)
+        if verbatim:
+            _cited(quote, src)
+        proposal = u.get("proposal_path")
+        if (can_merge_proposal and verbatim
+                and isinstance(proposal, str) and proposal.strip()):
+            # 保存先の解釈案: target_paths と同一の安全検査。逐語照合は適用しない
+            # （原文に無い保存先の提案が目的 —「システム提案」ラベルで人が裁く）
+            path = proposal.strip()
+            if (_SAFE_PARAM_RE.match(path) and ".." not in path.split("/")
+                    and not path.startswith("/")
+                    and (path in target_paths
+                         or len(target_paths) < MAX_TARGET_PATHS)):
+                unmapped.append({"quote": quote, "proposal_path": path})
+                if path not in target_paths:
+                    target_paths.append(path)
+                continue
+        question = u.get("question")
+        unmapped.append({
+            "quote": quote,
+            "question": (question.strip()
+                         if isinstance(question, str) and question.strip()
+                         else UNMAPPED_DEFAULT_QUESTION)})
+
     # 脳が runbook の kind（merge_ff 等）を完了条件欄に置く誤りを機械補正する（§8.10g。
     # カタログ名の完全一致のみで判定＝決定的・LLM 不使用。2026-08-28 E2E 実測: qwen が
     # この取り違えを高頻度で再発し、fail-closed が契約ごと弾いて依頼が進まなくなる。
@@ -338,8 +383,11 @@ def validate_contract(raw, source_text: str, utterances: dict | None = None,
     # フィールドが無い契約は過去話題への束縛（stale 束縛）として不成立（§8.10f。
     # 2026-08-29 実障害: 現在の不具合報告に対し過去スレッドの計画へ束縛した契約が
     # 提示された — 構造検証だけでは検出できなかった意味不正の機械検出）
+    # 発火条件は発話由来フィールドのみで判定する（spoken_targets = 提案追記前の
+    # target_paths。unmapped の proposal_path はシステム提案で発話由来でないため、
+    # その追記が本検査を誤発火させてはならない — §8.10f 閉包規則）
     if (current_id is not None and utterances is not None and not cites_current
-            and (directive or constraints or branch or target_paths)):
+            and (directive or constraints or branch or spoken_targets)):
         problems.append("現在ターンの発話を引用するフィールドがない（過去話題への束縛）")
 
     if problems:
@@ -371,6 +419,7 @@ def validate_contract(raw, source_text: str, utterances: dict | None = None,
         "branch": branch,
         "target_paths": target_paths,
         "needs_repo": needs_repo,
+        "unmapped": unmapped,
     }
     # rest_summary: runbook 外の残り作業の要約（§8.10f。計画組立の分解入力専用・
     # worker / 完了検査へは渡さない）。null は「残り作業なし＝agent 分解を省略」の明示。
@@ -387,6 +436,24 @@ def validate_contract(raw, source_text: str, utterances: dict | None = None,
     else:
         return None, ["rest_summary が文字列でも null でもない（空文字列も不可）"]
     return result, []
+
+
+# 依頼の構造マーカー（意図判定の決定的ガード・§8.4「構造マーカーの決定的ガード」・#175）。
+# このシステム自身が依頼者に書かせている書式（契約・着手確認の項目名と repo:/docs: 記法）の
+# 固定小リスト。2026-09-16 実測: マーカー 5 個を持つ構造化依頼が意図判定で chat
+# （confidence 0.98）に誤判定され、依頼が捨てられた。判定は文字列の存在検査のみ
+# （LLM・正規表現の意味解釈なし — P2）。リストの変更は設計書の当該節とあわせて行う
+REQUEST_STRUCTURE_MARKERS = (
+    "依頼内容", "依頼名", "成果物", "対象ファイル",
+    "完了条件", "拘束条件", "repo:", "docs:",
+)
+
+
+def request_structure_count(text: str) -> int:
+    """発話に含まれる依頼構造マーカーの異なり数を返す（決定的・LLM 不関与）。"""
+    if not text:
+        return 0
+    return sum(1 for m in REQUEST_STRUCTURE_MARKERS if m in text)
 
 
 # 依頼が push を含むかの検出（既定検査の自動付与用）。語彙は grounding.py の主張検出
